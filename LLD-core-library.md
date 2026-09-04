@@ -91,13 +91,15 @@ pub struct Task {
     pub id: TaskId,
     pub title: String,
     pub description: Option<String>,
-    pub parent_id: Option<TaskId>,
+    pub parent_ids: Vec<TaskId>,    // a task may sit under multiple parents
+                                     // (e.g. shared by two goals/projects);
+                                     // empty = top-level
     pub type_key: String,           // FK into TaskType.key; "task" default
     pub status: TaskStatus,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
     pub assignee_id: Option<UserId>,
-    pub depends_on: Vec<TaskId>,    // predecessors, finish-to-start
+    pub depends_on: Vec<Dependency>, // predecessors, each typed
     pub out_of_sync: bool,
     pub progress: f32,              // 0.0..=1.0, library-computed, read-only
     pub created_at: DateTime<Utc>,
@@ -107,6 +109,21 @@ pub struct Task {
 }
 
 pub enum TaskStatus { Incomplete, Complete }
+
+pub struct Dependency {
+    pub predecessor_id: TaskId,
+    pub dep_type: DependencyType,
+}
+
+/// One edge per (predecessor, successor) pair — adding a new type between
+/// an already-linked pair replaces the existing edge rather than adding a
+/// second one, so `remove_dependency` never has to disambiguate by type.
+pub enum DependencyType {
+    FinishToStart,  // default; predecessor finishes before successor starts
+    StartToStart,   // predecessor starts before successor starts
+    FinishToFinish, // predecessor finishes before successor finishes
+    StartToFinish,  // predecessor starts before successor finishes
+}
 
 pub struct TaskType {
     pub key: String,       // stable identifier, e.g. "initiative"
@@ -137,9 +154,9 @@ pub struct TaskPatch {
     pub due_date: Field<NaiveDate>,   // Clear -> None
     pub assignee_id: Field<UserId>,   // Clear -> unassign
     pub type_key: Field<String>,
-    // parent_id and depends_on are intentionally NOT here — reparenting
+    // parent_ids and depends_on are intentionally NOT here — reparenting
     // and dependency edits go through their own dedicated methods
-    // (reparent_task, add/remove_dependency) because each carries its
+    // (set_parents, add/remove_dependency) because each carries its
     // own invariant check that a generic patch would obscure.
 }
 
@@ -203,8 +220,8 @@ impl<S: Store> Core<S> {
     pub fn update_task(&mut self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError>;
     pub fn delete_task(&mut self, id: TaskId, mode: DeleteMode) -> Result<Vec<Task>, CoreError>;
     pub fn restore_task(&mut self, id: TaskId) -> Result<Task, CoreError>;
-    pub fn reparent_task(&mut self, id: TaskId, new_parent: Option<TaskId>) -> Result<Task, CoreError>;
-    pub fn add_dependency(&mut self, id: TaskId, predecessor: TaskId) -> Result<Task, CoreError>;
+    pub fn set_parents(&mut self, id: TaskId, new_parents: Vec<TaskId>) -> Result<Task, CoreError>;
+    pub fn add_dependency(&mut self, id: TaskId, predecessor: TaskId, dep_type: DependencyType) -> Result<Task, CoreError>;
     pub fn remove_dependency(&mut self, id: TaskId, predecessor: TaskId) -> Result<Task, CoreError>;
     pub fn complete_task(&mut self, id: TaskId, cascade: bool) -> Result<Vec<Task>, CoreError>;
     pub fn preview_cascade(&self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError>;
@@ -221,65 +238,130 @@ contract encodes the "rm vs. rm -r" decision from §Context — deliberately
 as an explicit parameter rather than two method names, since the CLI/Web
 API each map it onto one confirmation prompt either way.
 
+With multiple parents, `DeleteMode::Subtree` only ever removes
+*parent-edges*, not tasks: deleting task A with `Subtree` drops the A→X
+edge for every child X, and X itself is only soft-deleted (tombstoned)
+once that leaves it with an empty `parent_ids` — i.e. A was its only
+parent. A child still reachable through another live parent (e.g. it's
+also under Goal B) stays untouched, just with one less parent, so
+deleting a goal can never silently delete a task that another goal still
+needs. `PromoteChildren` follows the same rule in reverse: A's parent
+edge on each child is replaced with an edge to A's own parents (or
+dropped, making the child top-level, if A had none) — for a child with
+other parents besides A, that's one more edge added alongside the ones
+it already keeps.
+
+`set_parents` replaces the old single-parent `reparent_task(id,
+Option<TaskId>)`. It takes the *whole* new parent list and applies it
+atomically: the hierarchy invariant (§1) is checked for every added
+parent before any edge is written, and if any one of them would create a
+cycle, the whole call is rejected with `CircularHierarchy` naming that
+specific parent — no partial reparenting. This is a bulk replace, not an
+incremental add/remove, because the per-edge cycle check doesn't depend
+on which other parents are being added in the same call (adding parent P
+to task `id` only risks a cycle if `id` is already an ancestor of P,
+independent of P's siblings in the call), so bulk-and-atomic gets the
+same error precision as one-edge-at-a-time without the extra round
+trips.
+
 ## Algorithms
 
 ### 1. Hierarchy invariant — no circular nesting (Stories 2.1 AC5)
 
-`reparent_task(id, new_parent)`: walk `new_parent`'s ancestor chain via
-`parent_id` up to the root. If `id` appears in that chain, reject with
-`CircularHierarchy`. O(depth) — no full-tree walk needed. `create_task`
-runs the same check when `NewTask.parent_id` is set (an id can't be its
-own ancestor at creation, but the check is shared code, not special-cased
-away).
+Multiple parents make the hierarchy a DAG, not a tree, so "ancestor
+chain" becomes "ancestor set reachable via `parent_ids`." `set_parents(id,
+new_parents)` checks each candidate `parent` in `new_parents`
+independently: DFS/BFS upward from `parent` following `parent_ids`
+edges, with a `visited` set (a shared ancestor reachable through two
+different paths — e.g. two of `id`'s new parents both rolling up to the
+same goal — is only walked once). If `id` is reachable in that walk,
+reject the whole call with `CircularHierarchy { task: id, attempted_parent:
+parent }` — no edges are written until every candidate parent has passed
+the check. O(edges) per call, same complexity class as the old O(depth)
+single-chain walk since `visited` bounds the work to each ancestor node
+once regardless of how many paths reach it. `create_task` runs the same
+check per entry in `NewTask.parent_ids` (an id can't be its own ancestor
+at creation, but the check is shared code, not special-cased away).
 
 ### 2. Dependency invariants (Story 3.1 AC2–3)
 
-`add_dependency(id, predecessor)`:
+`add_dependency(id, predecessor, dep_type)`:
 1. Reject if `id == predecessor` (self-dependency).
-2. Walk `id`'s ancestor chain and descendant subtree (hierarchy graph);
-   reject with `DependsOnRelative` if `predecessor` appears in either —
-   this is the one place a dependency check must cross into the
-   hierarchy graph, per HLD §4.
+2. Walk `id`'s ancestor *set* and descendant subtree in the hierarchy
+   graph — with multiple parents this is DAG reachability (§1's
+   memoized walk) rather than a single chain, in both directions: upward
+   from each of `id`'s `parent_ids`, and downward through everything
+   reachable as a descendant of `id`. Reject with `DependsOnRelative` if
+   `predecessor` appears in either set — this is the one place a
+   dependency check must cross into the hierarchy graph, per HLD §4.
 3. Cycle check on the dependency graph itself: before adding the edge
    `predecessor → id`, DFS from `id` following existing `depends_on`
    edges outward (i.e., walk what `id` already (transitively) depends
    on). If `predecessor` is reachable, the new edge would close a cycle
    — reject with `CircularDependency { cycle }`, where `cycle` is the
    path found. This is a plain reachability check, not a full
-   topological sort, and runs in O(edges) per call.
+   topological sort, and runs in O(edges) per call. The check doesn't
+   depend on `dep_type` — a cycle is a cycle regardless of which of the
+   four types closes it.
+4. If an edge already exists between `predecessor` and `id` (of any
+   type), it is replaced by the new one rather than adding a second edge
+   — see §Data Model, `Dependency` — so `add_dependency` is also how a
+   caller changes an existing edge's type.
 
 `remove_dependency` has no invariant to check — removing an edge can
 never introduce a cycle or a relative-dependency violation.
 
 ### 3. Cascade scheduling (Story 3.2 AC1–4)
 
+Each `DependencyType` anchors a different field of the predecessor to a
+different field of the successor:
+
+| Type | Constraint | Anchor field (predecessor) | Constrained field (successor) |
+|---|---|---|---|
+| Finish-to-Start (FS, default) | `successor.start ≥ predecessor.due` | `due_date` | `start_date` |
+| Start-to-Start (SS) | `successor.start ≥ predecessor.start` | `start_date` | `start_date` |
+| Finish-to-Finish (FF) | `successor.due ≥ predecessor.due` | `due_date` | `due_date` |
+| Start-to-Finish (SF) | `successor.due ≥ predecessor.start` | `start_date` | `due_date` |
+
+`constraint_ok(edge, pred, succ)` and `anchor_date(edge, pred)` are the
+two small per-type functions everything below is built from — the rest
+of the algorithm is type-agnostic once those exist.
+
 Two distinct triggers, kept separate because they have different
 observable outcomes:
 
 - **A task's own dates are edited directly** (`update_task` on a task
-  that itself has predecessors): if the new `start_date` would fall
-  before the latest `due_date` among its predecessors, the edit is
-  **allowed but flags `out_of_sync = true`** on that task (AC4 — manual
-  override, not an auto-correction).
-- **A predecessor's `due_date` changes, forward propagation to
-  successors** (AC1–2): for every successor whose constraint is now
-  violated, its dates shift forward by the same delta (duration
-  preserved), and that shift is *not* flagged out-of-sync — it's the
-  system doing its job, not an override.
+  that itself has predecessors): for each predecessor edge, if
+  `constraint_ok` is now violated, the edit is **allowed but flags
+  `out_of_sync = true`** on that task (AC4 — manual override, not an
+  auto-correction). A task with multiple predecessor edges (possibly of
+  different types) is out-of-sync if *any* edge is violated.
+- **A predecessor's `start_date` or `due_date` changes, forward
+  propagation to successors** (AC1–2): for every outgoing edge whose
+  constraint is now violated, the successor's *constrained field* shifts
+  forward by the same delta (duration preserved — the other field moves
+  with it), and that shift is *not* flagged out-of-sync — it's the
+  system doing its job, not an override. Because FS/SS constrain the
+  successor's `start_date` while FF/SF constrain its `due_date`, a
+  single predecessor change is checked against all outgoing edges
+  regardless of type — an SS edge can fire off a `start_date` change the
+  same way an FS edge fires off a `due_date` change.
 
 Cascade algorithm (used by both `update_task`'s forward-propagation step
 and `preview_cascade`):
 
 ```
-fn cascade(changed: TaskId, new_due: NaiveDate, graph) -> Vec<Task> {
+fn cascade(changed: TaskId, graph) -> Vec<Task> {
     let mut touched = HashMap::new();       // TaskId -> Task, dedup + latest value
     let mut queue = VecDeque::from([changed]);
     while let Some(current) = queue.pop_front() {
-        let due = touched.get(&current).map(|t| t.due_date).unwrap_or(new_due);
-        for successor in graph.successors_of(current) {  // tasks that depend on `current`
-            if successor.start_date < due {
-                let delta = due - successor.start_date;
-                let shifted = successor.shift_by(delta);  // preserves duration
+        let current_task = touched.get(&current).unwrap_or_else(|| graph.task(current));
+        for (successor, edge) in graph.successor_edges_of(current) {  // (task, DependencyType)
+            let succ_task = touched.get(&successor.id).unwrap_or(&successor);
+            if !constraint_ok(edge, current_task, succ_task) {
+                let anchor = anchor_date(edge, current_task);
+                let delta = anchor - constrained_field(edge, succ_task);
+                let shifted = succ_task.shift_by(delta);  // preserves duration; shifts both start and due
                 touched.insert(successor.id, shifted);
                 queue.push_back(successor.id);            // re-examine its own successors
             }
@@ -290,18 +372,18 @@ fn cascade(changed: TaskId, new_due: NaiveDate, graph) -> Vec<Task> {
 ```
 
 Because the dependency graph is acyclic by construction (§2 rejects
-cycles at edge-add time), this queue drains in finite steps — a task can
-be re-pushed if a later relaxation shifts it further out (multiple
-incoming edges), but each push strictly increases its `start_date`, so
-the loop terminates. `preview_cascade` runs this against an in-memory
-copy of the affected subgraph and returns the result **without** calling
-`Store::put_task` — same computation, no commit, satisfying Story 3.2
-AC3's "preview before committing".
+cycles at edge-add time, independent of edge type), this queue drains in
+finite steps — a task can be re-pushed if a later relaxation shifts it
+further out (multiple incoming edges), but each push strictly increases
+its constrained field, so the loop terminates. `preview_cascade` runs
+this against an in-memory copy of the affected subgraph and returns the
+result **without** calling `Store::put_task` — same computation, no
+commit, satisfying Story 3.2 AC3's "preview before committing".
 
-`update_task` calls `cascade` when `due_date` moves later, then persists
-`[changed_task] + touched` inside one `Store::transaction`, and returns
-the full `Vec<Task>` so a caller can refresh every affected view without
-re-querying (HLD §Interfaces guarantee).
+`update_task` calls `cascade` whenever `start_date` or `due_date` moves,
+then persists `[changed_task] + touched` inside one `Store::transaction`,
+and returns the full `Vec<Task>` so a caller can refresh every affected
+view without re-querying (HLD §Interfaces guarantee).
 
 ### 4. Progress rollup (Story 2.3 AC1–5)
 
@@ -321,6 +403,16 @@ A task's own `status` is independent of its rollup number once it has
 children (AC4) — `progress` and `status` are reported as two separate
 fields on `Task`, never conflated. O(n) for the whole tree per
 `get_tree` call, not O(n) per task.
+
+With multiple parents, "children" is the reverse lookup — every task
+whose `parent_ids` contains this task's id — and a task shared by two
+parents contributes its `progress` **in full to each parent
+independently**; there's no splitting or normalization across parents
+(a task at 50% counts as 50% toward both Goal A's and Goal B's rollup).
+That also means the hierarchy is walked as a DAG here too: the
+post-order traversal memoizes each task's computed `progress` by id, so
+a task reachable under two parents is computed once and reused, not
+recomputed once per path to it.
 
 ### 5. `complete_task` (Story 1.4 AC2, resolved per §Context)
 
@@ -345,8 +437,11 @@ rather than re-querying.
 Not a network contract (HLD §4) — a Rust trait so `bala-core` is
 testable against an in-memory fake today and the Data Store LLD's
 embedded engine is just another implementation. Per HLD, hierarchy
-(`parent_id`) and dependency edges are related-but-independent graphs
-stored distinctly, so the trait doesn't fold edges into the task row:
+(`parent_ids`) and dependency edges are related-but-independent graphs
+stored distinctly, so the trait doesn't fold edges into the task row.
+Multiple parents mean hierarchy is now an edge set rather than a single
+FK column, so it gets the same edge-table shape dependencies already
+have:
 
 ```rust
 pub trait Store {
@@ -361,8 +456,12 @@ pub trait StoreTx {
     fn put_task(&mut self, task: &Task) -> Result<(), StoreError>;
     fn list_tasks(&mut self, filter: &TreeFilter) -> Result<Vec<Task>, StoreError>;
 
-    fn list_dependency_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
-    fn add_dependency_edge(&mut self, predecessor: TaskId, successor: TaskId) -> Result<(), StoreError>;
+    fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
+    fn add_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
+    fn remove_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
+
+    fn list_dependency_edges(&mut self, id: TaskId) -> Result<Vec<Dependency>, StoreError>;
+    fn add_dependency_edge(&mut self, predecessor: TaskId, successor: TaskId, dep_type: DependencyType) -> Result<(), StoreError>;
     fn remove_dependency_edge(&mut self, predecessor: TaskId, successor: TaskId) -> Result<(), StoreError>;
 
     fn get_task_types(&mut self) -> Result<Vec<TaskType>, StoreError>;
@@ -388,11 +487,21 @@ flagged at the HLD level, not solved by adding locking here.
   algorithms in §Algorithms.
 - Name tests for behavior, not method name, per rust-best-practices:
   e.g. `add_dependency_should_reject_cycle_through_transitive_predecessor`,
-  `complete_task_should_block_when_children_incomplete_and_cascade_false`.
-- Property-style tests for cascade: random small DAGs, assert the
-  post-cascade graph satisfies "every successor's start ≥ every
-  predecessor's due" and that `preview_cascade` and `update_task` agree
-  on the touched set before the latter commits.
+  `complete_task_should_block_when_children_incomplete_and_cascade_false`,
+  `set_parents_should_reject_whole_call_when_one_candidate_creates_cycle`,
+  `delete_subtree_should_keep_child_reachable_through_other_parent`.
+- Cascade tests per `DependencyType`: one predecessor/successor pair for
+  each of FS/SS/FF/SF confirming the right field pair (start↔start,
+  due↔start, due↔due, start↔due) is checked and shifted; plus a mixed
+  case where the same predecessor has both an FS and an SS successor to
+  confirm each is evaluated by its own edge's rule independently.
+- Property-style tests for cascade: random small DAGs (with a random mix
+  of dependency types), assert the post-cascade graph satisfies each
+  edge's own type-specific constraint and that `preview_cascade` and
+  `update_task` agree on the touched set before the latter commits.
+- Multi-parent rollup: a task shared by two parents contributes its full
+  `progress` to both independently; assert the rollup traversal computes
+  it once (not once per parent) via a call-count/memoization check.
 
 ## Deferred to Other LLDs
 
@@ -419,6 +528,16 @@ flagged at the HLD level, not solved by adding locking here.
   same `cascade()` function by construction — there's no way for preview
   to drift from what actually commits, which is the whole point of
   Story 3.2 AC3.
+- Multiple parents turn the hierarchy into a DAG, which is now load-bearing
+  on §1's invariant check, §2's ancestor/descendant walk, §4's rollup,
+  and delete cascade semantics (§Method Contract) — a future move back to
+  strict single-parent would be a simplification, not free, since callers
+  (including the Web API) would already be built against `Vec<TaskId>`.
+- Typed dependencies are similarly load-bearing on §3's cascade algorithm:
+  starting with FS-only usage in practice doesn't defer any of this
+  complexity, since the constraint/anchor abstraction had to exist from
+  the start to keep FS a special case of the general rule rather than a
+  hardcoded path SS/FF/SF would later have to be retrofitted around.
 
 ## Action Items
 1. [ ] Scaffold `bala-core` crate with the module layout in §Decision
