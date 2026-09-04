@@ -183,8 +183,8 @@ indexing, and transaction boundaries are also deferred there.
 - No real-time sync (WebSocket/SSE) between multiple concurrent users/clients is in this HLD; "immediate" updates (Stories 1.1, 2.2, 2.3) are satisfied by direct calls into the library (v1) or normal request/response + optimistic UI (future web). Multi-client concurrent editing (e.g. CLI and web open on the same task data at once) isn't addressed here — noted so it isn't silently assumed away.
 
 ## Action Items
-1. [ ] Write Core Library LLD (method contract, hierarchy / scheduling / rollup modules)
-2. [ ] Write Data Store LLD
+1. [x] Write Core Library LLD (method contract, hierarchy / scheduling / rollup modules)
+2. [x] Write Data Store LLD
 3. [ ] Write CLI/TUI Client LLD
 4. [x] Decide soft-delete vs. undo mechanism for Story 1.3 AC5 — resolved: soft-delete, per Core Library LLD §Context
 5. [ ] Decide v1 export approach for Story 4.5 (text export now vs. defer image export to the Web Client)
