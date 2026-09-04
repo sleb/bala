@@ -151,10 +151,12 @@ CREATE TABLE dependency_edges (
     PRIMARY KEY (predecessor_id, successor_id)  -- one edge per pair (Core LLD §Data Model);
                                                  -- add_dependency_edge upserts, doesn't duplicate
 );
--- PK's leading column (predecessor_id) indexes "what does X depend on"
--- (dependency validity walk, §2). Reverse needs its own index:
-CREATE INDEX idx_dependency_edges_successor ON dependency_edges(successor_id); -- "what depends on X"
-                                                                                -- (cascade forward-propagation, §3)
+-- PK's leading column (predecessor_id) indexes "what depends on X"
+-- (cascade forward-propagation, §3; list_successor_edges). Reverse needs
+-- its own index:
+CREATE INDEX idx_dependency_edges_successor ON dependency_edges(successor_id); -- "what does X depend on"
+                                                                                -- (dependency validity walk, §2;
+                                                                                -- list_dependency_edges)
 ```
 
 `PRAGMA foreign_keys = ON` and `PRAGMA journal_mode = WAL` are set on
@@ -244,6 +246,10 @@ impl<'a> StoreTx for SqliteTx<'a> {
     fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
         // SELECT parent_id FROM parent_edges WHERE child_id = ?  (idx_parent_edges_child)
     }
+    fn list_child_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+        // SELECT child_id FROM parent_edges WHERE parent_id = ?  (PK's leading column —
+        // no extra index needed, same table §Schema already indexes both directions)
+    }
     fn add_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError> {
         // INSERT OR IGNORE INTO parent_edges ...  (idempotent: re-adding an existing edge is a no-op)
     }
@@ -254,6 +260,10 @@ impl<'a> StoreTx for SqliteTx<'a> {
     fn list_dependency_edges(&mut self, id: TaskId) -> Result<Vec<Dependency>, StoreError> {
         // SELECT predecessor_id, dep_type FROM dependency_edges WHERE successor_id = ?
         // (predecessors of id, i.e. Task.depends_on — matches Core LLD's Data Model shape)
+    }
+    fn list_successor_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+        // SELECT successor_id FROM dependency_edges WHERE predecessor_id = ?  (PK's leading
+        // column — "what depends on id", used by §Algorithm 3's forward-propagation walk)
     }
     fn add_dependency_edge(&mut self, predecessor: TaskId, successor: TaskId, dep_type: DependencyType) -> Result<(), StoreError> {
         // INSERT INTO dependency_edges ... ON CONFLICT(predecessor_id, successor_id) DO UPDATE SET dep_type = excluded.dep_type
@@ -298,13 +308,15 @@ task scale HLD cites). `get_task(id)` (single task) skips the batching
 and just does the 1+2 direct-lookup form, which is simpler and cheap at
 N=1.
 
-`TreeFilter`'s exact fields aren't fixed by Core LLD yet (see §Open
-Questions) — the indexes above (`type_key`, `status`, `assignee_id`, all
-partial on `deleted_at IS NULL`) are chosen to make the filter
-predicates Stories 2.4 AC4 ("filter/group by type") and 3.3 AC4
-("show only blocked/unblocked") imply cheap; a filter field this doesn't
-anticipate gets a full scan over live tasks, which is still fine at
-hundreds of rows.
+Core LLD's `TreeFilter` (§Data Model there) has four fields — `type_key`,
+`status`, `assignee_id`, `include_deleted` — and the indexes above
+(`type_key`, `status`, `assignee_id`, all partial on `deleted_at IS
+NULL`) cover exactly those, making the filter predicates Stories 2.4 AC4
+("filter/group by type") and 3.3 AC4 ("show only blocked/unblocked")
+imply cheap. `include_deleted = true` simply drops the `WHERE deleted_at
+IS NULL` predicate, falling back to a full scan on the (unindexed)
+`deleted_at` column — acceptable since it's the uncommon path and still
+fine at hundreds of rows.
 
 ## Testing Strategy
 
@@ -316,7 +328,9 @@ hundreds of rows.
   per the repo's existing convention (LLD-core-library.md §Testing
   Strategy): e.g. `add_parent_edge_should_be_idempotent_on_duplicate`,
   `add_dependency_edge_should_replace_type_on_existing_pair`,
-  `list_tasks_should_exclude_soft_deleted_by_default`.
+  `list_tasks_should_exclude_soft_deleted_by_default`,
+  `list_child_edges_should_return_all_children_of_multi_child_parent`,
+  `list_successor_edges_should_return_all_successors_of_multi_successor_predecessor`.
 - **Transaction atomicity**: a test that runs a `transaction` closure
   which writes several tasks/edges then returns `Err`, asserting nothing
   committed (`get_task` on any of them still returns the pre-transaction
@@ -338,41 +352,29 @@ hundreds of rows.
   assertion — a call-count assertion, matching the pattern
   LLD-core-library.md uses for its own memoization tests).
 
-## Open Questions (back to Core Library LLD)
+## Resolved Since First Draft
 
-Two things this LLD had to make an assumption about because Core LLD's
-`StoreTx` trait doesn't fully pin them down — noted rather than silently
-resolved, since both are Core LLD's call, not this layer's:
+Two things this LLD had made an assumption about because Core LLD's
+`StoreTx` trait didn't fully pin them down at the time — both raised
+back to Core LLD in review and now fixed there:
 
-1. **Reverse-edge lookups.** The trait exposes `list_parent_edges(id)`
-   and `list_dependency_edges(id)`, which this LLD assumes return,
-   respectively, *parents of `id`* and *predecessors of `id`* (i.e. they
-   populate `Task.parent_ids`/`Task.depends_on` directly) — matching
-   Core LLD §Algorithm 1's "upward walk" and §Algorithm 2 step 3's
-   "walk what `id` already depends on." But §Algorithm 3's cascade
-   (`graph.successor_edges_of(current)`) and §Algorithm 4's rollup
-   ("children" = reverse lookup of `parent_ids`) both need the *other*
-   direction, and neither is a named trait method. This LLD's schema
-   indexes both directions equally cheaply (`idx_parent_edges_child` /
-   the parent_edges PK; `idx_dependency_edges_successor` / the
-   dependency_edges PK) so it isn't blocked either way, but Core LLD
-   should confirm: does `Core` build the reverse index itself in memory
-   from a bulk `list_tasks` (consistent with rollup's "single post-order
-   traversal per call" already implying a fully-loaded, in-memory
-   subgraph), or should the trait grow explicit `list_child_edges`/
-   `list_dependency_successors` methods? This LLD works either way
-   without a schema change — it's purely a trait-surface question.
-2. **`TreeFilter`'s fields.** Referenced in `Core`'s method contract but
-   never defined. §Query Strategy assumes `type_key`, `status`,
-   `assignee_id`, and an include-deleted flag as the filterable fields
-   and indexes accordingly; confirm against whatever the CLI/TUI Client
-   LLD ends up needing for its list/tree/filter views (Stories 2.4 AC4,
-   3.3 AC4).
+1. **Reverse-edge lookups.** `StoreTx` now has named methods for both
+   directions: `list_parent_edges`/`list_dependency_edges` (parents of
+   `id` / predecessors of `id`, as this LLD already assumed) alongside
+   new `list_child_edges`/`list_successor_edges` (children of `id` /
+   successors of `id`) for §Algorithm 3's cascade and §Algorithm 4's
+   rollup. No schema change was needed — the reverse direction was
+   already indexed (`idx_parent_edges_child` and the `parent_edges` PK;
+   `idx_dependency_edges_successor` and the `dependency_edges` PK, see
+   §Schema); this only added the two trait methods and their
+   implementations above (§`Store`/`StoreTx` Implementation).
+2. **`TreeFilter`'s fields.** Now defined in Core LLD (§Data Model):
+   `type_key: Option<String>`, `status: Option<TaskStatus>`,
+   `assignee_id: Option<UserId>`, `include_deleted: bool` — exactly what
+   §Query Strategy assumed and already indexed for.
 
 ## Deferred to Other LLDs
 
-- **Core Library LLD:** resolve §Open Questions above (reverse-edge
-  trait surface, `TreeFilter` fields).
 - **CLI/TUI Client LLD:** where the SQLite file lives on disk (config/
   data dir convention, e.g. XDG on Linux) — `SqliteStore::open` takes a
   path and has no opinion on it.
@@ -410,8 +412,9 @@ resolved, since both are Core LLD's call, not this layer's:
 1. [ ] Scaffold `bala-store` crate; wire `refinery` migration runner
 2. [ ] Write `V1__init.sql` per §Schema; `SqliteStore::open`/`open_in_memory`
 3. [ ] Implement `task` module (`get_task`, `put_task`, batched `list_tasks` per §Query Strategy)
-4. [ ] Implement `edges` module (`parent_edges`, `dependency_edges` — idempotent add, plain remove)
+4. [ ] Implement `edges` module (`parent_edges`, `dependency_edges`, both directions —
+   `list_parent_edges`/`list_child_edges`, `list_dependency_edges`/`list_successor_edges` —
+   idempotent add, plain remove)
 5. [ ] Implement `types` module (`task_types` CRUD)
 6. [ ] Implement `Store::transaction` (`RefCell`-based, §Decision) and wire `SqliteTx`
 7. [ ] Write tests per §Testing Strategy, including the transaction-rollback and foreign-key smoke tests
-8. [ ] Raise §Open Questions with Core Library LLD before/while implementing — resolving them may add trait methods but shouldn't require a schema change here
