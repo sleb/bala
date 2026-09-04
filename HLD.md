@@ -185,6 +185,6 @@ indexing, and transaction boundaries are also deferred there.
 ## Action Items
 1. [x] Write Core Library LLD (method contract, hierarchy / scheduling / rollup modules)
 2. [x] Write Data Store LLD
-3. [ ] Write CLI/TUI Client LLD
+3. [x] Write CLI/TUI Client LLD
 4. [x] Decide soft-delete vs. undo mechanism for Story 1.3 AC5 — resolved: soft-delete, per Core Library LLD §Context
-5. [ ] Decide v1 export approach for Story 4.5 (text export now vs. defer image export to the Web Client)
+5. [x] Decide v1 export approach for Story 4.5 — resolved: text/ASCII export now, per CLI/TUI Client LLD §Algorithm 4 (PNG/PDF deferred to Web Client)
