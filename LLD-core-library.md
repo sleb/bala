@@ -131,6 +131,25 @@ pub struct TaskType {
     pub color: Option<String>,
     pub sort_order: i32,
 }
+
+/// Filter predicate for `get_tree`/`list_tasks`. All fields are ANDed;
+/// `None`/empty means "don't filter on this". Fixes the assumption
+/// Data Store LLD made ahead of this definition (its §Open Questions) —
+/// field-for-field, matching the indexes it already built for these:
+/// `type_key`, `status`, `assignee_id` each get a partial index on
+/// `deleted_at IS NULL`, and `include_deleted` toggles that predicate.
+pub struct TreeFilter {
+    pub type_key: Option<String>,
+    pub status: Option<TaskStatus>,
+    pub assignee_id: Option<UserId>,
+    pub include_deleted: bool,  // default false: soft-deleted tasks excluded
+}
+
+impl Default for TreeFilter {
+    fn default() -> Self {
+        Self { type_key: None, status: None, assignee_id: None, include_deleted: false }
+    }
+}
 ```
 
 **`TaskPatch` — the "don't touch" vs. "clear" problem.** A plain
@@ -457,10 +476,12 @@ pub trait StoreTx {
     fn list_tasks(&mut self, filter: &TreeFilter) -> Result<Vec<Task>, StoreError>;
 
     fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
+    fn list_child_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
     fn add_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
     fn remove_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
 
     fn list_dependency_edges(&mut self, id: TaskId) -> Result<Vec<Dependency>, StoreError>;
+    fn list_successor_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
     fn add_dependency_edge(&mut self, predecessor: TaskId, successor: TaskId, dep_type: DependencyType) -> Result<(), StoreError>;
     fn remove_dependency_edge(&mut self, predecessor: TaskId, successor: TaskId) -> Result<(), StoreError>;
 
@@ -468,6 +489,16 @@ pub trait StoreTx {
     fn put_task_type(&mut self, t: &TaskType) -> Result<(), StoreError>;
 }
 ```
+
+`list_child_edges`/`list_successor_edges` are the reverse of
+`list_parent_edges`/`list_dependency_edges` — resolving Data Store LLD's
+§Open Questions item 1 as named trait methods rather than something
+`Core` reconstructs in memory from a bulk `list_tasks`. §Algorithm 3's
+cascade (`graph.successor_edges_of(current)`) calls `list_successor_edges`
+per task walked, and §Algorithm 4's rollup ("children" = reverse lookup
+of `parent_ids`) calls `list_child_edges` per task in its post-order
+traversal — both were already relying on this direction existing, just
+without a named method to call.
 
 Every `Core` method that touches more than one task (cascade, subtree
 delete/complete) wraps its writes in one `Store::transaction` call, so a
@@ -506,7 +537,10 @@ flagged at the HLD level, not solved by adding locking here.
 ## Deferred to Other LLDs
 
 - **Data Store LLD:** which embedded engine implements `Store`/`StoreTx`,
-  schema, indexing for tree + dependency queries at 200+ tasks.
+  schema, indexing for tree + dependency queries at 200+ tasks. (Its own
+  two open questions back to this LLD — reverse-edge trait methods and
+  `TreeFilter`'s fields — are now resolved above: `list_child_edges`/
+  `list_successor_edges` and §Data Model's `TreeFilter`.)
 - **CLI/TUI Client LLD:** how `preview_cascade`'s result is rendered as a
   confirmation prompt (Story 3.2 AC3) and how `IncompleteChildren`/
   `CircularHierarchy`/etc. map to on-screen messages.
