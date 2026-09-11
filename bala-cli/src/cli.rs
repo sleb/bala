@@ -317,14 +317,19 @@ fn run_task_edit(db_path: &Path, args: EditArgs) -> Result<(), CliError> {
 fn run_task_delete(db_path: &Path, args: &DeleteArgs) -> Result<(), CliError> {
     let mut core = open_core(db_path)?;
     let target_id = TaskId::from(args.id);
-    let target = core
-        .get_tree(TreeFilter::default())?
-        .into_iter()
-        .find(|task| task.id == target_id)
-        .ok_or(CoreError::NotFound(target_id))?;
 
-    let children: Vec<Task> = core
-        .get_tree(TreeFilter::default())?
+    // `Core` exposes no single-task lookup or "children of id" method, so
+    // finding the target and its children both require scanning the full
+    // tree — but one fetch is enough for both; the CLI-level inefficiency
+    // this replaces was calling `get_tree` twice for the same snapshot.
+    let mut tasks = core.get_tree(TreeFilter::default())?;
+    let target_index = tasks
+        .iter()
+        .position(|task| task.id == target_id)
+        .ok_or(CoreError::NotFound(target_id))?;
+    let target = tasks.swap_remove(target_index);
+
+    let children: Vec<Task> = tasks
         .into_iter()
         .filter(|task| task.parent_ids.contains(&target_id))
         .collect();
