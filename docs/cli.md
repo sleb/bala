@@ -16,6 +16,9 @@ or working with multiple task lists:
 bala --db-path ./my-project.db task ls
 ```
 
+See [config.md](config.md) for the full path-resolution details and default
+locations per OS.
+
 ## Running with no subcommand
 
 ```sh
