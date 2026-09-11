@@ -3,7 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-09-03
 **Deciders:** Scott (product/eng)
-**Related:** [HLD.md](./HLD.md) (CLI/TUI Client component), [LLD-core-library.md](./LLD-core-library.md) (`Core<S: Store>` facade this LLD calls in-process), [LLD-data-store.md](./LLD-data-store.md) (`SqliteStore::open` path this LLD supplies), [STORIES.md](./STORIES.md) (Epics 1–4)
+**Related:** [HLD.md](./HLD.md) (CLI/TUI Client component), [core-library.md](./core-library.md) (`Core<S: Store>` facade this LLD calls in-process), [data-store.md](./data-store.md) (`SqliteStore::open` path this LLD supplies), [STORIES.md](./STORIES.md) (Epics 1–4)
 
 ## Context
 
@@ -160,7 +160,7 @@ pub enum Edge { Both, Start, Due }   // which date(s) a reschedule nudge moves
 ```
 
 `Mode` lives on `App` and gates key dispatch: `tui::keymap` maps a
-`KeyEvent` to an `Action` *given the current mode*, so the same physical
+`KeyEvent` to an `Action` _given the current mode_, so the same physical
 key means different things in different modes without a giant flat
 `match` (e.g. `h`/`l` pan the tree cursor in `Normal`, nudge dates in
 `Reschedule`, move the text cursor in `Insert`). `Esc` is universal:
@@ -172,38 +172,38 @@ simply dropped, never persisted (§Algorithm 3).
 4.1 AC2's "tree on the left" — the right pane toggles between Detail and
 Gantt):
 
-| Key | Action |
-|---|---|
-| `j`/`k`, `↓`/`↑` | move selection in the flattened visible tree |
-| `h`/`l`, `←`/`→` | collapse/expand focused task (Story 2.2 AC1) |
-| `gg` / `G` | jump to first/last visible task |
-| `E` / `C` | expand all / collapse all (Story 2.2 AC3) |
-| `o` / `O` | new subtask under focused task / new top-level task → `Insert{title}` (Stories 1.1, 2.1) |
-| `Enter` | open Detail pane on focused task |
-| `i` (in Detail pane) | edit a field → `Insert` (Story 1.2) |
-| `dd` | delete focused task → `Confirm` (Story 1.3) |
-| `x` / `Space` | toggle complete → `Confirm` only if blocked by incomplete children (Story 1.4) |
-| `m` | reparent (`set_parents`) → `Insert{parent list}` (Story 2.1 AC4) |
-| `p` / `P` | add / remove dependency → `Insert{predecessor}` (Story 3.1) |
-| `t` | set task type → `Insert{type}` (Story 2.4) |
-| `g` (Gantt toggle) | switch right pane Detail ↔ Gantt (Story 4.1) |
-| `r` | enter `Reschedule` for focused task; switches right pane to Gantt if it isn't already showing, so the bar being nudged is visible (Story 4.3 AC1) |
-| `+`/`-` | zoom gantt scale in/out — Day↔Week↔Month (Story 4.2 AC1) |
-| `T` | jump-to-today: recenters `gantt_anchor` (Story 4.2 AC3) |
-| `f` | open filter menu → `Filter` (type/status/blocked-only) |
-| `?` | help overlay → `Help` |
-| `q` | save config, quit |
+| Key                  | Action                                                                                                                                            |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `j`/`k`, `↓`/`↑`     | move selection in the flattened visible tree                                                                                                      |
+| `h`/`l`, `←`/`→`     | collapse/expand focused task (Story 2.2 AC1)                                                                                                      |
+| `gg` / `G`           | jump to first/last visible task                                                                                                                   |
+| `E` / `C`            | expand all / collapse all (Story 2.2 AC3)                                                                                                         |
+| `o` / `O`            | new subtask under focused task / new top-level task → `Insert{title}` (Stories 1.1, 2.1)                                                          |
+| `Enter`              | open Detail pane on focused task                                                                                                                  |
+| `i` (in Detail pane) | edit a field → `Insert` (Story 1.2)                                                                                                               |
+| `dd`                 | delete focused task → `Confirm` (Story 1.3)                                                                                                       |
+| `x` / `Space`        | toggle complete → `Confirm` only if blocked by incomplete children (Story 1.4)                                                                    |
+| `m`                  | reparent (`set_parents`) → `Insert{parent list}` (Story 2.1 AC4)                                                                                  |
+| `p` / `P`            | add / remove dependency → `Insert{predecessor}` (Story 3.1)                                                                                       |
+| `t`                  | set task type → `Insert{type}` (Story 2.4)                                                                                                        |
+| `g` (Gantt toggle)   | switch right pane Detail ↔ Gantt (Story 4.1)                                                                                                      |
+| `r`                  | enter `Reschedule` for focused task; switches right pane to Gantt if it isn't already showing, so the bar being nudged is visible (Story 4.3 AC1) |
+| `+`/`-`              | zoom gantt scale in/out — Day↔Week↔Month (Story 4.2 AC1)                                                                                          |
+| `T`                  | jump-to-today: recenters `gantt_anchor` (Story 4.2 AC3)                                                                                           |
+| `f`                  | open filter menu → `Filter` (type/status/blocked-only)                                                                                            |
+| `?`                  | help overlay → `Help`                                                                                                                             |
+| `q`                  | save config, quit                                                                                                                                 |
 
 **Reschedule mode** (Story 4.3 AC1–3):
 
-| Key | Action |
-|---|---|
-| `h`/`l` | nudge both dates back/forward by one `gantt_scale` unit (duration preserved) |
-| `Tab` | switch `edge` between `Both`/`Start`/`Due` |
-| `H`/`L` (with `edge != Both`) | resize the selected edge independently |
-| `:` | numeric/date entry → `Insert{date}` for a larger jump, then back to `Reschedule` |
-| `Enter` | commit — calls `update_task` with the accumulated date change |
-| `Esc` | discard preview, return to `Normal` |
+| Key                           | Action                                                                           |
+| ----------------------------- | -------------------------------------------------------------------------------- |
+| `h`/`l`                       | nudge both dates back/forward by one `gantt_scale` unit (duration preserved)     |
+| `Tab`                         | switch `edge` between `Both`/`Start`/`Due`                                       |
+| `H`/`L` (with `edge != Both`) | resize the selected edge independently                                           |
+| `:`                           | numeric/date entry → `Insert{date}` for a larger jump, then back to `Reschedule` |
+| `Enter`                       | commit — calls `update_task` with the accumulated date change                    |
+| `Esc`                         | discard preview, return to `Normal`                                              |
 
 **Confirm mode** presents the `CoreError`-derived prompt text (§Error
 Rendering) and accepts `y`/`n` only; `y` runs the `PendingAction`
@@ -395,14 +395,14 @@ passed, so scripting isn't blocked on a TTY prompt.
 Every `CoreError` variant (Core LLD §Error Taxonomy) maps to one
 rendering rule, shared by the TUI status bar and CLI subcommand stderr:
 
-| `CoreError` variant | TUI | CLI |
-|---|---|---|
-| `EmptyTitle`, `InvalidDateRange` | inline message under the `Insert` field, blocks submit | stderr, nonzero exit, no partial write |
-| `CircularHierarchy` | inline in `Insert{parent list}` (reparent) | stderr, nonzero exit |
-| `DependsOnRelative`, `CircularDependency` | inline in `Insert{predecessor}` | stderr, nonzero exit |
-| `IncompleteChildren` | routes to `Confirm` offering cascade (§Modes) | stderr suggesting `--cascade`, nonzero exit |
-| `NotFound`, `UnknownTaskType` | status-bar message (defensive — shouldn't normally be reachable from a rendered list) | stderr, nonzero exit |
-| `Store(_)` | status-bar "storage error", task list unchanged | stderr, nonzero exit |
+| `CoreError` variant                       | TUI                                                                                   | CLI                                         |
+| ----------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `EmptyTitle`, `InvalidDateRange`          | inline message under the `Insert` field, blocks submit                                | stderr, nonzero exit, no partial write      |
+| `CircularHierarchy`                       | inline in `Insert{parent list}` (reparent)                                            | stderr, nonzero exit                        |
+| `DependsOnRelative`, `CircularDependency` | inline in `Insert{predecessor}`                                                       | stderr, nonzero exit                        |
+| `IncompleteChildren`                      | routes to `Confirm` offering cascade (§Modes)                                         | stderr suggesting `--cascade`, nonzero exit |
+| `NotFound`, `UnknownTaskType`             | status-bar message (defensive — shouldn't normally be reachable from a rendered list) | stderr, nonzero exit                        |
+| `Store(_)`                                | status-bar "storage error", task list unchanged                                       | stderr, nonzero exit                        |
 
 No `CoreError` variant is ever displayed as a raw `Debug`/`{:?}` dump —
 every one has a specific rendering per this table, so a caller (this
@@ -447,7 +447,7 @@ rather than falling back to string parsing, per HLD's original
 - **Web Client LLD:** true PNG/PDF export (§Algorithm 4); browser-side
   equivalent of every screen here, per HLD's client-boundary rule (no
   business logic in either client).
-- Nothing here is deferred *from* HLD that isn't now resolved: terminal
+- Nothing here is deferred _from_ HLD that isn't now resolved: terminal
   view components, Gantt rendering/zoom/pan, keyboard rescheduling, the
   Story 4.5 export mechanism, and the config file format (HLD's five
   explicit action items for this LLD) are all fixed above. Data Store
