@@ -175,3 +175,148 @@ fn task_add_with_unknown_assignee_fails_with_clear_error() {
         .failure()
         .stderr(contains("unknown user"));
 }
+
+fn add_task(db_path: &std::path::Path, args: &[&str]) -> String {
+    let mut full_args = vec!["task", "add"];
+    full_args.extend_from_slice(args);
+    let output = bala_cmd(db_path)
+        .args(full_args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).unwrap().trim().to_owned()
+}
+
+#[test]
+fn task_edit_should_update_title_and_show_in_ls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Old title"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--title", "New title"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("New title").and(contains("Old title").not()));
+}
+
+#[test]
+fn task_edit_should_clear_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(
+        &db_path,
+        &["--title", "Task with desc", "--description", "Some desc"],
+    );
+
+    // `task ls` doesn't currently surface description at all, so there's no
+    // visible-output assertion available here — the observable surface for
+    // this checkpoint is just that the edit itself succeeds.
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--clear-description"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn task_edit_with_empty_title_should_fail_with_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Has a title"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--title", ""])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn task_edit_with_unknown_task_id_should_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let unknown_task_id = uuid::Uuid::new_v4().to_string();
+
+    bala_cmd(&db_path)
+        .args([
+            "task",
+            "edit",
+            &unknown_task_id,
+            "--title",
+            "Doesn't matter",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn task_edit_should_set_and_clear_assignee() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let user_id = String::from_utf8(
+        bala_cmd(&db_path)
+            .args(["user", "add", "--name", "Ada"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    let task_id = add_task(&db_path, &["--title", "Ship it"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--assignee", &user_id])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("Ada"));
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--clear-assignee"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("Ada").not());
+}
+
+#[test]
+fn task_edit_with_conflicting_value_and_clear_flags_should_fail_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Ship it"]);
+
+    bala_cmd(&db_path)
+        .args([
+            "task",
+            "edit",
+            &task_id,
+            "--description",
+            "X",
+            "--clear-description",
+        ])
+        .assert()
+        .failure();
+}

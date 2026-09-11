@@ -477,6 +477,49 @@ mod tests {
     }
 
     #[test]
+    fn put_task_should_update_existing_row_and_bump_updated_at() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        task.title = "New Title".to_owned();
+        task.status = TaskStatus::Complete;
+        task.updated_at += chrono::Duration::seconds(60);
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert_eq!(fetched, Some(task));
+
+        let listed = store
+            .transaction(|tx| tx.list_tasks(&TreeFilter::default()))
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn put_task_should_clear_optional_fields_to_null_on_update() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let user = sample_user("Ada Lovelace");
+        store.transaction(|tx| tx.put_user(&user)).unwrap();
+
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.description = Some("Some description".to_owned());
+        task.start_date = Some(Utc::now().date_naive());
+        task.due_date = Some(Utc::now().date_naive());
+        task.assignee_id = Some(user.id);
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        task.description = None;
+        task.start_date = None;
+        task.due_date = None;
+        task.assignee_id = None;
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert_eq!(fetched, Some(task));
+    }
+
+    #[test]
     fn put_task_should_fail_when_assignee_id_references_nonexistent_user() {
         // Confirms the FK added by `migrations/V2__add_users.sql`
         // (`assignee_id BLOB REFERENCES users(id)`) is actually enforced,

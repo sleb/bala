@@ -146,6 +146,45 @@ pub struct TreeFilter {
     pub include_deleted: bool,
 }
 
+/// One field of a [`TaskPatch`]: distinguishes "leave alone" from "set to
+/// nothing" for `Option<T>`-backed fields, which a plain `Option<T>`
+/// (ambiguous) or `Option<Option<T>>` (compiles, but `Some(None)` isn't
+/// self-documenting at call sites) cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Field<T> {
+    /// Leave the field as-is.
+    #[default]
+    Keep,
+    /// Set the field to this value.
+    Set(T),
+    /// Clear the field (only meaningful for `Option<T>` targets, e.g.
+    /// `description`).
+    Clear,
+}
+
+/// Input to `Core::update_task`. Every field defaults to [`Field::Keep`];
+/// callers build one with struct-update syntax against
+/// [`TaskPatch::default`], touching only what changed, e.g.
+/// `TaskPatch { title: Field::Set("New title".into()), ..Default::default() }`.
+///
+/// `parent_ids` and dependency edits are intentionally not here — those go
+/// through their own dedicated methods (`set_parents`,
+/// `add_dependency`/`remove_dependency`) because each carries its own
+/// invariant check that a generic patch would obscure.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskPatch {
+    pub title: Field<String>,
+    /// `Clear` maps to `None`.
+    pub description: Field<String>,
+    /// `Clear` maps to `None`.
+    pub start_date: Field<NaiveDate>,
+    /// `Clear` maps to `None`.
+    pub due_date: Field<NaiveDate>,
+    /// `Clear` unassigns the task.
+    pub assignee_id: Field<UserId>,
+    pub type_key: Field<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +320,41 @@ mod tests {
         };
         let cloned = user.clone();
         assert_eq!(user, cloned);
+    }
+
+    #[test]
+    fn task_patch_default_has_every_field_keep() {
+        let patch = TaskPatch::default();
+        assert_eq!(patch.title, Field::Keep);
+        assert_eq!(patch.description, Field::Keep);
+        assert_eq!(patch.start_date, Field::Keep);
+        assert_eq!(patch.due_date, Field::Keep);
+        assert_eq!(patch.assignee_id, Field::Keep);
+        assert_eq!(patch.type_key, Field::Keep);
+    }
+
+    #[test]
+    fn field_variants_are_distinct_and_comparable() {
+        let keep: Field<String> = Field::Keep;
+        let set_x: Field<String> = Field::Set("x".to_owned());
+        let set_x_again: Field<String> = Field::Set("x".to_owned());
+        let clear: Field<String> = Field::Clear;
+
+        assert_ne!(keep, set_x);
+        assert_ne!(set_x, clear);
+        assert_ne!(keep, clear);
+        assert_eq!(set_x, set_x_again);
+    }
+
+    #[test]
+    fn field_clone_and_eq_agree() {
+        let string_field: Field<String> = Field::Set("hello".to_owned());
+        let cloned_string_field = string_field.clone();
+        assert_eq!(string_field, cloned_string_field);
+
+        let date_field: Field<NaiveDate> =
+            Field::Set(NaiveDate::from_ymd_opt(2026, 9, 10).expect("valid date"));
+        let cloned_date_field = date_field.clone();
+        assert_eq!(date_field, cloned_date_field);
     }
 }

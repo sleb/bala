@@ -10,7 +10,9 @@ use chrono::Utc;
 
 use crate::error::CoreError;
 use crate::hierarchy::check_new_parent;
-use crate::model::{NewTask, Task, TaskId, TaskStatus, TaskType, TreeFilter, User, UserId};
+use crate::model::{
+    Field, NewTask, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User, UserId,
+};
 use crate::store::Store;
 
 /// The stable key of the default task type every `Core` seeds on
@@ -189,6 +191,98 @@ impl<S: Store> Core<S> {
     /// Returns `Err` if the backend fails.
     pub fn list_task_types(&self) -> Result<Vec<TaskType>, CoreError> {
         Ok(self.store.transaction(|tx| tx.get_task_types())?)
+    }
+
+    /// Updates an existing task per LLD §Algorithm (Story 1.2): applies
+    /// `patch` field-by-field, validates the resulting state, bumps
+    /// `updated_at`, and persists.
+    ///
+    /// `patch.title` and `patch.type_key` are `String`-backed, not
+    /// `Option`-backed, on [`Task`], so [`Field::Clear`] on either is a
+    /// defensive no-op equivalent to [`Field::Keep`] rather than a real
+    /// path — no caller in this checkpoint constructs one.
+    ///
+    /// Scoped to exactly what Story 1.2 needs: no cascade rescheduling of
+    /// dependents or subtasks (Epic 3) — a task's own dates and
+    /// assignment change in isolation, and this always returns a
+    /// single-element `Vec` until that cascade lands.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::NotFound`] if `id` names no existing task.
+    /// - [`CoreError::EmptyTitle`] if the resulting title is empty or
+    ///   whitespace-only.
+    /// - [`CoreError::UnknownTaskType`] if the resulting `type_key` names
+    ///   no configured [`TaskType`].
+    /// - [`CoreError::InvalidDateRange`] if the resulting `start_date`
+    ///   and `due_date` are both `Some` and `due_date` is before
+    ///   `start_date`.
+    /// - [`CoreError::UnknownUser`] if `patch.assignee_id` is
+    ///   [`Field::Set`] to a value naming no existing [`User`].
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn update_task(&mut self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError> {
+        let mut task = self
+            .store
+            .transaction(|tx| tx.get_task(id))?
+            .ok_or(CoreError::NotFound(id))?;
+
+        if let Field::Set(title) = patch.title {
+            task.title = title;
+        }
+        if task.title.trim().is_empty() {
+            return Err(CoreError::EmptyTitle);
+        }
+
+        if let Field::Set(type_key) = patch.type_key {
+            task.type_key = type_key;
+        }
+        let types = self.store.transaction(|tx| tx.get_task_types())?;
+        if !types.iter().any(|t| t.key == task.type_key) {
+            return Err(CoreError::UnknownTaskType(task.type_key));
+        }
+
+        match patch.description {
+            Field::Keep => {}
+            Field::Set(description) => task.description = Some(description),
+            Field::Clear => task.description = None,
+        }
+
+        match patch.start_date {
+            Field::Keep => {}
+            Field::Set(start_date) => task.start_date = Some(start_date),
+            Field::Clear => task.start_date = None,
+        }
+        match patch.due_date {
+            Field::Keep => {}
+            Field::Set(due_date) => task.due_date = Some(due_date),
+            Field::Clear => task.due_date = None,
+        }
+        if let (Some(start), Some(due)) = (task.start_date, task.due_date)
+            && due < start
+        {
+            return Err(CoreError::InvalidDateRange { start, due });
+        }
+
+        match patch.assignee_id {
+            Field::Keep => {}
+            Field::Set(assignee_id) => {
+                let assignee_exists = self
+                    .store
+                    .transaction(|tx| tx.get_user(assignee_id))?
+                    .is_some();
+                if !assignee_exists {
+                    return Err(CoreError::UnknownUser(assignee_id));
+                }
+                task.assignee_id = Some(assignee_id);
+            }
+            Field::Clear => task.assignee_id = None,
+        }
+
+        task.updated_at = Utc::now();
+
+        self.store.transaction(|tx| tx.put_task(&task))?;
+
+        Ok(vec![task])
     }
 
     /// Inserts or replaces the task type with `t.key`.
@@ -554,5 +648,321 @@ mod tests {
             .unwrap();
 
         assert_eq!(tree, vec![alice_task]);
+    }
+
+    #[test]
+    fn update_task_should_reject_when_task_not_found() {
+        let mut core = new_core();
+        let missing = TaskId::new();
+
+        let result = core.update_task(missing, TaskPatch::default());
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
+    #[test]
+    fn update_task_should_update_title_when_set() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Original")).unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    title: Field::Set("Renamed".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated[0].title, "Renamed");
+    }
+
+    #[test]
+    fn update_task_should_leave_title_unchanged_when_kept() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Original")).unwrap();
+
+        let updated = core.update_task(task.id, TaskPatch::default()).unwrap();
+
+        assert_eq!(updated[0].title, "Original");
+    }
+
+    #[test]
+    fn update_task_should_reject_empty_title() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Original")).unwrap();
+
+        let result = core.update_task(
+            task.id,
+            TaskPatch {
+                title: Field::Set(String::new()),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(result, Err(CoreError::EmptyTitle)));
+    }
+
+    #[test]
+    fn update_task_should_reject_whitespace_only_title() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Original")).unwrap();
+
+        let result = core.update_task(
+            task.id,
+            TaskPatch {
+                title: Field::Set("   \t  ".to_owned()),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(result, Err(CoreError::EmptyTitle)));
+    }
+
+    #[test]
+    fn update_task_should_set_and_clear_description() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    description: Field::Set("Details".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated[0].description.as_deref(), Some("Details"));
+
+        let cleared = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    description: Field::Clear,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared[0].description, None);
+    }
+
+    #[test]
+    fn update_task_should_set_and_clear_start_and_due_dates() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let due = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    start_date: Field::Set(start),
+                    due_date: Field::Set(due),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated[0].start_date, Some(start));
+        assert_eq!(updated[0].due_date, Some(due));
+
+        let cleared = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    start_date: Field::Clear,
+                    due_date: Field::Clear,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared[0].start_date, None);
+        assert_eq!(cleared[0].due_date, None);
+    }
+
+    #[test]
+    fn update_task_should_reject_due_date_before_start_date_after_patch() {
+        let mut core = new_core();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let earlier_due = NaiveDate::from_ymd_opt(2025, 12, 1).unwrap();
+        let task = core
+            .create_task(NewTask {
+                start_date: Some(start),
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+
+        let result = core.update_task(
+            task.id,
+            TaskPatch {
+                due_date: Field::Set(earlier_due),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(CoreError::InvalidDateRange { start: s, due: d }) if s == start && d == earlier_due
+        ));
+    }
+
+    #[test]
+    fn update_task_should_set_and_clear_assignee() {
+        let mut core = new_core();
+        let user = core.create_user("Ada".to_owned()).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    assignee_id: Field::Set(user.id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated[0].assignee_id, Some(user.id));
+
+        let cleared = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    assignee_id: Field::Clear,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared[0].assignee_id, None);
+    }
+
+    #[test]
+    fn update_task_should_reject_unknown_assignee_id() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let unknown_assignee = UserId::new();
+
+        let result = core.update_task(
+            task.id,
+            TaskPatch {
+                assignee_id: Field::Set(unknown_assignee),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(result, Err(CoreError::UnknownUser(id)) if id == unknown_assignee));
+    }
+
+    #[test]
+    fn update_task_should_update_type_key_when_set() {
+        let mut core = new_core();
+        let goal = TaskType {
+            key: "goal".to_owned(),
+            label: "Goal".to_owned(),
+            color: None,
+            sort_order: 1,
+        };
+        core.upsert_task_type(goal).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    type_key: Field::Set("goal".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated[0].type_key, "goal");
+    }
+
+    #[test]
+    fn update_task_should_reject_unknown_type_key() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let result = core.update_task(
+            task.id,
+            TaskPatch {
+                type_key: Field::Set("bogus".to_owned()),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(result, Err(CoreError::UnknownTaskType(key)) if key == "bogus"));
+    }
+
+    #[test]
+    fn update_task_should_bump_updated_at_but_not_created_at() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    title: Field::Set("Renamed".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated[0].created_at, task.created_at);
+        assert!(updated[0].updated_at >= task.updated_at);
+    }
+
+    #[test]
+    fn update_task_should_not_change_subtasks_dates() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child_start = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let child_due = NaiveDate::from_ymd_opt(2026, 2, 28).unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                start_date: Some(child_start),
+                due_date: Some(child_due),
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        let new_start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let new_due = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        core.update_task(
+            parent.id,
+            TaskPatch {
+                start_date: Field::Set(new_start),
+                due_date: Field::Set(new_due),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
+        assert_eq!(child_after.start_date, Some(child_start));
+        assert_eq!(child_after.due_date, Some(child_due));
+    }
+
+    #[test]
+    fn update_task_should_return_only_the_updated_task() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let result = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    title: Field::Set("Renamed".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "Renamed");
     }
 }

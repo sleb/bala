@@ -11,5 +11,7 @@ mod store;
 pub use error::CoreError;
 pub use facade::Core;
 pub use in_memory_store::InMemoryStore;
-pub use model::{NewTask, Task, TaskId, TaskStatus, TaskType, TreeFilter, User, UserId};
+pub use model::{
+    Field, NewTask, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User, UserId,
+};
 pub use store::{Store, StoreError, StoreTx};
