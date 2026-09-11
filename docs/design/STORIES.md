@@ -12,7 +12,9 @@
 
 ## Epic 1: Core Task Management
 
-### Story 1.1 — Create a Task
+[![Epic 1 progress](https://img.shields.io/github/milestones/progress-percent/sleb/bala/1)](https://github.com/sleb/bala/milestone/1)
+
+### Story 1.1 — Create a Task [![Issue #6](https://img.shields.io/github/issues/detail/state/sleb/bala/6)](https://github.com/sleb/bala/issues/6)
 **Description:** As a user, I want to create a task with a title and optional details, so that I can start tracking work.
 
 **Acceptance Criteria:**
@@ -27,7 +29,7 @@
 story yet defines user/assignee management (no `User` entity, no assignee store or
 validation). Deferred to Story 1.1a below rather than built ahead of that design.
 
-### Story 1.1a — Assign a Task *(new, split from 1.1)*
+### Story 1.1a — Assign a Task *(new, split from 1.1)* [![Issue #9](https://img.shields.io/github/issues/detail/state/sleb/bala/9)](https://github.com/sleb/bala/issues/9)
 **Description:** As a user, I want to set a task's assignee, so that it's clear who owns the work.
 
 **Acceptance Criteria:**
@@ -36,9 +38,7 @@ validation). Deferred to Story 1.1a below rather than built ahead of that design
    real user store, something else?) is decided here rather than assumed.
 3. Assignee is visible on the task in list/detail views.
 
-**Status:** Planned — see [issue #9](https://github.com/sleb/bala/issues/9).
-
-### Story 1.2 — Edit a Task
+### Story 1.2 — Edit a Task [![Issue #11](https://img.shields.io/github/issues/detail/state/sleb/bala/11)](https://github.com/sleb/bala/issues/11)
 **Description:** As a user, I want to edit a task's details, so that I can keep it accurate as work progresses.
 
 **Acceptance Criteria:**
@@ -48,7 +48,7 @@ validation). Deferred to Story 1.1a below rather than built ahead of that design
 4. Validation errors (e.g., due date before start date) are shown inline and block save.
 5. Editing a task does not silently change its subtasks' dates.
 
-### Story 1.3 — Delete a Task
+### Story 1.3 — Delete a Task [![Issue #12](https://img.shields.io/github/issues/detail/state/sleb/bala/12)](https://github.com/sleb/bala/issues/12)
 **Description:** As a user, I want to delete a task, so that I can remove work that's no longer relevant.
 
 **Acceptance Criteria:**
@@ -58,7 +58,7 @@ validation). Deferred to Story 1.1a below rather than built ahead of that design
 4. Deleted task is removed from all views (list, board, Gantt) immediately.
 5. Deletion is either soft (recoverable for N days) or accompanied by an "undo" toast — decision noted for later design.
 
-### Story 1.4 — Mark a Task Complete
+### Story 1.4 — Mark a Task Complete [![Issue #13](https://img.shields.io/github/issues/detail/state/sleb/bala/13)](https://github.com/sleb/bala/issues/13)
 **Description:** As a user, I want to mark a task as done, so that I can track progress.
 
 **Acceptance Criteria:**
