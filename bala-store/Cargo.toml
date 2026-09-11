@@ -1,0 +1,15 @@
+[package]
+name = "bala-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bala-core = { path = "../bala-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+refinery = { version = "0.8", features = ["rusqlite"] }
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
