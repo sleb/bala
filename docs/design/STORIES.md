@@ -58,6 +58,11 @@ validation). Deferred to Story 1.1a below rather than built ahead of that design
 4. Deleted task is removed from all views (list, board, Gantt) immediately.
 5. Deletion is either soft (recoverable for N days) or accompanied by an "undo" toast — decision noted for later design.
 
+**Note:** AC3 depends on the dependency model (Epic 3), which doesn't exist yet — no
+`depends_on` field, no `add_dependency` method. Until Story 3.1 ships, no task can
+possibly depend on another, so AC3 is vacuously satisfied; real enforcement (warning
+which specific dependents are affected) lands with Story 3.1's dependency model.
+
 ### Story 1.4 — Mark a Task Complete [![Issue #13](https://img.shields.io/github/issues/detail/state/sleb/bala/13)](https://github.com/sleb/bala/issues/13)
 **Description:** As a user, I want to mark a task as done, so that I can track progress.
 
