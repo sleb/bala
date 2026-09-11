@@ -30,6 +30,7 @@ fn main() -> ExitCode {
 
     let result = match command {
         Commands::Task(task_args) => cli::run_task_command(&db_path, task_args.command),
+        Commands::User(user_args) => cli::run_user_command(&db_path, user_args.command),
     };
 
     match result {

@@ -36,7 +36,7 @@ validation). Deferred to Story 1.1a below rather than built ahead of that design
    real user store, something else?) is decided here rather than assumed.
 3. Assignee is visible on the task in list/detail views.
 
-**Status:** Not yet planned — placeholder so this doesn't get silently dropped.
+**Status:** Planned — see [issue #9](https://github.com/sleb/bala/issues/9).
 
 ### Story 1.2 — Edit a Task
 **Description:** As a user, I want to edit a task's details, so that I can keep it accurate as work progresses.

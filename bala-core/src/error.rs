@@ -3,15 +3,15 @@
 
 use chrono::NaiveDate;
 
-use crate::model::TaskId;
+use crate::model::{TaskId, UserId};
 use crate::store::StoreError;
 
 /// Errors the `Core` facade can return.
 ///
 /// This is a subset of the full taxonomy in `docs/design/core-library.md`
-/// §Error Taxonomy: only the variants needed by Story 1.1 (create a task).
-/// Later stories add `CircularHierarchy`, `DependsOnRelative`,
-/// `CircularDependency`, and `IncompleteChildren`.
+/// §Error Taxonomy: only the variants needed by Story 1.1 (create a task)
+/// and Story 1.1a (assign a task). Later stories add `CircularHierarchy`,
+/// `DependsOnRelative`, `CircularDependency`, and `IncompleteChildren`.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("task {0:?} not found")]
@@ -25,6 +25,12 @@ pub enum CoreError {
 
     #[error("unknown task type {0:?}")]
     UnknownTaskType(String),
+
+    #[error("user name must not be empty")]
+    EmptyUserName,
+
+    #[error("unknown user {0:?}")]
+    UnknownUser(UserId),
 
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -61,6 +67,21 @@ mod tests {
     fn unknown_task_type_display_includes_debug_of_key() {
         let err = CoreError::UnknownTaskType("bogus".to_owned());
         assert_eq!(err.to_string(), "unknown task type \"bogus\"");
+    }
+
+    #[test]
+    fn empty_user_name_display_message() {
+        assert_eq!(
+            CoreError::EmptyUserName.to_string(),
+            "user name must not be empty"
+        );
+    }
+
+    #[test]
+    fn unknown_user_display_includes_user_id_debug() {
+        let id = UserId::new();
+        let err = CoreError::UnknownUser(id);
+        assert_eq!(err.to_string(), format!("unknown user {id:?}"));
     }
 
     #[test]

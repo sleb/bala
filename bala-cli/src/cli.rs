@@ -1,9 +1,10 @@
 //! Command dispatch: builds a `Core<SqliteStore>` over the resolved db path
 //! and drives it from parsed CLI arguments.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use bala_core::{Core, CoreError, NewTask, StoreError, TaskId, TreeFilter};
+use bala_core::{Core, CoreError, NewTask, StoreError, TaskId, TreeFilter, UserId};
 use bala_store::SqliteStore;
 use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
@@ -26,6 +27,8 @@ pub struct Cli {
 pub enum Commands {
     /// Task operations: `add`, `ls`.
     Task(TaskArgs),
+    /// User operations: `add`, `ls`.
+    User(UserArgs),
 }
 
 #[derive(Debug, Args)]
@@ -60,6 +63,30 @@ pub struct AddArgs {
 
     #[arg(long)]
     pub due: Option<NaiveDate>,
+
+    /// Id of the user to assign the new task to.
+    #[arg(long)]
+    pub assignee: Option<Uuid>,
+}
+
+#[derive(Debug, Args)]
+pub struct UserArgs {
+    #[command(subcommand)]
+    pub command: UserCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UserCommands {
+    /// Create a new user.
+    Add(UserAddArgs),
+    /// List all users.
+    Ls,
+}
+
+#[derive(Debug, Args)]
+pub struct UserAddArgs {
+    #[arg(long)]
+    pub name: String,
 }
 
 /// Errors that can surface while dispatching a command, distinct from
@@ -116,6 +143,7 @@ fn run_task_add(db_path: &Path, args: AddArgs) -> Result<(), CliError> {
         type_key: None,
         start_date: args.start,
         due_date: args.due,
+        assignee_id: args.assignee.map(UserId::from),
     };
     let task = core.create_task(new_task)?;
     println!("{}", Uuid::from(task.id));
@@ -125,12 +153,52 @@ fn run_task_add(db_path: &Path, args: AddArgs) -> Result<(), CliError> {
 fn run_task_ls(db_path: &Path) -> Result<(), CliError> {
     let core = open_core(db_path)?;
     let tasks = core.get_tree(TreeFilter::default())?;
+    let names: HashMap<UserId, String> = core
+        .list_users()?
+        .into_iter()
+        .map(|user| (user.id, user.name))
+        .collect();
     for task in &tasks {
         // Minimal nesting: indent one level under a task's first parent
         // (if any) so a child visibly nests under it — full recursive tree
         // layout is the TUI's job later.
         let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-        println!("{indent}{} {}", Uuid::from(task.id), task.title);
+        let assignee = task
+            .assignee_id
+            .and_then(|id| names.get(&id))
+            .map(|name| format!(" (assigned: {name})"))
+            .unwrap_or_default();
+        println!("{indent}{} {}{assignee}", Uuid::from(task.id), task.title);
+    }
+    Ok(())
+}
+
+/// Runs the given user command against the store at `db_path`, printing to
+/// stdout on success.
+///
+/// # Errors
+///
+/// Returns `Err` if the store can't be opened or the underlying `Core`
+/// call fails.
+pub fn run_user_command(db_path: &Path, command: UserCommands) -> Result<(), CliError> {
+    match command {
+        UserCommands::Add(args) => run_user_add(db_path, args),
+        UserCommands::Ls => run_user_ls(db_path),
+    }
+}
+
+fn run_user_add(db_path: &Path, args: UserAddArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let user = core.create_user(args.name)?;
+    println!("{}", Uuid::from(user.id));
+    Ok(())
+}
+
+fn run_user_ls(db_path: &Path) -> Result<(), CliError> {
+    let core = open_core(db_path)?;
+    let users = core.list_users()?;
+    for user in &users {
+        println!("{} {}", Uuid::from(user.id), user.name);
     }
     Ok(())
 }

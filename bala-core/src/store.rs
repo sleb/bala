@@ -6,7 +6,7 @@
 //! methods; those land in later stories that actually use them, per the
 //! "don't speculatively build methods this story doesn't need" guidance.
 
-use crate::model::{Task, TaskId, TaskType, TreeFilter};
+use crate::model::{Task, TaskId, TaskType, TreeFilter, User, UserId};
 
 /// Errors from the storage boundary.
 ///
@@ -44,6 +44,28 @@ pub trait Store {
 
 /// Operations available inside one [`Store::transaction`] call.
 pub trait StoreTx {
+    /// Looks up a user by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails. Returns `Ok(None)`, not `Err`,
+    /// when no user with `id` exists.
+    fn get_user(&mut self, id: UserId) -> Result<Option<User>, StoreError>;
+
+    /// Inserts or replaces the user with `user.id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    fn put_user(&mut self, user: &User) -> Result<(), StoreError>;
+
+    /// Lists every user.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    fn list_users(&mut self) -> Result<Vec<User>, StoreError>;
+
     /// Looks up a task by id.
     ///
     /// # Errors

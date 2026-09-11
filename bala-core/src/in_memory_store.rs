@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::model::{Task, TaskId, TaskType, TreeFilter};
+use crate::model::{Task, TaskId, TaskType, TreeFilter, User, UserId};
 use crate::store::{Store, StoreError, StoreTx};
 
 /// Test double for [`Store`], backed by in-memory maps.
@@ -23,6 +23,7 @@ pub struct InMemoryStore {
 
 #[derive(Debug, Default)]
 struct State {
+    users: HashMap<UserId, User>,
     tasks: HashMap<TaskId, Task>,
     /// child -> its parents.
     parent_edges: HashMap<TaskId, Vec<TaskId>>,
@@ -40,6 +41,19 @@ impl Store for InMemoryStore {
 }
 
 impl StoreTx for State {
+    fn get_user(&mut self, id: UserId) -> Result<Option<User>, StoreError> {
+        Ok(self.users.get(&id).cloned())
+    }
+
+    fn put_user(&mut self, user: &User) -> Result<(), StoreError> {
+        self.users.insert(user.id, user.clone());
+        Ok(())
+    }
+
+    fn list_users(&mut self) -> Result<Vec<User>, StoreError> {
+        Ok(self.users.values().cloned().collect())
+    }
+
     fn get_task(&mut self, id: TaskId) -> Result<Option<Task>, StoreError> {
         Ok(self.tasks.get(&id).cloned())
     }
@@ -60,6 +74,11 @@ impl StoreTx for State {
                     .is_none_or(|type_key| task.type_key == type_key)
             })
             .filter(|task| filter.status.is_none_or(|status| task.status == status))
+            .filter(|task| {
+                filter
+                    .assignee_id
+                    .is_none_or(|assignee_id| task.assignee_id == Some(assignee_id))
+            })
             .cloned()
             .collect())
     }
@@ -101,6 +120,7 @@ mod tests {
             status,
             start_date: None,
             due_date: None,
+            assignee_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -257,5 +277,53 @@ mod tests {
 
         let listed = store.transaction(|tx| tx.get_task_types()).unwrap();
         assert_eq!(listed, vec![task_type]);
+    }
+
+    #[test]
+    fn put_user_then_get_user_returns_same_user() {
+        let store = InMemoryStore::default();
+        let user = User {
+            id: UserId::new(),
+            name: "Ada".to_owned(),
+        };
+
+        store.transaction(|tx| tx.put_user(&user)).unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_user(user.id)).unwrap();
+        assert_eq!(fetched, Some(user));
+    }
+
+    #[test]
+    fn get_user_for_unknown_id_returns_none() {
+        let store = InMemoryStore::default();
+        let fetched = store.transaction(|tx| tx.get_user(UserId::new())).unwrap();
+        assert_eq!(fetched, None);
+    }
+
+    #[test]
+    fn list_users_returns_all_put_users() {
+        let store = InMemoryStore::default();
+        let a = User {
+            id: UserId::new(),
+            name: "Ada".to_owned(),
+        };
+        let b = User {
+            id: UserId::new(),
+            name: "Grace".to_owned(),
+        };
+
+        store
+            .transaction(|tx| {
+                tx.put_user(&a)?;
+                tx.put_user(&b)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut listed = store.transaction(|tx| tx.list_users()).unwrap();
+        listed.sort_by_key(|u| Uuid::from(u.id));
+        let mut expected = vec![a, b];
+        expected.sort_by_key(|u| Uuid::from(u.id));
+        assert_eq!(listed, expected);
     }
 }
