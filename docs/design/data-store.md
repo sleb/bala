@@ -3,7 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-09-03
 **Deciders:** Scott (product/eng)
-**Related:** [HLD.md](./HLD.md) (Data Store component), [LLD-core-library.md](./LLD-core-library.md) (`Store`/`StoreTx` trait boundary this LLD implements)
+**Related:** [HLD.md](./HLD.md) (Data Store component), [LLD-core-library.md](./core-library.md) (`Store`/`StoreTx` trait boundary this LLD implements)
 
 ## Context
 
@@ -81,11 +81,11 @@ flowchart TB
 `RefCell` — not a `Mutex` — because `Store::transaction` takes `&self`
 (per Core LLD) while `rusqlite::Connection::transaction()` needs `&mut
 Connection`. `RefCell` gets `&self` → `&mut Connection` without changing
-Core LLD's already-committed trait signature. This is safe *and*
+Core LLD's already-committed trait signature. This is safe _and_
 sufficient specifically because Core LLD's storage boundary already
 assumes single-writer-at-a-time (no concurrent `Store` callers) — a
 `RefCell` panics on reentrant borrow rather than blocking, so a caller
-that ever *did* nest one `Store::transaction` inside another would panic
+that ever _did_ nest one `Store::transaction` inside another would panic
 immediately in dev/test rather than deadlock or silently interleave.
 `SqliteStore` is therefore `!Sync`; if a future multi-threaded caller
 needs one, that caller wraps it in a `Mutex<SqliteStore>` at its own
@@ -310,7 +310,7 @@ impl<'a> StoreTx for SqliteTx<'a> {
 upserts**, not plain inserts: the edge tables' primary keys make a
 duplicate `add_parent_edge` on an already-existing edge a silent no-op
 (`INSERT OR IGNORE`) rather than a constraint-violation error, and a
-repeated `add_dependency_edge` on an existing pair *replaces* the type
+repeated `add_dependency_edge` on an existing pair _replaces_ the type
 rather than erroring — this is what makes that call double as "change an
 existing edge's type" per Core LLD §Algorithm 2 step 4, with no special
 "does this edge already exist" branch needed on the `bala-core` side.
@@ -327,7 +327,7 @@ path batches:
    to get the matching id set and scalar fields.
 2. One query against `parent_edges WHERE child_id IN (...)` for the
    whole id set, grouped by `child_id` in Rust into a `HashMap<TaskId,
-   Vec<TaskId>>`.
+Vec<TaskId>>`.
 3. One query against `dependency_edges WHERE successor_id IN (...)`,
    same grouping.
 4. Zip the three into `Vec<Task>`.
@@ -378,7 +378,7 @@ fine at hundreds of rows.
   a child has >1 parent edge row.
 - **Foreign-key/constraint smoke test**: writing an edge or dependency
   referencing a nonexistent task id fails fast via the `PRAGMA
-  foreign_keys` constraint, confirming it's actually enabled per
+foreign_keys` constraint, confirming it's actually enabled per
   connection (a common `rusqlite` footgun — the pragma must be set on
   every new connection, it isn't a database-file-level setting).
 - A perf smoke test seeding 200+ tasks with a realistic edge density and
@@ -413,7 +413,7 @@ back to Core LLD in review and now fixed there:
 - **CLI/TUI Client LLD:** where the SQLite file lives on disk (config/
   data dir convention, e.g. XDG on Linux) — `SqliteStore::open` takes a
   path and has no opinion on it.
-- Nothing here is deferred *from* HLD that isn't now resolved: engine,
+- Nothing here is deferred _from_ HLD that isn't now resolved: engine,
   schema, and indexing (HLD's three explicit action items for this LLD)
   are all fixed above.
 
@@ -448,8 +448,8 @@ back to Core LLD in review and now fixed there:
 2. [ ] Write `V1__init.sql` per §Schema; `SqliteStore::open`/`open_in_memory`
 3. [ ] Implement `task` module (`get_task`, `put_task`, batched `list_tasks` per §Query Strategy)
 4. [ ] Implement `edges` module (`parent_edges`, `dependency_edges`, both directions —
-   `list_parent_edges`/`list_child_edges`, `list_dependency_edges`/`list_successor_edges` —
-   idempotent add, plain remove)
+       `list_parent_edges`/`list_child_edges`, `list_dependency_edges`/`list_successor_edges` —
+       idempotent add, plain remove)
 5. [ ] Implement `types` module (`task_types` CRUD)
 6. [ ] Implement `Store::transaction` (`RefCell`-based, §Decision) and wire `SqliteTx`
 7. [ ] Write tests per §Testing Strategy, including the transaction-rollback and foreign-key smoke tests
