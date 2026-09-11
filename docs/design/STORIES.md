@@ -17,11 +17,26 @@
 
 **Acceptance Criteria:**
 1. User can create a task with at minimum a title (required, non-empty).
-2. Optional fields at creation: description, start date, due date, assignee.
+2. Optional fields at creation: description, start date, due date.
 3. New task appears immediately in the task list without a page reload.
 4. Empty/whitespace-only title is rejected with an inline error.
 5. Created task gets a unique ID and a "created at" timestamp.
 6. Task defaults to top-level (no parent) unless created from within another task.
+
+**Note:** Assignee was originally listed as an optional field at creation (AC2), but no
+story yet defines user/assignee management (no `User` entity, no assignee store or
+validation). Deferred to Story 1.1a below rather than built ahead of that design.
+
+### Story 1.1a — Assign a Task *(new, split from 1.1)*
+**Description:** As a user, I want to set a task's assignee, so that it's clear who owns the work.
+
+**Acceptance Criteria:**
+1. `assignee_id` can be set at creation or via edit (Story 1.2).
+2. Assignee identity/validation model (is it a free-text name, a `UserId` referencing a
+   real user store, something else?) is decided here rather than assumed.
+3. Assignee is visible on the task in list/detail views.
+
+**Status:** Not yet planned — placeholder so this doesn't get silently dropped.
 
 ### Story 1.2 — Edit a Task
 **Description:** As a user, I want to edit a task's details, so that I can keep it accurate as work progresses.
