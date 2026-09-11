@@ -8,7 +8,7 @@ use predicates::prelude::*;
 use predicates::str::contains;
 
 fn bala_cmd(db_path: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("bala-cli").unwrap();
+    let mut cmd = Command::cargo_bin("bala").unwrap();
     cmd.arg("--db-path").arg(db_path);
     cmd
 }
