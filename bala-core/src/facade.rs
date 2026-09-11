@@ -1,0 +1,409 @@
+//! The `Core` facade (LLD §Decision, §Method Contract): the single entry
+//! point every caller (CLI today, Web API later) drives.
+//!
+//! Scoped to exactly what Story 1.1 needs: `create_task`, `get_tree`, and
+//! thin `TaskType` pass-throughs. `update_task`, `delete_task`,
+//! `set_parents`, dependency methods, cascade, rollup, and `complete_task`
+//! belong to later stories/epics and are deliberately absent.
+
+use chrono::Utc;
+
+use crate::error::CoreError;
+use crate::hierarchy::check_new_parent;
+use crate::model::{NewTask, Task, TaskId, TaskStatus, TaskType, TreeFilter};
+use crate::store::Store;
+
+/// The stable key of the default task type every `Core` seeds on
+/// construction (LLD §Data Model: `type_key` "defaults to `\"task\"`").
+const DEFAULT_TYPE_KEY: &str = "task";
+
+/// Facade over a [`Store`] backend, generic rather than boxed (LLD
+/// §Decision: exactly one store implementation is live at a time, so
+/// static dispatch costs nothing).
+#[derive(Debug)]
+pub struct Core<S: Store> {
+    store: S,
+}
+
+impl<S: Store> Core<S> {
+    /// Constructs a `Core` backed by `store`, seeding the default
+    /// `"task"` [`TaskType`] if one isn't already present, so a freshly
+    /// constructed `Core` always has a type `create_task` can default to.
+    /// Idempotent: constructing another `Core` over a store that already
+    /// has the default type leaves it untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails while checking or seeding the
+    /// default task type.
+    pub fn new(store: S) -> Result<Self, CoreError> {
+        store.transaction(|tx| {
+            let types = tx.get_task_types()?;
+            if types.iter().any(|t| t.key == DEFAULT_TYPE_KEY) {
+                return Ok(());
+            }
+            tx.put_task_type(&TaskType {
+                key: DEFAULT_TYPE_KEY.to_owned(),
+                label: "Task".to_owned(),
+                color: None,
+                sort_order: 0,
+            })
+        })?;
+        Ok(Self { store })
+    }
+
+    /// Creates a task per LLD §Algorithm (Story 1.1): validates the
+    /// title, type key, date range, and each given parent, then persists
+    /// the new task and its parent edges.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::EmptyTitle`] if `new.title` is empty or
+    ///   whitespace-only.
+    /// - [`CoreError::UnknownTaskType`] if `new.type_key` (or the
+    ///   default) names no configured [`TaskType`].
+    /// - [`CoreError::InvalidDateRange`] if both dates are given and
+    ///   `due_date` is before `start_date`.
+    /// - [`CoreError::NotFound`] if any of `new.parent_ids` names no
+    ///   existing task.
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn create_task(&mut self, new: NewTask) -> Result<Task, CoreError> {
+        if new.title.trim().is_empty() {
+            return Err(CoreError::EmptyTitle);
+        }
+
+        let type_key = new.type_key.unwrap_or_else(|| DEFAULT_TYPE_KEY.to_owned());
+        let types = self.store.transaction(|tx| tx.get_task_types())?;
+        if !types.iter().any(|t| t.key == type_key) {
+            return Err(CoreError::UnknownTaskType(type_key));
+        }
+
+        if let (Some(start), Some(due)) = (new.start_date, new.due_date)
+            && due < start
+        {
+            return Err(CoreError::InvalidDateRange { start, due });
+        }
+
+        for &parent_id in &new.parent_ids {
+            let parent_exists = self
+                .store
+                .transaction(|tx| tx.get_task(parent_id))?
+                .is_some();
+            if !parent_exists {
+                return Err(CoreError::NotFound(parent_id));
+            }
+        }
+
+        let now = Utc::now();
+        let task = Task {
+            id: TaskId::new(),
+            title: new.title,
+            description: new.description,
+            parent_ids: new.parent_ids,
+            type_key,
+            status: TaskStatus::Incomplete,
+            start_date: new.start_date,
+            due_date: new.due_date,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.store.transaction(|tx| {
+            tx.put_task(&task)?;
+            for &parent_id in &task.parent_ids {
+                check_new_parent(tx, parent_id, task.id)?;
+                tx.add_parent_edge(parent_id, task.id)?;
+            }
+            Ok(())
+        })?;
+
+        Ok(task)
+    }
+
+    /// Lists tasks matching `filter`.
+    ///
+    /// Scoped to this checkpoint: a thin pass-through to
+    /// `Store::list_tasks`, with no progress rollup (Story 2.3) or
+    /// hierarchy assembly beyond what `Task::parent_ids` already carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    // `TreeFilter` is taken by value to match the LLD §Method Contract
+    // signature (`get_tree(&self, filter: TreeFilter)`), which callers
+    // build fresh per call rather than reuse.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn get_tree(&self, filter: TreeFilter) -> Result<Vec<Task>, CoreError> {
+        Ok(self.store.transaction(|tx| tx.list_tasks(&filter))?)
+    }
+
+    /// Lists every configured task type.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    pub fn list_task_types(&self) -> Result<Vec<TaskType>, CoreError> {
+        Ok(self.store.transaction(|tx| tx.get_task_types())?)
+    }
+
+    /// Inserts or replaces the task type with `t.key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    pub fn upsert_task_type(&mut self, t: TaskType) -> Result<TaskType, CoreError> {
+        self.store.transaction(|tx| tx.put_task_type(&t))?;
+        Ok(t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::in_memory_store::InMemoryStore;
+    use crate::model::TaskStatus;
+    use chrono::NaiveDate;
+
+    fn new_core() -> Core<InMemoryStore> {
+        Core::new(InMemoryStore::default()).unwrap()
+    }
+
+    fn minimal_new_task(title: &str) -> NewTask {
+        NewTask {
+            title: title.to_owned(),
+            description: None,
+            parent_ids: Vec::new(),
+            type_key: None,
+            start_date: None,
+            due_date: None,
+        }
+    }
+
+    #[test]
+    fn create_task_should_reject_empty_title() {
+        let mut core = new_core();
+
+        let result = core.create_task(minimal_new_task(""));
+
+        assert!(matches!(result, Err(CoreError::EmptyTitle)));
+    }
+
+    #[test]
+    fn create_task_should_reject_whitespace_only_title() {
+        let mut core = new_core();
+
+        let result = core.create_task(minimal_new_task("   \t  "));
+
+        assert!(matches!(result, Err(CoreError::EmptyTitle)));
+    }
+
+    #[test]
+    fn create_task_should_assign_unique_id_and_created_at() {
+        let mut core = new_core();
+
+        let a = core.create_task(minimal_new_task("Task A")).unwrap();
+        let b = core.create_task(minimal_new_task("Task B")).unwrap();
+
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.created_at, a.updated_at);
+        assert_eq!(b.created_at, b.updated_at);
+    }
+
+    #[test]
+    fn create_task_should_default_to_top_level_when_no_parent_given() {
+        let mut core = new_core();
+
+        let task = core.create_task(minimal_new_task("Top level")).unwrap();
+
+        assert!(task.parent_ids.is_empty());
+    }
+
+    #[test]
+    fn create_task_should_attach_to_given_parent_when_parent_ids_provided() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        assert_eq!(child.parent_ids, vec![parent.id]);
+    }
+
+    #[test]
+    fn create_task_should_reject_when_given_parent_does_not_exist() {
+        let mut core = new_core();
+        let missing_parent = TaskId::new();
+
+        let result = core.create_task(NewTask {
+            parent_ids: vec![missing_parent],
+            ..minimal_new_task("Orphan")
+        });
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing_parent));
+    }
+
+    #[test]
+    fn create_task_should_default_type_key_to_task_when_unset() {
+        let mut core = new_core();
+
+        let task = core.create_task(minimal_new_task("Untyped")).unwrap();
+
+        assert_eq!(task.type_key, "task");
+    }
+
+    #[test]
+    fn create_task_should_reject_unknown_type_key() {
+        let mut core = new_core();
+
+        let result = core.create_task(NewTask {
+            type_key: Some("bogus".to_owned()),
+            ..minimal_new_task("Mistyped")
+        });
+
+        assert!(matches!(result, Err(CoreError::UnknownTaskType(key)) if key == "bogus"));
+    }
+
+    #[test]
+    fn create_task_should_store_optional_description_and_dates() {
+        let mut core = new_core();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let due = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+
+        let task = core
+            .create_task(NewTask {
+                description: Some("Details".to_owned()),
+                start_date: Some(start),
+                due_date: Some(due),
+                ..minimal_new_task("With details")
+            })
+            .unwrap();
+
+        assert_eq!(task.description.as_deref(), Some("Details"));
+        assert_eq!(task.start_date, Some(start));
+        assert_eq!(task.due_date, Some(due));
+    }
+
+    #[test]
+    fn create_task_should_reject_due_date_before_start_date() {
+        let mut core = new_core();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+        let due = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+        let result = core.create_task(NewTask {
+            start_date: Some(start),
+            due_date: Some(due),
+            ..minimal_new_task("Backwards dates")
+        });
+
+        assert!(matches!(
+            result,
+            Err(CoreError::InvalidDateRange { start: s, due: d }) if s == start && d == due
+        ));
+    }
+
+    #[test]
+    fn create_task_should_run_hierarchy_check_for_each_given_parent() {
+        // The hierarchy check is a no-op at this checkpoint (Story 2.1
+        // gives it teeth), so the honest thing to assert here is that
+        // attaching a task under several parents in one call still
+        // succeeds and records every edge — i.e. the per-parent check
+        // (`hierarchy::check_new_parent`) runs without rejecting any of
+        // them. `hierarchy::tests::check_new_parent_always_succeeds_for_a_fresh_child`
+        // separately unit-tests the function itself.
+        let mut core = new_core();
+        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
+        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
+
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent_a.id, parent_b.id],
+                ..minimal_new_task("Multi-parent child")
+            })
+            .unwrap();
+
+        assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
+    }
+
+    #[test]
+    fn get_tree_should_include_a_just_created_task() {
+        let mut core = new_core();
+
+        let created = core.create_task(minimal_new_task("Findable")).unwrap();
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+
+        assert!(tree.contains(&created));
+    }
+
+    #[test]
+    fn new_should_seed_default_task_type() {
+        let core = new_core();
+
+        let types = core.list_task_types().unwrap();
+
+        assert!(types.iter().any(|t| t.key == "task"));
+    }
+
+    #[test]
+    fn new_is_idempotent_about_seeding_the_default_task_type() {
+        let store = InMemoryStore::default();
+        let core_a = Core::new(store).unwrap();
+        let types_after_first = core_a.list_task_types().unwrap();
+        assert_eq!(
+            types_after_first.iter().filter(|t| t.key == "task").count(),
+            1
+        );
+
+        // Re-seeding over a store that already has the default leaves it
+        // as a single entry, not a duplicate.
+        let store_with_default = InMemoryStore::default();
+        store_with_default
+            .transaction(|tx| {
+                tx.put_task_type(&TaskType {
+                    key: "task".to_owned(),
+                    label: "Task".to_owned(),
+                    color: None,
+                    sort_order: 0,
+                })
+            })
+            .unwrap();
+        let core_b = Core::new(store_with_default).unwrap();
+        let types_after_second = core_b.list_task_types().unwrap();
+        assert_eq!(
+            types_after_second
+                .iter()
+                .filter(|t| t.key == "task")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn list_task_types_and_upsert_task_type_round_trip() {
+        let mut core = new_core();
+        let goal = TaskType {
+            key: "goal".to_owned(),
+            label: "Goal".to_owned(),
+            color: None,
+            sort_order: 1,
+        };
+
+        let upserted = core.upsert_task_type(goal.clone()).unwrap();
+        let types = core.list_task_types().unwrap();
+
+        assert_eq!(upserted, goal);
+        assert!(types.contains(&goal));
+    }
+
+    #[test]
+    fn create_task_uses_status_incomplete() {
+        let mut core = new_core();
+
+        let task = core.create_task(minimal_new_task("New")).unwrap();
+
+        assert_eq!(task.status, TaskStatus::Incomplete);
+    }
+}
