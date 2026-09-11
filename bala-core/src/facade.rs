@@ -221,66 +221,73 @@ impl<S: Store> Core<S> {
     ///   [`Field::Set`] to a value naming no existing [`User`].
     /// - [`CoreError::Store`] if the backend fails.
     pub fn update_task(&mut self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError> {
-        let mut task = self
-            .store
-            .transaction(|tx| tx.get_task(id))?
-            .ok_or(CoreError::NotFound(id))?;
+        // Every lookup, the patch application, validation, and the final
+        // `put_task` all run inside one `Store::transaction` closure — not
+        // one per step — so a concurrent writer can't slip a change in
+        // between our read and our write and have it silently clobbered by
+        // a `put_task` built from a now-stale snapshot. Domain-level
+        // rejections (`NotFound`, `EmptyTitle`, ...) are threaded out as
+        // `Ok(Err(_))`, distinct from backend failures (`StoreError`,
+        // propagated via `?` as usual), and unwrapped by the two `?`s
+        // below.
+        let task = self.store.transaction(|tx| {
+            let Some(mut task) = tx.get_task(id)? else {
+                return Ok(Err(CoreError::NotFound(id)));
+            };
 
-        if let Field::Set(title) = patch.title {
-            task.title = title;
-        }
-        if task.title.trim().is_empty() {
-            return Err(CoreError::EmptyTitle);
-        }
-
-        if let Field::Set(type_key) = patch.type_key {
-            task.type_key = type_key;
-        }
-        let types = self.store.transaction(|tx| tx.get_task_types())?;
-        if !types.iter().any(|t| t.key == task.type_key) {
-            return Err(CoreError::UnknownTaskType(task.type_key));
-        }
-
-        match patch.description {
-            Field::Keep => {}
-            Field::Set(description) => task.description = Some(description),
-            Field::Clear => task.description = None,
-        }
-
-        match patch.start_date {
-            Field::Keep => {}
-            Field::Set(start_date) => task.start_date = Some(start_date),
-            Field::Clear => task.start_date = None,
-        }
-        match patch.due_date {
-            Field::Keep => {}
-            Field::Set(due_date) => task.due_date = Some(due_date),
-            Field::Clear => task.due_date = None,
-        }
-        if let (Some(start), Some(due)) = (task.start_date, task.due_date)
-            && due < start
-        {
-            return Err(CoreError::InvalidDateRange { start, due });
-        }
-
-        match patch.assignee_id {
-            Field::Keep => {}
-            Field::Set(assignee_id) => {
-                let assignee_exists = self
-                    .store
-                    .transaction(|tx| tx.get_user(assignee_id))?
-                    .is_some();
-                if !assignee_exists {
-                    return Err(CoreError::UnknownUser(assignee_id));
-                }
-                task.assignee_id = Some(assignee_id);
+            if let Field::Set(title) = patch.title {
+                task.title = title;
             }
-            Field::Clear => task.assignee_id = None,
-        }
+            if task.title.trim().is_empty() {
+                return Ok(Err(CoreError::EmptyTitle));
+            }
 
-        task.updated_at = Utc::now();
+            if let Field::Set(type_key) = patch.type_key {
+                task.type_key = type_key;
+            }
+            let types = tx.get_task_types()?;
+            if !types.iter().any(|t| t.key == task.type_key) {
+                return Ok(Err(CoreError::UnknownTaskType(task.type_key)));
+            }
 
-        self.store.transaction(|tx| tx.put_task(&task))?;
+            match patch.description {
+                Field::Keep => {}
+                Field::Set(description) => task.description = Some(description),
+                Field::Clear => task.description = None,
+            }
+
+            match patch.start_date {
+                Field::Keep => {}
+                Field::Set(start_date) => task.start_date = Some(start_date),
+                Field::Clear => task.start_date = None,
+            }
+            match patch.due_date {
+                Field::Keep => {}
+                Field::Set(due_date) => task.due_date = Some(due_date),
+                Field::Clear => task.due_date = None,
+            }
+            if let (Some(start), Some(due)) = (task.start_date, task.due_date)
+                && due < start
+            {
+                return Ok(Err(CoreError::InvalidDateRange { start, due }));
+            }
+
+            match patch.assignee_id {
+                Field::Keep => {}
+                Field::Set(assignee_id) => {
+                    if tx.get_user(assignee_id)?.is_none() {
+                        return Ok(Err(CoreError::UnknownUser(assignee_id)));
+                    }
+                    task.assignee_id = Some(assignee_id);
+                }
+                Field::Clear => task.assignee_id = None,
+            }
+
+            task.updated_at = Utc::now();
+            tx.put_task(&task)?;
+
+            Ok(Ok(task))
+        })??;
 
         Ok(vec![task])
     }
