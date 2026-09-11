@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use bala_core::{Core, CoreError, NewTask, StoreError, TaskId, TreeFilter, UserId};
+use bala_core::{
+    Core, CoreError, Field, NewTask, StoreError, Task, TaskId, TaskPatch, TreeFilter, UserId,
+};
 use bala_store::SqliteStore;
 use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
@@ -43,6 +45,8 @@ pub enum TaskCommands {
     Add(AddArgs),
     /// List all tasks.
     Ls,
+    /// Edit an existing task.
+    Edit(EditArgs),
 }
 
 #[derive(Debug, Args)]
@@ -67,6 +71,52 @@ pub struct AddArgs {
     /// Id of the user to assign the new task to.
     #[arg(long)]
     pub assignee: Option<Uuid>,
+}
+
+// The four `clear_*` flags below are independent boolean switches (one per
+// clearable field), not overlapping state — a state machine or enum
+// wouldn't fit clap's derive-based flag model any better.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Args)]
+pub struct EditArgs {
+    /// Id of the task to edit.
+    pub id: Uuid,
+
+    #[arg(long)]
+    pub title: Option<String>,
+
+    #[arg(long, conflicts_with = "clear_description")]
+    pub description: Option<String>,
+
+    /// Clear the task's description.
+    #[arg(long)]
+    pub clear_description: bool,
+
+    #[arg(long, conflicts_with = "clear_start")]
+    pub start: Option<NaiveDate>,
+
+    /// Clear the task's start date.
+    #[arg(long)]
+    pub clear_start: bool,
+
+    #[arg(long, conflicts_with = "clear_due")]
+    pub due: Option<NaiveDate>,
+
+    /// Clear the task's due date.
+    #[arg(long)]
+    pub clear_due: bool,
+
+    /// Id of the user to assign the task to.
+    #[arg(long, conflicts_with = "clear_assignee")]
+    pub assignee: Option<Uuid>,
+
+    /// Unassign the task.
+    #[arg(long)]
+    pub clear_assignee: bool,
+
+    /// New task type key.
+    #[arg(long = "type")]
+    pub type_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -131,6 +181,19 @@ pub fn run_task_command(db_path: &Path, command: TaskCommands) -> Result<(), Cli
     match command {
         TaskCommands::Add(args) => run_task_add(db_path, args),
         TaskCommands::Ls => run_task_ls(db_path),
+        TaskCommands::Edit(args) => run_task_edit(db_path, args),
+    }
+}
+
+/// Builds a `Field<T>` from a parsed CLI value and its paired `--clear-*`
+/// flag: `Set` when a value was given, `Clear` when the clear flag was
+/// passed, `Keep` otherwise. For fields with no `--clear-*` counterpart
+/// (`title`, `type_key`), pass `clear: false`.
+fn field_from<T>(value: Option<T>, clear: bool) -> Field<T> {
+    match value {
+        Some(v) => Field::Set(v),
+        None if clear => Field::Clear,
+        None => Field::Keep,
     }
 }
 
@@ -163,12 +226,41 @@ fn run_task_ls(db_path: &Path) -> Result<(), CliError> {
         // (if any) so a child visibly nests under it — full recursive tree
         // layout is the TUI's job later.
         let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-        let assignee = task
-            .assignee_id
-            .and_then(|id| names.get(&id))
-            .map(|name| format!(" (assigned: {name})"))
-            .unwrap_or_default();
-        println!("{indent}{} {}{assignee}", Uuid::from(task.id), task.title);
+        println!("{}", format_task_line(task, indent, &names));
+    }
+    Ok(())
+}
+
+/// Renders the one-line summary shared by `task ls` and `task edit`:
+/// `"{indent}{id} {title}{assignee_suffix}"`.
+fn format_task_line(task: &Task, indent: &str, names: &HashMap<UserId, String>) -> String {
+    let assignee = task
+        .assignee_id
+        .and_then(|id| names.get(&id))
+        .map(|name| format!(" (assigned: {name})"))
+        .unwrap_or_default();
+    format!("{indent}{} {}{assignee}", Uuid::from(task.id), task.title)
+}
+
+fn run_task_edit(db_path: &Path, args: EditArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let patch = TaskPatch {
+        title: field_from(args.title, false),
+        description: field_from(args.description, args.clear_description),
+        start_date: field_from(args.start, args.clear_start),
+        due_date: field_from(args.due, args.clear_due),
+        assignee_id: field_from(args.assignee.map(UserId::from), args.clear_assignee),
+        type_key: field_from(args.type_key, false),
+    };
+    let updated = core.update_task(TaskId::from(args.id), patch)?;
+    let names: HashMap<UserId, String> = core
+        .list_users()?
+        .into_iter()
+        .map(|user| (user.id, user.name))
+        .collect();
+    for task in &updated {
+        let indent = if task.parent_ids.is_empty() { "" } else { "  " };
+        println!("{}", format_task_line(task, indent, &names));
     }
     Ok(())
 }
