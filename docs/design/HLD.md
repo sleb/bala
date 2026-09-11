@@ -53,7 +53,7 @@ flowchart LR
 | **Web Client (future)** | Browser rendering equivalent, mouse drag-to-reschedule, PNG/PDF export | Same — no business logic; talks only to the Web API, never the library directly |
 | **Core Library** | The entire domain layer: task CRUD, hierarchy invariants (no circular nesting, multi-parent reparenting), dependency invariants (no self/ancestor deps, cycle detection, typed constraints), typed cascade scheduling (finish-to-start default, plus start-to-start/finish-to-finish/start-to-finish), progress rollup, task-type/label config. Every rule lives here exactly once, exposed as a set of methods any caller — in-process today, wrapped over HTTP later — uses the same way | Rendering, transport, serialization, HTTP concerns |
 | **Web API (future)** | Pure translation: HTTP routing + JSON (de)serialization + (eventually) auth — ideally ~one endpoint per Core Library method | Any domain logic. If a rule can't be phrased as "call this library method," it doesn't belong in this layer |
-| **Data Store** | Durable persistence of tasks, hierarchy edges (a task may have multiple parents), dependency edges, task types, and their timestamps | Any business rules — invariants are enforced by the Core Library before writes |
+| **Data Store** | Durable persistence of tasks, hierarchy edges (a task may have multiple parents), dependency edges, task types, and their timestamps, and minimal user identity rows (`id`, `name`) for task assignment | Any business rules — invariants are enforced by the Core Library before writes |
 
 This still groups Epics 1–3's logic (CRUD, hierarchy, dependencies,
 rollup) into one component rather than three — splitting those at this
@@ -78,7 +78,8 @@ Task {
   type,                     // Initiative | Goal | Project | Story | Task | custom
   status,                   // incomplete | complete (extensible later)
   startDate, dueDate,
-  assigneeId,
+  assigneeId,               // resolves to a real User (minimal id+name,
+                             // no auth) — not a bare/unvalidated field
   dependsOn: [{predecessorId, type}], // type = finish-to-start (default),
                                        // start-to-start, finish-to-finish,
                                        // or start-to-finish

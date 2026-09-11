@@ -4,7 +4,7 @@
 //! IDs are stored as `BLOB(16)` raw UUID bytes (LLD-2 §Decision); dates and
 //! timestamps as ISO-8601 `TEXT` (LLD-2 §Schema).
 
-use bala_core::{StoreError, TaskId, TaskStatus};
+use bala_core::{StoreError, TaskId, TaskStatus, UserId};
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
@@ -32,6 +32,20 @@ pub(crate) fn blob_to_task_id(bytes: &[u8]) -> Result<TaskId, StoreError> {
         )
     })?;
     Ok(TaskId::from(Uuid::from_bytes(array)))
+}
+
+pub(crate) fn user_id_to_blob(id: UserId) -> [u8; 16] {
+    *Uuid::from(id).as_bytes()
+}
+
+pub(crate) fn blob_to_user_id(bytes: &[u8]) -> Result<UserId, StoreError> {
+    let array: [u8; 16] = bytes.try_into().map_err(|_| {
+        corrupt(
+            "user id",
+            format!("blob is {} bytes, expected 16", bytes.len()),
+        )
+    })?;
+    Ok(UserId::from(Uuid::from_bytes(array)))
 }
 
 pub(crate) fn status_to_text(status: TaskStatus) -> &'static str {

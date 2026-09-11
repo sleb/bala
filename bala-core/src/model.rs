@@ -67,6 +67,15 @@ impl From<UserId> for Uuid {
     }
 }
 
+/// Minimal user identity for task assignment — no auth, email, roles, or
+/// avatars (out of scope per STORIES.md Story 1.1a); just enough to give
+/// `assignee_id` a real entity to resolve to instead of a bare id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct User {
+    pub id: UserId,
+    pub name: String,
+}
+
 /// Whether a [`Task`] is done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskStatus {
@@ -77,9 +86,9 @@ pub enum TaskStatus {
 /// A task as stored and returned by the core library.
 ///
 /// Deliberately narrower than the full LLD shape for this story: fields
-/// belonging to later stories/epics (`assignee_id`, `depends_on`,
-/// `out_of_sync`, `progress`, `completed_at`, `deleted_at`) are omitted
-/// until the stories that need them land.
+/// belonging to later stories/epics (`depends_on`, `out_of_sync`,
+/// `progress`, `completed_at`, `deleted_at`) are omitted until the stories
+/// that need them land.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: TaskId,
@@ -92,6 +101,9 @@ pub struct Task {
     pub status: TaskStatus,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
+    /// `None` means unassigned. `Core::create_task` validates a `Some`
+    /// value against `Store::get_user` before persisting.
+    pub assignee_id: Option<UserId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -106,6 +118,8 @@ pub struct NewTask {
     pub type_key: Option<String>,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
+    /// `None` means unassigned; `Some` must name an existing [`User`].
+    pub assignee_id: Option<UserId>,
 }
 
 /// A configurable task type, e.g. "initiative" or "task".
@@ -121,14 +135,11 @@ pub struct TaskType {
 
 /// Filter predicate for `Store::list_tasks`. All fields are `ANDed`;
 /// `None`/`false` means "don't filter on this".
-///
-/// Deliberately narrower than the full LLD shape (`docs/design/core-library.md`
-/// §Data Model): `assignee_id` is omitted since `UserId` isn't wired into
-/// [`Task`] yet in this story, matching `Task`'s own scope cut.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TreeFilter {
     pub type_key: Option<String>,
     pub status: Option<TaskStatus>,
+    pub assignee_id: Option<UserId>,
     /// Default `false`: soft-deleted tasks excluded. `Task` has no
     /// `deleted_at` field yet at this checkpoint's scope, so this is
     /// currently a no-op in `InMemoryStore` — see its module docs.
@@ -187,6 +198,7 @@ mod tests {
             status: TaskStatus::Incomplete,
             start_date: None,
             due_date: None,
+            assignee_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -208,6 +220,7 @@ mod tests {
             status: TaskStatus::Complete,
             start_date: None,
             due_date: None,
+            assignee_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -224,6 +237,7 @@ mod tests {
             type_key: None,
             start_date: None,
             due_date: None,
+            assignee_id: None,
         };
         assert_eq!(new_task.type_key, None);
     }
@@ -233,6 +247,7 @@ mod tests {
         let filter = TreeFilter::default();
         assert_eq!(filter.type_key, None);
         assert_eq!(filter.status, None);
+        assert_eq!(filter.assignee_id, None);
         assert!(!filter.include_deleted);
     }
 
@@ -246,5 +261,25 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn user_is_constructible_with_expected_fields() {
+        let user = User {
+            id: UserId::new(),
+            name: "Ada Lovelace".to_owned(),
+        };
+
+        assert_eq!(user.name, "Ada Lovelace");
+    }
+
+    #[test]
+    fn user_clone_and_eq_agree() {
+        let user = User {
+            id: UserId::new(),
+            name: "Grace Hopper".to_owned(),
+        };
+        let cloned = user.clone();
+        assert_eq!(user, cloned);
     }
 }

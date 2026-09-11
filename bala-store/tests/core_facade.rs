@@ -27,6 +27,7 @@ fn minimal_new_task(title: &str) -> NewTask {
         type_key: None,
         start_date: None,
         due_date: None,
+        assignee_id: None,
     }
 }
 

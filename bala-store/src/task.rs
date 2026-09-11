@@ -1,21 +1,22 @@
 //! `tasks` row <-> [`Task`] mapping and queries.
 //!
-//! Columns unused by `bala-core`'s current `Task` shape (`assignee_id`,
-//! `out_of_sync`, `completed_at`, `deleted_at` — see crate docs) are written
-//! with fixed defaults (`NULL`/`0`) on every `put_task` and never read back
-//! into a `Task`, since `Task` has nowhere to put them yet.
+//! Columns unused by `bala-core`'s current `Task` shape (`out_of_sync`,
+//! `completed_at`, `deleted_at` — see crate docs) are written with fixed
+//! defaults (`NULL`/`0`) on every `put_task` and never read back into a
+//! `Task`, since `Task` has nowhere to put them yet. `assignee_id` *is*
+//! read/written, per Story 1.1a.
 
 use bala_core::{StoreError, Task, TaskId, TreeFilter};
 use rusqlite::{OptionalExtension, Row, ToSql, Transaction, params};
 
 use crate::convert::{
-    blob_to_task_id, date_from_text, date_to_text, id_to_blob, status_from_text, status_to_text,
-    timestamp_from_text, timestamp_to_text,
+    blob_to_task_id, blob_to_user_id, date_from_text, date_to_text, id_to_blob, status_from_text,
+    status_to_text, timestamp_from_text, timestamp_to_text, user_id_to_blob,
 };
 use crate::edges;
 
-const SELECT_COLUMNS: &str =
-    "id, title, description, type_key, status, start_date, due_date, created_at, updated_at";
+const SELECT_COLUMNS: &str = "id, title, description, type_key, status, start_date, due_date, \
+    assignee_id, created_at, updated_at";
 
 /// Builds a [`Task`] from a row of [`SELECT_COLUMNS`], leaving `parent_ids`
 /// empty — callers fill it in from `parent_edges` separately (edges are a
@@ -28,8 +29,9 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
     let status_text: String = row.get(4)?;
     let start_date: Option<String> = row.get(5)?;
     let due_date: Option<String> = row.get(6)?;
-    let created_at: String = row.get(7)?;
-    let updated_at: String = row.get(8)?;
+    let assignee_id: Option<Vec<u8>> = row.get(7)?;
+    let created_at: String = row.get(8)?;
+    let updated_at: String = row.get(9)?;
 
     Ok((|| {
         Ok(Task {
@@ -41,6 +43,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
             status: status_from_text(&status_text)?,
             start_date: start_date.map(|s| date_from_text(&s)).transpose()?,
             due_date: due_date.map(|s| date_from_text(&s)).transpose()?,
+            assignee_id: assignee_id.map(|b| blob_to_user_id(&b)).transpose()?,
             created_at: timestamp_from_text(&created_at)?,
             updated_at: timestamp_from_text(&updated_at)?,
         })
@@ -63,11 +66,12 @@ pub(crate) fn get_task(tx: &Transaction, id: TaskId) -> Result<Option<Task>, Sto
 
 pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> {
     let id_blob = id_to_blob(task.id);
+    let assignee_id_blob = task.assignee_id.map(user_id_to_blob);
     tx.execute(
         "INSERT INTO tasks (
             id, title, description, type_key, status, start_date, due_date,
             assignee_id, out_of_sync, created_at, updated_at, completed_at, deleted_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, ?8, ?9, NULL, NULL)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, NULL, NULL)
         ON CONFLICT(id) DO UPDATE SET
             title = excluded.title,
             description = excluded.description,
@@ -75,6 +79,7 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
             status = excluded.status,
             start_date = excluded.start_date,
             due_date = excluded.due_date,
+            assignee_id = excluded.assignee_id,
             updated_at = excluded.updated_at",
         params![
             id_blob.as_slice(),
@@ -84,6 +89,7 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
             status_to_text(task.status),
             task.start_date.map(date_to_text),
             task.due_date.map(date_to_text),
+            assignee_id_blob.as_ref().map(<[u8; 16]>::as_slice),
             timestamp_to_text(task.created_at),
             timestamp_to_text(task.updated_at),
         ],
@@ -106,6 +112,10 @@ pub(crate) fn list_tasks(tx: &Transaction, filter: &TreeFilter) -> Result<Vec<Ta
     if let Some(status) = filter.status {
         sql.push_str(" AND status = ?");
         owned_params.push(Box::new(status_to_text(status).to_owned()));
+    }
+    if let Some(assignee_id) = filter.assignee_id {
+        sql.push_str(" AND assignee_id = ?");
+        owned_params.push(Box::new(user_id_to_blob(assignee_id).to_vec()));
     }
 
     let mut stmt = tx.prepare(&sql).map_err(sqlite_err)?;

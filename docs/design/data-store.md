@@ -111,6 +111,11 @@ CREATE TABLE task_types (
     sort_order  INTEGER NOT NULL
 );
 
+CREATE TABLE users (
+    id    BLOB PRIMARY KEY,   -- 16-byte UUID
+    name  TEXT NOT NULL
+);
+
 CREATE TABLE tasks (
     id            BLOB PRIMARY KEY,          -- 16-byte UUID
     title         TEXT NOT NULL,
@@ -167,6 +172,21 @@ call mid-transaction from the same process, don't block on it), and
 or task row can reference a nonexistent id — invariants Core LLD already
 enforces in Rust before writing, but a DB-level constraint catches a
 `bala-store` bug (not a `bala-core` caller bug) that skips the trait.
+
+**`migrations/V2__add_users.sql` (Story 1.1a).** SQLite can't
+`ALTER TABLE ... ADD COLUMN ... REFERENCES ...` — a `REFERENCES` clause
+can only be declared when a column is first created, and `tasks.assignee_id`
+already exists (untyped `BLOB`, no FK) from V1. Giving it the FK the
+Core LLD's user-validation invariant now depends on means the standard
+SQLite "add a constraint to an existing column" rebuild: create the new
+`users` table; rename `tasks` out of the way; create a new `tasks` table
+identical to V1's except `assignee_id BLOB REFERENCES users(id)`; copy
+every row across with a plain `INSERT INTO tasks SELECT ... FROM
+tasks_old`; drop `tasks_old`; and recreate `idx_tasks_type_live`,
+`idx_tasks_status_live`, and `idx_tasks_assignee_live` against the new
+table, since `DROP TABLE` takes its indexes with it. No existing row can
+violate the new FK (V1 never populated `assignee_id`), so the copy step
+needs no data migration beyond the straight copy.
 
 Deletion is soft-delete only (Core LLD §Context, resolved there): `DELETE
 FROM tasks` is never issued by this crate outside of the (unused today)
@@ -239,6 +259,16 @@ struct SqliteTx<'a> {
 }
 
 impl<'a> StoreTx for SqliteTx<'a> {
+    fn get_user(&mut self, id: UserId) -> Result<Option<User>, StoreError> {
+        // SELECT id, name FROM users WHERE id = ?
+    }
+    fn put_user(&mut self, user: &User) -> Result<(), StoreError> {
+        // INSERT INTO users ... ON CONFLICT(id) DO UPDATE
+    }
+    fn list_users(&mut self) -> Result<Vec<User>, StoreError> {
+        // SELECT id, name FROM users
+    }
+
     fn get_task(&mut self, id: TaskId) -> Result<Option<Task>, StoreError> { /* row + edges, see below */ }
     fn put_task(&mut self, task: &Task) -> Result<(), StoreError> { /* INSERT ... ON CONFLICT(id) DO UPDATE */ }
     fn list_tasks(&mut self, filter: &TreeFilter) -> Result<Vec<Task>, StoreError> { /* see §Query Strategy */ }
@@ -330,7 +360,12 @@ fine at hundreds of rows.
   `add_dependency_edge_should_replace_type_on_existing_pair`,
   `list_tasks_should_exclude_soft_deleted_by_default`,
   `list_child_edges_should_return_all_children_of_multi_child_parent`,
-  `list_successor_edges_should_return_all_successors_of_multi_successor_predecessor`.
+  `list_successor_edges_should_return_all_successors_of_multi_successor_predecessor`,
+  `put_user_and_get_user_round_trip`,
+  `list_users_should_return_all_created_users`,
+  `put_task_should_persist_and_round_trip_assignee_id`,
+  `list_tasks_should_filter_by_assignee_id`,
+  `put_task_should_fail_when_assignee_id_references_nonexistent_user`.
 - **Transaction atomicity**: a test that runs a `transaction` closure
   which writes several tasks/edges then returns `Err`, asserting nothing
   committed (`get_task` on any of them still returns the pre-transaction

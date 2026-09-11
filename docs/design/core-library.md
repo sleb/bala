@@ -87,6 +87,14 @@ internally.
 pub struct TaskId(Uuid);
 pub struct UserId(Uuid);
 
+/// Minimal user identity for task assignment — no auth, email, roles, or
+/// avatars (out of scope per STORIES.md Story 1.1a); just enough to give
+/// `assignee_id` a real entity to resolve to instead of a bare id.
+pub struct User {
+    pub id: UserId,
+    pub name: String,
+}
+
 pub struct Task {
     pub id: TaskId,
     pub title: String,
@@ -138,6 +146,9 @@ pub struct TaskType {
 /// field-for-field, matching the indexes it already built for these:
 /// `type_key`, `status`, `assignee_id` each get a partial index on
 /// `deleted_at IS NULL`, and `include_deleted` toggles that predicate.
+/// `assignee_id` filters against a real `User.id` (Story 1.1a) — `Core`
+/// validates it exists via `Store::get_user` at `create_task` time, so a
+/// filter value here always corresponds to a real, resolvable user.
 pub struct TreeFilter {
     pub type_key: Option<String>,
     pub status: Option<TaskStatus>,
@@ -222,6 +233,12 @@ pub enum CoreError {
     #[error("unknown task type {0:?}")]
     UnknownTaskType(String),
 
+    #[error("user name must not be empty")]
+    EmptyUserName,
+
+    #[error("unknown user {0:?}")]
+    UnknownUser(UserId),
+
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -235,6 +252,8 @@ to errors, not just successes.
 
 ```rust
 impl<S: Store> Core<S> {
+    pub fn create_user(&mut self, name: String) -> Result<User, CoreError>;
+    pub fn list_users(&self) -> Result<Vec<User>, CoreError>;
     pub fn create_task(&mut self, new: NewTask) -> Result<Task, CoreError>;
     pub fn update_task(&mut self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError>;
     pub fn delete_task(&mut self, id: TaskId, mode: DeleteMode) -> Result<Vec<Task>, CoreError>;
@@ -471,6 +490,10 @@ pub trait Store {
 }
 
 pub trait StoreTx {
+    fn get_user(&mut self, id: UserId) -> Result<Option<User>, StoreError>;
+    fn put_user(&mut self, user: &User) -> Result<(), StoreError>;
+    fn list_users(&mut self) -> Result<Vec<User>, StoreError>;
+
     fn get_task(&mut self, id: TaskId) -> Result<Option<Task>, StoreError>;
     fn put_task(&mut self, task: &Task) -> Result<(), StoreError>;
     fn list_tasks(&mut self, filter: &TreeFilter) -> Result<Vec<Task>, StoreError>;

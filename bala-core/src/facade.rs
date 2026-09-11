@@ -10,7 +10,7 @@ use chrono::Utc;
 
 use crate::error::CoreError;
 use crate::hierarchy::check_new_parent;
-use crate::model::{NewTask, Task, TaskId, TaskStatus, TaskType, TreeFilter};
+use crate::model::{NewTask, Task, TaskId, TaskStatus, TaskType, TreeFilter, User, UserId};
 use crate::store::Store;
 
 /// The stable key of the default task type every `Core` seeds on
@@ -52,6 +52,38 @@ impl<S: Store> Core<S> {
         Ok(Self { store })
     }
 
+    /// Creates a user, so `Task::assignee_id` (added in a later checkpoint)
+    /// has a real entity to resolve to.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::EmptyUserName`] if `name` is empty or
+    ///   whitespace-only.
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn create_user(&mut self, name: String) -> Result<User, CoreError> {
+        if name.trim().is_empty() {
+            return Err(CoreError::EmptyUserName);
+        }
+
+        let user = User {
+            id: UserId::new(),
+            name,
+        };
+
+        self.store.transaction(|tx| tx.put_user(&user))?;
+
+        Ok(user)
+    }
+
+    /// Lists every user.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    pub fn list_users(&self) -> Result<Vec<User>, CoreError> {
+        Ok(self.store.transaction(|tx| tx.list_users())?)
+    }
+
     /// Creates a task per LLD §Algorithm (Story 1.1): validates the
     /// title, type key, date range, and each given parent, then persists
     /// the new task and its parent edges.
@@ -66,6 +98,8 @@ impl<S: Store> Core<S> {
     ///   `due_date` is before `start_date`.
     /// - [`CoreError::NotFound`] if any of `new.parent_ids` names no
     ///   existing task.
+    /// - [`CoreError::UnknownUser`] if `new.assignee_id` is `Some` and
+    ///   names no existing [`User`].
     /// - [`CoreError::Store`] if the backend fails.
     pub fn create_task(&mut self, new: NewTask) -> Result<Task, CoreError> {
         if new.title.trim().is_empty() {
@@ -94,6 +128,16 @@ impl<S: Store> Core<S> {
             }
         }
 
+        if let Some(assignee_id) = new.assignee_id {
+            let assignee_exists = self
+                .store
+                .transaction(|tx| tx.get_user(assignee_id))?
+                .is_some();
+            if !assignee_exists {
+                return Err(CoreError::UnknownUser(assignee_id));
+            }
+        }
+
         let now = Utc::now();
         let task = Task {
             id: TaskId::new(),
@@ -104,6 +148,7 @@ impl<S: Store> Core<S> {
             status: TaskStatus::Incomplete,
             start_date: new.start_date,
             due_date: new.due_date,
+            assignee_id: new.assignee_id,
             created_at: now,
             updated_at: now,
         };
@@ -176,6 +221,7 @@ mod tests {
             type_key: None,
             start_date: None,
             due_date: None,
+            assignee_id: None,
         }
     }
 
@@ -405,5 +451,108 @@ mod tests {
         let task = core.create_task(minimal_new_task("New")).unwrap();
 
         assert_eq!(task.status, TaskStatus::Incomplete);
+    }
+
+    #[test]
+    fn create_user_should_reject_empty_name() {
+        let mut core = new_core();
+
+        let result = core.create_user(String::new());
+
+        assert!(matches!(result, Err(CoreError::EmptyUserName)));
+    }
+
+    #[test]
+    fn create_user_should_reject_whitespace_only_name() {
+        let mut core = new_core();
+
+        let result = core.create_user("   \t  ".to_owned());
+
+        assert!(matches!(result, Err(CoreError::EmptyUserName)));
+    }
+
+    #[test]
+    fn create_user_should_assign_unique_id() {
+        let mut core = new_core();
+
+        let a = core.create_user("Ada".to_owned()).unwrap();
+        let b = core.create_user("Grace".to_owned()).unwrap();
+
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn list_users_should_include_a_just_created_user() {
+        let mut core = new_core();
+
+        let created = core.create_user("Findable".to_owned()).unwrap();
+        let users = core.list_users().unwrap();
+
+        assert!(users.contains(&created));
+    }
+
+    #[test]
+    fn create_task_should_store_given_assignee_id() {
+        let mut core = new_core();
+        let user = core.create_user("Ada".to_owned()).unwrap();
+
+        let task = core
+            .create_task(NewTask {
+                assignee_id: Some(user.id),
+                ..minimal_new_task("Assigned")
+            })
+            .unwrap();
+
+        assert_eq!(task.assignee_id, Some(user.id));
+    }
+
+    #[test]
+    fn create_task_should_default_assignee_to_none_when_unset() {
+        let mut core = new_core();
+
+        let task = core.create_task(minimal_new_task("Unassigned")).unwrap();
+
+        assert!(task.assignee_id.is_none());
+    }
+
+    #[test]
+    fn create_task_should_reject_unknown_assignee_id() {
+        let mut core = new_core();
+        let unknown_assignee = UserId::new();
+
+        let result = core.create_task(NewTask {
+            assignee_id: Some(unknown_assignee),
+            ..minimal_new_task("Orphan assignee")
+        });
+
+        assert!(matches!(result, Err(CoreError::UnknownUser(id)) if id == unknown_assignee));
+    }
+
+    #[test]
+    fn get_tree_should_filter_by_assignee_id() {
+        let mut core = new_core();
+        let alice = core.create_user("Alice".to_owned()).unwrap();
+        let bob = core.create_user("Bob".to_owned()).unwrap();
+
+        let alice_task = core
+            .create_task(NewTask {
+                assignee_id: Some(alice.id),
+                ..minimal_new_task("Alice's task")
+            })
+            .unwrap();
+        core.create_task(NewTask {
+            assignee_id: Some(bob.id),
+            ..minimal_new_task("Bob's task")
+        })
+        .unwrap();
+
+        let tree = core
+            .get_tree(TreeFilter {
+                assignee_id: Some(alice.id),
+                ..TreeFilter::default()
+            })
+            .unwrap();
+
+        assert_eq!(tree, vec![alice_task]);
     }
 }

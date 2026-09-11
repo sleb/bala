@@ -4,10 +4,10 @@
 use std::cell::RefCell;
 use std::path::Path;
 
-use bala_core::{Store, StoreError, StoreTx, Task, TaskId, TaskType, TreeFilter};
+use bala_core::{Store, StoreError, StoreTx, Task, TaskId, TaskType, TreeFilter, User, UserId};
 use rusqlite::Connection;
 
-use crate::{edges, schema, task, types};
+use crate::{edges, schema, task, types, user};
 
 /// SQLite-backed [`Store`].
 ///
@@ -88,6 +88,18 @@ struct SqliteTx<'a> {
 }
 
 impl StoreTx for SqliteTx<'_> {
+    fn get_user(&mut self, id: UserId) -> Result<Option<User>, StoreError> {
+        user::get_user(&self.tx, id)
+    }
+
+    fn put_user(&mut self, user: &User) -> Result<(), StoreError> {
+        user::put_user(&self.tx, user)
+    }
+
+    fn list_users(&mut self) -> Result<Vec<User>, StoreError> {
+        user::list_users(&self.tx)
+    }
+
     fn get_task(&mut self, id: TaskId) -> Result<Option<Task>, StoreError> {
         task::get_task(&self.tx, id)
     }
@@ -124,6 +136,9 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
+    // `User`/`UserId` are already brought in via `super::*` (this module's
+    // own `use bala_core::{..., User, UserId}`).
+
     fn sample_task(type_key: &str, status: TaskStatus) -> Task {
         let now = Utc::now();
         Task {
@@ -135,8 +150,16 @@ mod tests {
             status,
             start_date: None,
             due_date: None,
+            assignee_id: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    fn sample_user(name: &str) -> User {
+        User {
+            id: UserId::new(),
+            name: name.to_owned(),
         }
     }
 
@@ -373,5 +396,99 @@ mod tests {
 
         let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
         assert_eq!(fetched, None);
+    }
+
+    #[test]
+    fn put_user_and_get_user_round_trip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let user = sample_user("Ada Lovelace");
+
+        store.transaction(|tx| tx.put_user(&user)).unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_user(user.id)).unwrap();
+        assert_eq!(fetched, Some(user));
+    }
+
+    #[test]
+    fn list_users_should_return_all_created_users() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_user("Ada Lovelace");
+        let b = sample_user("Grace Hopper");
+
+        store
+            .transaction(|tx| {
+                tx.put_user(&a)?;
+                tx.put_user(&b)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut listed = store.transaction(|tx| tx.list_users()).unwrap();
+        listed.sort_by_key(|u| Uuid::from(u.id));
+        let mut expected = vec![a, b];
+        expected.sort_by_key(|u| Uuid::from(u.id));
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn put_task_should_persist_and_round_trip_assignee_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let user = sample_user("Ada Lovelace");
+        store.transaction(|tx| tx.put_user(&user)).unwrap();
+
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.assignee_id = Some(user.id);
+
+        store
+            .transaction(|tx| {
+                tx.put_task(&task)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert_eq!(fetched, Some(task));
+    }
+
+    #[test]
+    fn list_tasks_should_filter_by_assignee_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let user = sample_user("Ada Lovelace");
+        store.transaction(|tx| tx.put_user(&user)).unwrap();
+
+        let mut assigned = sample_task("task", TaskStatus::Incomplete);
+        assigned.assignee_id = Some(user.id);
+        let unassigned = sample_task("task", TaskStatus::Incomplete);
+
+        store
+            .transaction(|tx| {
+                tx.put_task(&assigned)?;
+                tx.put_task(&unassigned)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let filter = TreeFilter {
+            assignee_id: Some(user.id),
+            ..TreeFilter::default()
+        };
+        let listed = store.transaction(|tx| tx.list_tasks(&filter)).unwrap();
+        assert_eq!(listed, vec![assigned]);
+    }
+
+    #[test]
+    fn put_task_should_fail_when_assignee_id_references_nonexistent_user() {
+        // Confirms the FK added by `migrations/V2__add_users.sql`
+        // (`assignee_id BLOB REFERENCES users(id)`) is actually enforced,
+        // mirroring `add_parent_edge_referencing_nonexistent_task_fails_foreign_key_check`'s
+        // reasoning: `PRAGMA foreign_keys = ON` is set on every connection
+        // (LLD-2 §Schema), so a task naming a user id that was never
+        // `put_user`'d fails the foreign-key constraint.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.assignee_id = Some(UserId::new());
+
+        let result = store.transaction(|tx| tx.put_task(&task));
+        assert!(result.is_err());
     }
 }

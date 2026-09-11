@@ -41,5 +41,6 @@ mod schema;
 mod store;
 mod task;
 mod types;
+mod user;
 
 pub use store::SqliteStore;
