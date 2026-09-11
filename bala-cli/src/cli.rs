@@ -2,10 +2,12 @@
 //! and drives it from parsed CLI arguments.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use bala_core::{
-    Core, CoreError, Field, NewTask, StoreError, Task, TaskId, TaskPatch, TreeFilter, UserId,
+    Core, CoreError, DeleteMode, Field, NewTask, StoreError, Task, TaskId, TaskPatch, TreeFilter,
+    UserId,
 };
 use bala_store::SqliteStore;
 use chrono::NaiveDate;
@@ -47,6 +49,10 @@ pub enum TaskCommands {
     Ls,
     /// Edit an existing task.
     Edit(EditArgs),
+    /// Delete a task, optionally along with (or promoting) its subtasks.
+    Delete(DeleteArgs),
+    /// Restore a previously deleted task.
+    Restore(RestoreArgs),
 }
 
 #[derive(Debug, Args)]
@@ -120,6 +126,31 @@ pub struct EditArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct DeleteArgs {
+    /// Id of the task to delete.
+    pub id: Uuid,
+
+    /// Skip the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Delete the task's whole subtree along with it.
+    #[arg(long, conflicts_with = "promote_children")]
+    pub cascade: bool,
+
+    /// Reattach the task's children to its own parents instead of deleting
+    /// them.
+    #[arg(long)]
+    pub promote_children: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RestoreArgs {
+    /// Id of the task to restore.
+    pub id: Uuid,
+}
+
+#[derive(Debug, Args)]
 pub struct UserArgs {
     #[command(subcommand)]
     pub command: UserCommands,
@@ -152,6 +183,22 @@ pub enum CliError {
 
     #[error(transparent)]
     Core(#[from] CoreError),
+
+    /// The target task has subtasks and neither `--cascade` nor
+    /// `--promote-children` was given, so the caller must choose a mode
+    /// before anything is deleted (AC2's "warned and can choose").
+    #[error(
+        "task {title:?} has subtasks that must be handled; pass --cascade or --promote-children:\n{}",
+        children
+            .iter()
+            .map(|task| format!("  {} {}", Uuid::from(task.id), task.title))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )]
+    NeedsDeleteMode { title: String, children: Vec<Task> },
+
+    #[error("failed to read confirmation from stdin: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 fn open_core(db_path: &Path) -> Result<Core<SqliteStore>, CliError> {
@@ -182,6 +229,8 @@ pub fn run_task_command(db_path: &Path, command: TaskCommands) -> Result<(), Cli
         TaskCommands::Add(args) => run_task_add(db_path, args),
         TaskCommands::Ls => run_task_ls(db_path),
         TaskCommands::Edit(args) => run_task_edit(db_path, args),
+        TaskCommands::Delete(args) => run_task_delete(db_path, &args),
+        TaskCommands::Restore(args) => run_task_restore(db_path, &args),
     }
 }
 
@@ -262,6 +311,70 @@ fn run_task_edit(db_path: &Path, args: EditArgs) -> Result<(), CliError> {
         let indent = if task.parent_ids.is_empty() { "" } else { "  " };
         println!("{}", format_task_line(task, indent, &names));
     }
+    Ok(())
+}
+
+fn run_task_delete(db_path: &Path, args: &DeleteArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let target_id = TaskId::from(args.id);
+    let target = core
+        .get_tree(TreeFilter::default())?
+        .into_iter()
+        .find(|task| task.id == target_id)
+        .ok_or(CoreError::NotFound(target_id))?;
+
+    let children: Vec<Task> = core
+        .get_tree(TreeFilter::default())?
+        .into_iter()
+        .filter(|task| task.parent_ids.contains(&target_id))
+        .collect();
+
+    let mode = match (args.cascade, args.promote_children) {
+        (true, _) => DeleteMode::Subtree,
+        (false, true) => DeleteMode::PromoteChildren,
+        (false, false) if children.is_empty() => DeleteMode::Subtree,
+        (false, false) => {
+            return Err(CliError::NeedsDeleteMode {
+                title: target.title,
+                children,
+            });
+        }
+    };
+
+    if !args.yes && !confirm(&format!("Delete task {:?}? [y/N] ", target.title))? {
+        println!("Aborted: nothing was deleted.");
+        return Ok(());
+    }
+
+    let deleted = core.delete_task(target_id, mode)?;
+    for task in &deleted {
+        println!("{}", Uuid::from(task.id));
+    }
+    Ok(())
+}
+
+/// Prompts on stdout/stdin for a yes/no confirmation, returning `true` only
+/// for (trimmed, case-insensitive) `y` or `yes`.
+fn confirm(prompt: &str) -> Result<bool, CliError> {
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+fn run_task_restore(db_path: &Path, args: &RestoreArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let task = core.restore_task(TaskId::from(args.id))?;
+    let names: HashMap<UserId, String> = core
+        .list_users()?
+        .into_iter()
+        .map(|user| (user.id, user.name))
+        .collect();
+    let indent = if task.parent_ids.is_empty() { "" } else { "  " };
+    println!("{}", format_task_line(&task, indent, &names));
     Ok(())
 }
 

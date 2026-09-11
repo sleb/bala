@@ -320,3 +320,149 @@ fn task_edit_with_conflicting_value_and_clear_flags_should_fail_usage() {
         .assert()
         .failure();
 }
+
+#[test]
+fn task_delete_leaf_task_with_yes_flag_should_succeed_and_remove_from_ls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Leaf task"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &task_id, "--yes"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("Leaf task").not());
+}
+
+#[test]
+fn task_delete_without_yes_and_declined_confirmation_should_not_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Leaf task"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &task_id])
+        .write_stdin("n\n")
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("Leaf task"));
+}
+
+#[test]
+fn task_delete_with_unknown_task_id_should_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let unknown_task_id = uuid::Uuid::new_v4().to_string();
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &unknown_task_id, "--yes"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn task_delete_task_with_subtasks_and_no_mode_flag_should_fail_with_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &parent_id, "--yes"])
+        .assert()
+        .failure()
+        .stderr(contains("Child task"));
+}
+
+#[test]
+fn task_delete_task_with_subtasks_and_cascade_should_remove_child_from_ls_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &parent_id, "--cascade", "--yes"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(
+            contains("Parent task")
+                .not()
+                .and(contains("Child task").not()),
+        );
+}
+
+#[test]
+fn task_delete_task_with_subtasks_and_promote_children_should_keep_child_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &parent_id, "--promote-children", "--yes"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("Parent task").not().and(contains("Child task")));
+}
+
+#[test]
+fn task_restore_should_bring_task_back_into_ls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Leaf task"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &task_id, "--yes"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "restore", &task_id])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("Leaf task"));
+}
+
+#[test]
+fn task_restore_with_unknown_id_should_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let unknown_task_id = uuid::Uuid::new_v4().to_string();
+
+    bala_cmd(&db_path)
+        .args(["task", "restore", &unknown_task_id])
+        .assert()
+        .failure();
+}

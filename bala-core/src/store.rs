@@ -1,10 +1,12 @@
 //! The persistence trait boundary (LLD §Storage Boundary).
 //!
-//! [`Store`]/[`StoreTx`] are scoped to exactly what Story 1.1 needs — task
-//! put/get/list, parent edges, and task types. The full LLD contract also
-//! has `list_child_edges`, `remove_parent_edge`, and the dependency-edge
-//! methods; those land in later stories that actually use them, per the
-//! "don't speculatively build methods this story doesn't need" guidance.
+//! [`Store`]/[`StoreTx`] cover what Story 1.1 needs — task put/get/list,
+//! parent edges, and task types — plus the edge/soft-delete lookups Story
+//! 1.3 ("Delete a Task") needs: `list_child_edges`, `remove_parent_edge`,
+//! `get_task_including_deleted`. The full LLD contract also has the
+//! dependency-edge methods; those land in later stories that actually use
+//! them, per the "don't speculatively build methods this story doesn't
+//! need" guidance.
 
 use crate::model::{Task, TaskId, TaskType, TreeFilter, User, UserId};
 
@@ -102,6 +104,33 @@ pub trait StoreTx {
     ///
     /// Returns `Err` if the backend fails.
     fn add_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
+
+    /// Lists the ids of `id`'s children — the reverse of
+    /// [`list_parent_edges`](StoreTx::list_parent_edges).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails. Returns an empty `Vec`, not
+    /// `Err`, when `id` has no children.
+    fn list_child_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
+
+    /// Removes the edge recording that `child` sits under `parent`, leaving
+    /// any other parent edges `child` has untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails. Removing an edge that doesn't
+    /// exist is not an error.
+    fn remove_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
+
+    /// Looks up a task by id, including soft-deleted ones that
+    /// [`get_task`](StoreTx::get_task) would filter out.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails. Returns `Ok(None)`, not `Err`,
+    /// when no task with `id` exists.
+    fn get_task_including_deleted(&mut self, id: TaskId) -> Result<Option<Task>, StoreError>;
 
     /// Lists every configured task type.
     ///

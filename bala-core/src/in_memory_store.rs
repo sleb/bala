@@ -5,9 +5,9 @@
 //! this checkpoint's own put/get/list/edge round-trip tests) can run
 //! without a real database.
 //!
-//! `TreeFilter::include_deleted` is currently a no-op here: [`Task`] has no
-//! `deleted_at` field yet at this checkpoint's scope (soft-delete lands in
-//! a later story), so there is nothing for it to filter.
+//! `parent_edges` is keyed child -> its parents, so `list_child_edges`
+//! (the reverse direction) scans every entry rather than maintaining a
+//! second map — fine for an in-memory fake that isn't optimized for scale.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -55,7 +55,11 @@ impl StoreTx for State {
     }
 
     fn get_task(&mut self, id: TaskId) -> Result<Option<Task>, StoreError> {
-        Ok(self.tasks.get(&id).cloned())
+        Ok(self
+            .tasks
+            .get(&id)
+            .filter(|task| task.deleted_at.is_none())
+            .cloned())
     }
 
     fn put_task(&mut self, task: &Task) -> Result<(), StoreError> {
@@ -79,6 +83,7 @@ impl StoreTx for State {
                     .assignee_id
                     .is_none_or(|assignee_id| task.assignee_id == Some(assignee_id))
             })
+            .filter(|task| filter.include_deleted || task.deleted_at.is_none())
             .cloned()
             .collect())
     }
@@ -90,6 +95,26 @@ impl StoreTx for State {
     fn add_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError> {
         self.parent_edges.entry(child).or_default().push(parent);
         Ok(())
+    }
+
+    fn list_child_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+        Ok(self
+            .parent_edges
+            .iter()
+            .filter(|(_, parents)| parents.contains(&id))
+            .map(|(&child, _)| child)
+            .collect())
+    }
+
+    fn remove_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError> {
+        if let Some(parents) = self.parent_edges.get_mut(&child) {
+            parents.retain(|&p| p != parent);
+        }
+        Ok(())
+    }
+
+    fn get_task_including_deleted(&mut self, id: TaskId) -> Result<Option<Task>, StoreError> {
+        Ok(self.tasks.get(&id).cloned())
     }
 
     fn get_task_types(&mut self) -> Result<Vec<TaskType>, StoreError> {
@@ -123,6 +148,7 @@ mod tests {
             assignee_id: None,
             created_at: now,
             updated_at: now,
+            deleted_at: None,
         }
     }
 
@@ -259,6 +285,125 @@ mod tests {
         let mut expected = vec![parent_a, parent_b];
         expected.sort_by_key(|&id| Uuid::from(id));
         assert_eq!(edges, expected);
+    }
+
+    #[test]
+    fn get_task_should_not_return_a_soft_deleted_task() {
+        let store = InMemoryStore::default();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.deleted_at = Some(Utc::now());
+
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert_eq!(fetched, None);
+    }
+
+    #[test]
+    fn get_task_including_deleted_should_return_a_soft_deleted_task() {
+        let store = InMemoryStore::default();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.deleted_at = Some(Utc::now());
+
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        let fetched = store
+            .transaction(|tx| tx.get_task_including_deleted(task.id))
+            .unwrap();
+        assert_eq!(fetched, Some(task));
+    }
+
+    #[test]
+    fn list_tasks_should_exclude_soft_deleted_by_default() {
+        let store = InMemoryStore::default();
+        let live = sample_task("task", TaskStatus::Incomplete);
+        let mut deleted = sample_task("task", TaskStatus::Incomplete);
+        deleted.deleted_at = Some(Utc::now());
+
+        store
+            .transaction(|tx| {
+                tx.put_task(&live)?;
+                tx.put_task(&deleted)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let listed = store
+            .transaction(|tx| tx.list_tasks(&TreeFilter::default()))
+            .unwrap();
+        assert_eq!(listed, vec![live]);
+    }
+
+    #[test]
+    fn list_tasks_should_include_soft_deleted_when_filter_requests_it() {
+        let store = InMemoryStore::default();
+        let live = sample_task("task", TaskStatus::Incomplete);
+        let mut deleted = sample_task("task", TaskStatus::Incomplete);
+        deleted.deleted_at = Some(Utc::now());
+
+        store
+            .transaction(|tx| {
+                tx.put_task(&live)?;
+                tx.put_task(&deleted)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let filter = TreeFilter {
+            include_deleted: true,
+            ..TreeFilter::default()
+        };
+        let mut listed = store.transaction(|tx| tx.list_tasks(&filter)).unwrap();
+        listed.sort_by_key(|t| Uuid::from(t.id));
+        let mut expected = vec![live, deleted];
+        expected.sort_by_key(|t| Uuid::from(t.id));
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn list_child_edges_for_task_with_no_children_returns_empty() {
+        let store = InMemoryStore::default();
+        let edges = store
+            .transaction(|tx| tx.list_child_edges(TaskId::new()))
+            .unwrap();
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn add_parent_edge_then_list_child_edges_returns_child() {
+        let store = InMemoryStore::default();
+        let parent = TaskId::new();
+        let child = TaskId::new();
+
+        store
+            .transaction(|tx| tx.add_parent_edge(parent, child))
+            .unwrap();
+
+        let edges = store.transaction(|tx| tx.list_child_edges(parent)).unwrap();
+        assert_eq!(edges, vec![child]);
+    }
+
+    #[test]
+    fn remove_parent_edge_removes_only_that_edge() {
+        let store = InMemoryStore::default();
+        let parent_a = TaskId::new();
+        let parent_b = TaskId::new();
+        let child = TaskId::new();
+
+        store
+            .transaction(|tx| {
+                tx.add_parent_edge(parent_a, child)?;
+                tx.add_parent_edge(parent_b, child)?;
+                Ok(())
+            })
+            .unwrap();
+
+        store
+            .transaction(|tx| tx.remove_parent_edge(parent_a, child))
+            .unwrap();
+
+        let edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();
+        assert_eq!(edges, vec![parent_b]);
     }
 
     #[test]

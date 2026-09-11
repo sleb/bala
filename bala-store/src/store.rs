@@ -120,6 +120,18 @@ impl StoreTx for SqliteTx<'_> {
         edges::add_parent_edge(&self.tx, parent, child)
     }
 
+    fn list_child_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+        edges::list_child_edges(&self.tx, id)
+    }
+
+    fn remove_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError> {
+        edges::remove_parent_edge(&self.tx, parent, child)
+    }
+
+    fn get_task_including_deleted(&mut self, id: TaskId) -> Result<Option<Task>, StoreError> {
+        task::get_task_including_deleted(&self.tx, id)
+    }
+
     fn get_task_types(&mut self) -> Result<Vec<TaskType>, StoreError> {
         types::get_task_types(&self.tx)
     }
@@ -153,6 +165,7 @@ mod tests {
             assignee_id: None,
             created_at: now,
             updated_at: now,
+            deleted_at: None,
         }
     }
 
@@ -517,6 +530,61 @@ mod tests {
 
         let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
         assert_eq!(fetched, Some(task));
+    }
+
+    #[test]
+    fn put_task_should_persist_deleted_at_and_get_task_including_deleted_should_return_it() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.deleted_at = Some(Utc::now());
+
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        let fetched = store
+            .transaction(|tx| tx.get_task_including_deleted(task.id))
+            .unwrap();
+        assert_eq!(fetched, Some(task));
+    }
+
+    #[test]
+    fn get_task_should_exclude_a_soft_deleted_row() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.deleted_at = Some(Utc::now());
+
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert_eq!(fetched, None);
+    }
+
+    #[test]
+    fn list_child_edges_then_remove_parent_edge_reflects_removal() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let parent = sample_task("task", TaskStatus::Incomplete);
+        let child = sample_task("task", TaskStatus::Incomplete);
+
+        store
+            .transaction(|tx| {
+                tx.put_task(&parent)?;
+                tx.put_task(&child)?;
+                tx.add_parent_edge(parent.id, child.id)
+            })
+            .unwrap();
+
+        let children = store
+            .transaction(|tx| tx.list_child_edges(parent.id))
+            .unwrap();
+        assert_eq!(children, vec![child.id]);
+
+        store
+            .transaction(|tx| tx.remove_parent_edge(parent.id, child.id))
+            .unwrap();
+
+        let children = store
+            .transaction(|tx| tx.list_child_edges(parent.id))
+            .unwrap();
+        assert!(children.is_empty());
     }
 
     #[test]

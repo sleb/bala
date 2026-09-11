@@ -2,18 +2,19 @@
 //! point every caller (CLI today, Web API later) drives.
 //!
 //! Scoped to exactly what Story 1.1 needs: `create_task`, `get_tree`, and
-//! thin `TaskType` pass-throughs. `update_task`, `delete_task`,
-//! `set_parents`, dependency methods, cascade, rollup, and `complete_task`
-//! belong to later stories/epics and are deliberately absent.
+//! thin `TaskType` pass-throughs. `set_parents`, dependency methods,
+//! cascade, rollup, and `complete_task` belong to later stories/epics and
+//! are deliberately absent.
 
 use chrono::Utc;
 
 use crate::error::CoreError;
 use crate::hierarchy::check_new_parent;
 use crate::model::{
-    Field, NewTask, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User, UserId,
+    DeleteMode, Field, NewTask, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User,
+    UserId,
 };
-use crate::store::Store;
+use crate::store::{Store, StoreError, StoreTx};
 
 /// The stable key of the default task type every `Core` seeds on
 /// construction (LLD §Data Model: `type_key` "defaults to `\"task\"`").
@@ -153,6 +154,7 @@ impl<S: Store> Core<S> {
             assignee_id: new.assignee_id,
             created_at: now,
             updated_at: now,
+            deleted_at: None,
         };
 
         self.store.transaction(|tx| {
@@ -301,6 +303,163 @@ impl<S: Store> Core<S> {
         self.store.transaction(|tx| tx.put_task_type(&t))?;
         Ok(t)
     }
+
+    /// Deletes a task per LLD §Algorithm (Story 1.3): tombstones `id`
+    /// (`deleted_at` set, never a hard delete) and, per `mode`, either
+    /// recursively tombstones every child left with no other live parent
+    /// ([`DeleteMode::Subtree`]) or reparents each child onto `id`'s own
+    /// parents, leaving it top-level if `id` had none
+    /// ([`DeleteMode::PromoteChildren`]).
+    ///
+    /// With multiple parents, `Subtree` only ever removes parent-edges,
+    /// not tasks: a child still reachable through another live parent
+    /// keeps existing, just with one less parent edge, so deleting one
+    /// goal can never silently delete a task another goal still needs.
+    /// `PromoteChildren` follows the same rule in reverse: a child with
+    /// other parents besides `id` simply gains an edge to each of `id`'s
+    /// parents alongside the ones it already keeps.
+    ///
+    /// Everything runs inside one [`Store::transaction`]. Returns every
+    /// [`Task`] actually touched — tombstoned, or (under
+    /// `PromoteChildren`) reparented — so a caller can refresh its view
+    /// from the return value alone.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::NotFound`] if `id` names no existing, live task —
+    ///   including a task that is already soft-deleted, which is treated
+    ///   as not-found rather than tombstoned a second time.
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn delete_task(&mut self, id: TaskId, mode: DeleteMode) -> Result<Vec<Task>, CoreError> {
+        let touched = self.store.transaction(|tx| {
+            // `get_task` (not `get_task_including_deleted`) so a task
+            // that's already soft-deleted is treated as not-found here,
+            // matching `update_task`'s "not found" idiom rather than
+            // re-tombstoning/double-counting it.
+            let Some(task) = tx.get_task(id)? else {
+                return Ok(Err(CoreError::NotFound(id)));
+            };
+
+            let now = Utc::now();
+            let mut touched = Vec::new();
+
+            match mode {
+                DeleteMode::Subtree => {
+                    tombstone_subtree(tx, id, now, &mut touched)?;
+                }
+                DeleteMode::PromoteChildren => {
+                    // `id`'s own parents, fetched independent of the
+                    // child loop below: they're a separate edge set
+                    // (id-as-child-of-its-parents) from the edges the
+                    // loop mutates (id-as-parent-of-its-children).
+                    let grandparents = tx.list_parent_edges(id)?;
+
+                    let mut deleted = task;
+                    deleted.deleted_at = Some(now);
+                    deleted.updated_at = now;
+                    tx.put_task(&deleted)?;
+                    touched.push(deleted);
+
+                    for child in tx.list_child_edges(id)? {
+                        tx.remove_parent_edge(id, child)?;
+                        for &grandparent in &grandparents {
+                            tx.add_parent_edge(grandparent, child)?;
+                        }
+
+                        if let Some(mut child_task) = tx.get_task(child)? {
+                            child_task.parent_ids.retain(|&p| p != id);
+                            for &grandparent in &grandparents {
+                                if !child_task.parent_ids.contains(&grandparent) {
+                                    child_task.parent_ids.push(grandparent);
+                                }
+                            }
+                            child_task.updated_at = now;
+                            tx.put_task(&child_task)?;
+                            touched.push(child_task);
+                        }
+                    }
+                }
+            }
+
+            Ok(Ok(touched))
+        })??;
+
+        Ok(touched)
+    }
+
+    /// Restores a soft-deleted task per LLD §Algorithm (Story 1.3, AC5):
+    /// looks `id` up via [`StoreTx::get_task_including_deleted`] — unlike
+    /// `delete_task`'s `get_task`, this must see a tombstoned row, not
+    /// just a live one — clears `deleted_at`, bumps `updated_at`, and
+    /// persists.
+    ///
+    /// Idempotent: calling this on a task that's already live (never
+    /// deleted, or already restored) is not an error — `deleted_at` was
+    /// already `None` and stays `None` — but `updated_at` still bumps,
+    /// mirroring `update_task`'s own convention of always bumping
+    /// `updated_at` on any successful call regardless of what the call
+    /// actually changed.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::NotFound`] if `id` names no existing task at all —
+    ///   not even a soft-deleted one.
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn restore_task(&mut self, id: TaskId) -> Result<Task, CoreError> {
+        let task = self.store.transaction(|tx| {
+            let Some(mut task) = tx.get_task_including_deleted(id)? else {
+                return Ok(Err(CoreError::NotFound(id)));
+            };
+
+            task.deleted_at = None;
+            task.updated_at = Utc::now();
+            tx.put_task(&task)?;
+
+            Ok(Ok(task))
+        })??;
+
+        Ok(task)
+    }
+}
+
+/// Recursively tombstones `id` under [`DeleteMode::Subtree`]: sets
+/// `deleted_at`/`updated_at`, drops the `id -> child` edge for every
+/// direct child, and — only for a child left with no remaining parents —
+/// recurses into it too, at arbitrary depth. A child still reachable
+/// through another live parent keeps existing untouched beyond that one
+/// dropped edge.
+///
+/// Every tombstoned (and, for a surviving child, edge-updated) [`Task`] is
+/// appended to `touched`.
+fn tombstone_subtree(
+    tx: &mut dyn StoreTx,
+    id: TaskId,
+    now: chrono::DateTime<Utc>,
+    touched: &mut Vec<Task>,
+) -> Result<(), StoreError> {
+    let Some(mut task) = tx.get_task_including_deleted(id)? else {
+        return Ok(());
+    };
+    task.deleted_at = Some(now);
+    task.updated_at = now;
+    tx.put_task(&task)?;
+    touched.push(task);
+
+    for child in tx.list_child_edges(id)? {
+        tx.remove_parent_edge(id, child)?;
+        let remaining_parents = tx.list_parent_edges(child)?;
+
+        if remaining_parents.is_empty() {
+            tombstone_subtree(tx, child, now, touched)?;
+        } else if let Some(mut child_task) = tx.get_task(child)? {
+            child_task.parent_ids.retain(|&p| p != id);
+            child_task.updated_at = now;
+            tx.put_task(&child_task)?;
+            touched.push(child_task);
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -971,5 +1130,291 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].title, "Renamed");
+    }
+
+    #[test]
+    fn delete_task_should_reject_when_task_not_found() {
+        let mut core = new_core();
+        let missing = TaskId::new();
+
+        let result = core.delete_task(missing, DeleteMode::Subtree);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
+    #[test]
+    fn delete_task_should_tombstone_leaf_task() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Leaf")).unwrap();
+
+        let touched = core.delete_task(task.id, DeleteMode::Subtree).unwrap();
+
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].id, task.id);
+        assert!(touched[0].deleted_at.is_some());
+
+        // A second delete on the same (now soft-deleted) task is treated
+        // as not-found, not re-tombstoned.
+        let result = core.delete_task(task.id, DeleteMode::Subtree);
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == task.id));
+    }
+
+    #[test]
+    fn delete_task_subtree_should_tombstone_child_with_no_other_parents() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        core.delete_task(parent.id, DeleteMode::Subtree).unwrap();
+
+        let tree = core
+            .get_tree(TreeFilter {
+                include_deleted: true,
+                ..TreeFilter::default()
+            })
+            .unwrap();
+        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
+        assert!(child_after.deleted_at.is_some());
+    }
+
+    #[test]
+    fn delete_subtree_should_keep_child_reachable_through_other_parent() {
+        let mut core = new_core();
+        let parent_a = core.create_task(minimal_new_task("Goal A")).unwrap();
+        let parent_b = core.create_task(minimal_new_task("Goal B")).unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent_a.id, parent_b.id],
+                ..minimal_new_task("Shared child")
+            })
+            .unwrap();
+
+        core.delete_task(parent_a.id, DeleteMode::Subtree).unwrap();
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
+        assert!(child_after.deleted_at.is_none());
+        assert_eq!(child_after.parent_ids, vec![parent_b.id]);
+    }
+
+    #[test]
+    fn delete_task_subtree_should_recurse_through_multiple_levels() {
+        let mut core = new_core();
+        let root = core.create_task(minimal_new_task("Root")).unwrap();
+        let mid = core
+            .create_task(NewTask {
+                parent_ids: vec![root.id],
+                ..minimal_new_task("Mid")
+            })
+            .unwrap();
+        let leaf = core
+            .create_task(NewTask {
+                parent_ids: vec![mid.id],
+                ..minimal_new_task("Leaf")
+            })
+            .unwrap();
+        let deepest = core
+            .create_task(NewTask {
+                parent_ids: vec![leaf.id],
+                ..minimal_new_task("Deepest")
+            })
+            .unwrap();
+
+        let touched = core.delete_task(root.id, DeleteMode::Subtree).unwrap();
+
+        let touched_ids: std::collections::HashSet<_> = touched.iter().map(|t| t.id).collect();
+        assert!(touched_ids.contains(&root.id));
+        assert!(touched_ids.contains(&mid.id));
+        assert!(touched_ids.contains(&leaf.id));
+        assert!(touched_ids.contains(&deepest.id));
+
+        let tree = core
+            .get_tree(TreeFilter {
+                include_deleted: true,
+                ..TreeFilter::default()
+            })
+            .unwrap();
+        for id in [root.id, mid.id, leaf.id, deepest.id] {
+            let task = tree.iter().find(|t| t.id == id).unwrap();
+            assert!(task.deleted_at.is_some(), "{id:?} should be tombstoned");
+        }
+    }
+
+    #[test]
+    fn delete_task_promote_children_should_reparent_child_to_deleted_tasks_parents() {
+        let mut core = new_core();
+        let grandparent = core.create_task(minimal_new_task("Grandparent")).unwrap();
+        let parent = core
+            .create_task(NewTask {
+                parent_ids: vec![grandparent.id],
+                ..minimal_new_task("Parent")
+            })
+            .unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        core.delete_task(parent.id, DeleteMode::PromoteChildren)
+            .unwrap();
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
+        assert_eq!(child_after.parent_ids, vec![grandparent.id]);
+    }
+
+    #[test]
+    fn delete_task_promote_children_should_make_child_top_level_when_deleted_task_had_no_parents() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        core.delete_task(parent.id, DeleteMode::PromoteChildren)
+            .unwrap();
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
+        assert!(child_after.parent_ids.is_empty());
+    }
+
+    #[test]
+    fn delete_task_promote_children_should_add_parent_alongside_existing_other_parents() {
+        let mut core = new_core();
+        let grandparent = core.create_task(minimal_new_task("Grandparent")).unwrap();
+        let parent = core
+            .create_task(NewTask {
+                parent_ids: vec![grandparent.id],
+                ..minimal_new_task("Parent")
+            })
+            .unwrap();
+        let other_parent = core.create_task(minimal_new_task("Other parent")).unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id, other_parent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        core.delete_task(parent.id, DeleteMode::PromoteChildren)
+            .unwrap();
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
+        let parents: std::collections::HashSet<_> =
+            child_after.parent_ids.iter().copied().collect();
+        let expected: std::collections::HashSet<_> =
+            [other_parent.id, grandparent.id].into_iter().collect();
+        assert_eq!(parents, expected);
+    }
+
+    #[test]
+    fn deleted_task_should_be_excluded_from_get_tree_by_default() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        core.delete_task(task.id, DeleteMode::Subtree).unwrap();
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        assert!(!tree.iter().any(|t| t.id == task.id));
+    }
+
+    #[test]
+    fn get_tree_should_include_deleted_task_when_filter_requests_it() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        core.delete_task(task.id, DeleteMode::Subtree).unwrap();
+
+        let tree = core
+            .get_tree(TreeFilter {
+                include_deleted: true,
+                ..TreeFilter::default()
+            })
+            .unwrap();
+        assert!(tree.iter().any(|t| t.id == task.id));
+    }
+
+    #[test]
+    fn restore_task_should_reject_when_task_does_not_exist_at_all() {
+        let mut core = new_core();
+        let missing = TaskId::new();
+
+        let result = core.restore_task(missing);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
+    #[test]
+    fn restore_task_should_clear_deleted_at_and_make_task_visible_again() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        core.delete_task(task.id, DeleteMode::Subtree).unwrap();
+
+        let restored = core.restore_task(task.id).unwrap();
+
+        assert!(restored.deleted_at.is_none());
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        assert!(tree.iter().any(|t| t.id == task.id));
+    }
+
+    #[test]
+    fn restore_task_should_be_idempotent_when_task_is_already_live() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let restored = core.restore_task(task.id).unwrap();
+
+        assert!(restored.deleted_at.is_none());
+        assert_eq!(restored.id, task.id);
+    }
+
+    #[test]
+    fn restore_task_should_bump_updated_at() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        core.delete_task(task.id, DeleteMode::Subtree).unwrap();
+
+        let restored = core.restore_task(task.id).unwrap();
+
+        assert!(restored.updated_at >= task.updated_at);
+    }
+
+    #[test]
+    fn delete_task_should_return_every_task_actually_touched() {
+        let mut core = new_core();
+        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
+        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
+        let shared_child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent_a.id, parent_b.id],
+                ..minimal_new_task("Shared child")
+            })
+            .unwrap();
+        let only_child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent_a.id],
+                ..minimal_new_task("Only child")
+            })
+            .unwrap();
+
+        let touched = core.delete_task(parent_a.id, DeleteMode::Subtree).unwrap();
+
+        let touched_ids: std::collections::HashSet<_> = touched.iter().map(|t| t.id).collect();
+        assert!(touched_ids.contains(&parent_a.id));
+        assert!(touched_ids.contains(&only_child.id));
+        assert!(touched_ids.contains(&shared_child.id));
+        assert!(!touched_ids.contains(&parent_b.id));
     }
 }

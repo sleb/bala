@@ -43,3 +43,37 @@ pub(crate) fn add_parent_edge(
     .map_err(sqlite_err)?;
     Ok(())
 }
+
+pub(crate) fn list_child_edges(tx: &Transaction, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+    let id_blob = id_to_blob(id);
+    let mut stmt = tx
+        .prepare("SELECT child_id FROM parent_edges WHERE parent_id = ?1")
+        .map_err(sqlite_err)?;
+    let rows = stmt
+        .query_map(params![id_blob.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_err)?;
+
+    let mut child_ids = Vec::new();
+    for row in rows {
+        let blob = row.map_err(sqlite_err)?;
+        child_ids.push(blob_to_task_id(&blob)?);
+    }
+    Ok(child_ids)
+}
+
+/// A no-op if the edge doesn't exist, matching `StoreTx::remove_parent_edge`'s
+/// documented semantics.
+pub(crate) fn remove_parent_edge(
+    tx: &Transaction,
+    parent: TaskId,
+    child: TaskId,
+) -> Result<(), StoreError> {
+    let parent_blob = id_to_blob(parent);
+    let child_blob = id_to_blob(child);
+    tx.execute(
+        "DELETE FROM parent_edges WHERE parent_id = ?1 AND child_id = ?2",
+        params![parent_blob.as_slice(), child_blob.as_slice()],
+    )
+    .map_err(sqlite_err)?;
+    Ok(())
+}
