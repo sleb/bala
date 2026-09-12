@@ -185,9 +185,56 @@ just the sum of checkpoints:
    and confirm each one is genuinely consistent with the plan's "out of
    scope" list — not a silent narrowing that should have gone back to
    the user first.
-6. Fix minor problems yourself directly (a stray clippy lint, a
+6. **Adversarial correctness/efficiency pass.** A green test suite only
+   proves the plan's own named tests pass — it says nothing about bug
+   classes nobody wrote a test for yet. Re-read every changed method in
+   `bala-core`'s facade (and any store impl touched) the way a
+   reviewer looking for trouble would, not the way the author who just
+   made it pass would. Ask, for each one:
+   - **Could two of its `Store` calls interleave with someone else's
+     write?** Any method that reads state, decides something from it,
+     and then writes needs that whole sequence atomic — one
+     transaction, not several with a gap in between.
+   - **Is it doing the same work twice?** Look for a second fetch,
+     scan, or query that a first one's result already contained, or a
+     loop re-deriving something computed just above it.
+   - **Do all implementations of the trait it calls actually agree?**
+     When more than one type implements the same `Store`/`StoreTx`
+     method (the real backend and the in-memory test fake, most
+     often), a subtle semantic a real caller relies on — idempotence,
+     ordering, uniqueness — is only as good as the *least* correct
+     implementation of it.
+   - **Is any loop or recursion bounded by something other than the
+     data's actual size?** Recursion or iteration whose depth tracks a
+     user-built structure (a parent chain, a dependency graph) needs a
+     bound that scales with the data, not the call stack or a fixed
+     buffer.
+   - **What happens if this is called again with no real change to
+     make?** A mutation that could be invoked on something already in
+     its target state should be a true no-op — no timestamp bump, no
+     spurious entry in a "touched"/"changed" result, no overwriting a
+     value that was already correct.
+   - **Did this change leave a sibling description behind?** A new
+     case, variant, or subcommand should show up everywhere its
+     siblings are enumerated — doc comments, help text, match arms —
+     not just where the compiler forces it to.
+
+   This list names the shapes of bug that have actually slipped through
+   this process before (a multi-transaction race, a redundant tree
+   fetch, a test-fake/real-backend divergence, unbounded recursion, a
+   non-idempotent completion, stale help text) as concrete illustrations
+   of each question — treat them as examples of what to look for, not
+   the complete set of what to check. If something you find doesn't fit
+   any bullet above but still smells like the code would surprise its
+   own author under a slightly different input, trust that instinct and
+   dig in rather than waiting for it to match a named category.
+7. Fix minor problems yourself directly (a stray clippy lint, a
    formatting nit, a small inconsistency) rather than spawning another
-   sub-agent round for something trivial.
+   sub-agent round for something trivial. A confirmed hit from step 6
+   (a real race, a real idempotency bug) is also usually small enough
+   to fix directly here — write the regression test first, then the
+   fix, then re-run the full suite from step 1, the same discipline a
+   checkpoint sub-agent would follow.
 
 **Stop and ask the user** if you find something you cannot confidently
 rule on yourself: a real behavioral discrepancy between what two
@@ -243,9 +290,11 @@ merging.
   that's how a plan's careful sequencing silently unravels. Any such
   need is a signal to stop and report, not to route around.
 - The comprehensive review (Phase 4) is not optional busywork — it's
-  the step that catches the class of bug individual-checkpoint testing
-  structurally cannot: two checkpoints that are each internally
-  consistent but disagree with each other.
+  the step that catches what individual-checkpoint testing structurally
+  cannot: two checkpoints that are each internally consistent but
+  disagree with each other, and the bug shapes step 6 asks about, which
+  a plan's own named tests don't set out to catch because the plan was
+  written before the code existed to have them.
 - If the user says "stop if you can't rule on yourself," take that
   literally in Phase 4: a genuine judgment call about design intent
   goes back to the user, not into a code comment justifying a guess.
