@@ -73,6 +73,16 @@ which specific dependents are affected) lands with Story 3.1's dependency model.
 4. Completing a task unblocks any dependent tasks waiting on it (see Epic 3).
 5. Completion timestamp is recorded.
 
+**Note:** AC3's tree and Gantt views don't exist yet (Epic 2's Story 2.2 tree
+collapse/expand, Epic 4's Gantt chart) — this story visually indicates completion
+only in the CLI's flat list output (`task ls`/`task edit`/`task complete`). Tree/Gantt
+rendering picks up the same `status`/`completed_at` fields once those views are built.
+
+**Note:** AC4 depends on the dependency model (Epic 3), which doesn't exist yet — no
+`depends_on` field, no blocking/unblocking logic. Until Story 3.1/3.2 land, no task can
+possibly be "waiting" on another, so AC4 is vacuously satisfied; real unblocking
+behavior lands with Epic 3's scheduling model.
+
 ---
 
 ## Epic 2: Nested Task Hierarchy
