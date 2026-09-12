@@ -155,6 +155,7 @@ impl<S: Store> Core<S> {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            completed_at: None,
         };
 
         self.store.transaction(|tx| {
@@ -420,6 +421,123 @@ impl<S: Store> Core<S> {
 
         Ok(task)
     }
+
+    /// Completes a task per LLD §Algorithm 5 (Story 1.4): marks `id`
+    /// `status = Complete`, `completed_at = Some(now)`, `updated_at = now`.
+    ///
+    /// If `id` has any direct child whose `status` is still
+    /// [`TaskStatus::Incomplete`], the call is rejected with
+    /// [`CoreError::IncompleteChildren`] and nothing is written — unless
+    /// `cascade` is `true`, in which case `id`'s entire subtree is marked
+    /// complete instead (every not-yet-complete descendant, walked
+    /// iteratively so an arbitrarily deep hierarchy can't overflow the
+    /// stack).
+    ///
+    /// Everything runs inside one [`Store::transaction`]. Returns every
+    /// [`Task`] actually completed by this call — a single-element `Vec`
+    /// when only `id` itself was completed, or the whole touched subtree
+    /// under cascade. A descendant that was already complete before this
+    /// call is not re-touched and not included in the result.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::NotFound`] if `id` names no existing, live task.
+    /// - [`CoreError::IncompleteChildren`] if `id` has a direct child that
+    ///   is still incomplete and `cascade` is `false`.
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn complete_task(&mut self, id: TaskId, cascade: bool) -> Result<Vec<Task>, CoreError> {
+        let touched = self.store.transaction(|tx| {
+            if tx.get_task(id)?.is_none() {
+                return Ok(Err(CoreError::NotFound(id)));
+            }
+
+            let incomplete_children = direct_incomplete_children(tx, id)?;
+            if !incomplete_children.is_empty() && !cascade {
+                return Ok(Err(CoreError::IncompleteChildren {
+                    task: id,
+                    incomplete: incomplete_children,
+                }));
+            }
+
+            let now = Utc::now();
+            let mut touched = Vec::new();
+            if cascade {
+                mark_complete_subtree(tx, id, now, &mut touched)?;
+            } else if let Some(mut task) = tx.get_task(id)?
+                && task.status != TaskStatus::Complete
+            {
+                task.status = TaskStatus::Complete;
+                task.completed_at = Some(now);
+                task.updated_at = now;
+                tx.put_task(&task)?;
+                touched.push(task);
+            }
+
+            Ok(Ok(touched))
+        })??;
+
+        Ok(touched)
+    }
+}
+
+/// Collects the ids of every direct child of `id` whose `status` is still
+/// [`TaskStatus::Incomplete`]. A child id that no longer resolves via
+/// [`StoreTx::get_task`] (already deleted) is skipped, matching how other
+/// code in this module treats missing lookups.
+fn direct_incomplete_children(tx: &mut dyn StoreTx, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+    let mut incomplete = Vec::new();
+    for child in tx.list_child_edges(id)? {
+        if let Some(child_task) = tx.get_task(child)?
+            && child_task.status == TaskStatus::Incomplete
+        {
+            incomplete.push(child);
+        }
+    }
+    Ok(incomplete)
+}
+
+/// Marks `id` and its entire subtree complete, for `Core::complete_task`
+/// under `cascade = true`.
+///
+/// Iterative (an explicit work stack), not recursive, for the same
+/// deep-chain-safety reason as `tombstone_subtree`. Unlike that function,
+/// this never touches parent/child edges — it only walks descendants via
+/// [`StoreTx::list_child_edges`] and flips `status`/`completed_at`/
+/// `updated_at`. A task reachable through two parents is visited only
+/// once (tracked via `visited`), and a task already
+/// [`TaskStatus::Complete`] is walked through (to reach further
+/// descendants) but not re-written or added to `touched`, so its
+/// `completed_at` isn't clobbered and it isn't double-counted.
+fn mark_complete_subtree(
+    tx: &mut dyn StoreTx,
+    id: TaskId,
+    now: chrono::DateTime<Utc>,
+    touched: &mut Vec<Task>,
+) -> Result<(), StoreError> {
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = vec![id];
+
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+
+        let Some(mut task) = tx.get_task(current)? else {
+            continue;
+        };
+
+        if task.status != TaskStatus::Complete {
+            task.status = TaskStatus::Complete;
+            task.completed_at = Some(now);
+            task.updated_at = now;
+            tx.put_task(&task)?;
+            touched.push(task);
+        }
+
+        pending.extend(tx.list_child_edges(current)?);
+    }
+
+    Ok(())
 }
 
 /// Tombstones `id` under [`DeleteMode::Subtree`]: sets
@@ -1483,5 +1601,188 @@ mod tests {
         assert!(touched_ids.contains(&only_child.id));
         assert!(touched_ids.contains(&shared_child.id));
         assert!(!touched_ids.contains(&parent_b.id));
+    }
+
+    #[test]
+    fn complete_task_should_reject_when_task_not_found() {
+        let mut core = new_core();
+        let missing = TaskId::new();
+
+        let result = core.complete_task(missing, false);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
+    #[test]
+    fn complete_task_should_mark_leaf_task_complete_and_set_completed_at() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Leaf")).unwrap();
+
+        let touched = core.complete_task(task.id, false).unwrap();
+
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].id, task.id);
+        assert_eq!(touched[0].status, TaskStatus::Complete);
+        assert!(touched[0].completed_at.is_some());
+    }
+
+    #[test]
+    fn complete_task_should_block_when_children_incomplete_and_cascade_false() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        let result = core.complete_task(parent.id, false);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::IncompleteChildren { task, incomplete })
+                if task == parent.id && incomplete == vec![child.id]
+        ));
+
+        // Nothing should have been written.
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        let parent_after = tree.iter().find(|t| t.id == parent.id).unwrap();
+        assert_eq!(parent_after.status, TaskStatus::Incomplete);
+    }
+
+    #[test]
+    fn complete_task_should_cascade_complete_whole_subtree_when_cascade_true() {
+        let mut core = new_core();
+        let root = core.create_task(minimal_new_task("Root")).unwrap();
+        let mid = core
+            .create_task(NewTask {
+                parent_ids: vec![root.id],
+                ..minimal_new_task("Mid")
+            })
+            .unwrap();
+        let leaf = core
+            .create_task(NewTask {
+                parent_ids: vec![mid.id],
+                ..minimal_new_task("Leaf")
+            })
+            .unwrap();
+
+        let touched = core.complete_task(root.id, true).unwrap();
+
+        let touched_ids: std::collections::HashSet<_> = touched.iter().map(|t| t.id).collect();
+        assert!(touched_ids.contains(&root.id));
+        assert!(touched_ids.contains(&mid.id));
+        assert!(touched_ids.contains(&leaf.id));
+        assert!(touched.iter().all(|t| t.status == TaskStatus::Complete));
+        assert!(touched.iter().all(|t| t.completed_at.is_some()));
+    }
+
+    #[test]
+    fn complete_task_should_not_require_cascade_when_children_already_complete() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+        core.complete_task(child.id, false).unwrap();
+
+        let touched = core.complete_task(parent.id, false).unwrap();
+
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].id, parent.id);
+        assert_eq!(touched[0].status, TaskStatus::Complete);
+    }
+
+    #[test]
+    fn complete_task_should_return_every_task_actually_completed() {
+        let mut core = new_core();
+        let root = core.create_task(minimal_new_task("Root")).unwrap();
+        let child_a = core
+            .create_task(NewTask {
+                parent_ids: vec![root.id],
+                ..minimal_new_task("Child A")
+            })
+            .unwrap();
+        let child_b = core
+            .create_task(NewTask {
+                parent_ids: vec![root.id],
+                ..minimal_new_task("Child B")
+            })
+            .unwrap();
+        // Pre-complete child_b so cascading over it doesn't double-count it.
+        core.complete_task(child_b.id, false).unwrap();
+
+        let touched = core.complete_task(root.id, true).unwrap();
+
+        let touched_ids: std::collections::HashSet<_> = touched.iter().map(|t| t.id).collect();
+        assert!(touched_ids.contains(&root.id));
+        assert!(touched_ids.contains(&child_a.id));
+        // child_b was already complete before this call, so it is not
+        // counted as "actually completed" by this call.
+        assert!(!touched_ids.contains(&child_b.id));
+        assert_eq!(touched.len(), 2);
+    }
+
+    #[test]
+    fn complete_task_should_bump_updated_at() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let touched = core.complete_task(task.id, false).unwrap();
+
+        assert_eq!(touched[0].created_at, task.created_at);
+        assert!(touched[0].updated_at >= task.updated_at);
+    }
+
+    #[test]
+    fn complete_task_should_be_a_no_op_when_already_complete() {
+        // Regression test: completing an already-complete leaf task must not
+        // return it as newly touched or clobber its original `completed_at`,
+        // matching `mark_complete_subtree`'s own "skip already-complete"
+        // behavior under cascade.
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let first = core.complete_task(task.id, false).unwrap();
+        let first_completed_at = first[0].completed_at;
+
+        let second = core.complete_task(task.id, false).unwrap();
+
+        assert!(second.is_empty());
+        let stored = core
+            .get_tree(TreeFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .unwrap();
+        assert_eq!(stored.completed_at, first_completed_at);
+    }
+
+    #[test]
+    fn complete_task_subtree_should_not_overflow_stack_on_a_deep_chain() {
+        // Regression test mirroring
+        // `delete_task_subtree_should_not_overflow_the_stack_on_a_deep_chain`:
+        // the subtree walk must use an explicit work stack, not Rust call
+        // recursion, so it doesn't overflow on a deep chain.
+        let mut core = new_core();
+        let root = core.create_task(minimal_new_task("Root")).unwrap();
+        let mut current = root.id;
+        for i in 0..5000 {
+            let task = core
+                .create_task(NewTask {
+                    parent_ids: vec![current],
+                    ..minimal_new_task(&format!("Level {i}"))
+                })
+                .unwrap();
+            current = task.id;
+        }
+
+        let touched = core.complete_task(root.id, true).unwrap();
+
+        assert_eq!(touched.len(), 5001);
+        assert!(touched.iter().all(|t| t.status == TaskStatus::Complete));
     }
 }

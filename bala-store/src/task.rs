@@ -1,10 +1,10 @@
 //! `tasks` row <-> [`Task`] mapping and queries.
 //!
-//! Columns unused by `bala-core`'s current `Task` shape (`out_of_sync`,
-//! `completed_at` — see crate docs) are written with fixed defaults
-//! (`NULL`/`0`) on every `put_task` and never read back into a `Task`,
-//! since `Task` has nowhere to put them yet. `assignee_id` (Story 1.1a)
-//! and `deleted_at` (Story 1.3) *are* read/written.
+//! `out_of_sync` is unused by `bala-core`'s current `Task` shape (see crate
+//! docs) and is written with a fixed default (`0`) on every `put_task`,
+//! never read back into a `Task`, since `Task` has nowhere to put it yet.
+//! `assignee_id` (Story 1.1a), `deleted_at` (Story 1.3), and `completed_at`
+//! (Story 1.4) *are* read/written.
 
 use bala_core::{StoreError, Task, TaskId, TreeFilter};
 use rusqlite::{OptionalExtension, Row, ToSql, Transaction, params};
@@ -16,7 +16,7 @@ use crate::convert::{
 use crate::edges;
 
 const SELECT_COLUMNS: &str = "id, title, description, type_key, status, start_date, due_date, \
-    assignee_id, created_at, updated_at, deleted_at";
+    assignee_id, created_at, updated_at, completed_at, deleted_at";
 
 /// Builds a [`Task`] from a row of [`SELECT_COLUMNS`], leaving `parent_ids`
 /// empty — callers fill it in from `parent_edges` separately (edges are a
@@ -32,7 +32,8 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
     let assignee_id: Option<Vec<u8>> = row.get(7)?;
     let created_at: String = row.get(8)?;
     let updated_at: String = row.get(9)?;
-    let deleted_at: Option<String> = row.get(10)?;
+    let completed_at: Option<String> = row.get(10)?;
+    let deleted_at: Option<String> = row.get(11)?;
 
     Ok((|| {
         Ok(Task {
@@ -47,6 +48,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
             assignee_id: assignee_id.map(|b| blob_to_user_id(&b)).transpose()?,
             created_at: timestamp_from_text(&created_at)?,
             updated_at: timestamp_from_text(&updated_at)?,
+            completed_at: completed_at.map(|s| timestamp_from_text(&s)).transpose()?,
             deleted_at: deleted_at.map(|s| timestamp_from_text(&s)).transpose()?,
         })
     })())
@@ -90,7 +92,7 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
         "INSERT INTO tasks (
             id, title, description, type_key, status, start_date, due_date,
             assignee_id, out_of_sync, created_at, updated_at, completed_at, deleted_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, NULL, ?11)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12)
         ON CONFLICT(id) DO UPDATE SET
             title = excluded.title,
             description = excluded.description,
@@ -100,6 +102,7 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
             due_date = excluded.due_date,
             assignee_id = excluded.assignee_id,
             updated_at = excluded.updated_at,
+            completed_at = excluded.completed_at,
             deleted_at = excluded.deleted_at",
         params![
             id_blob.as_slice(),
@@ -112,6 +115,7 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
             assignee_id_blob.as_ref().map(<[u8; 16]>::as_slice),
             timestamp_to_text(task.created_at),
             timestamp_to_text(task.updated_at),
+            task.completed_at.map(timestamp_to_text),
             task.deleted_at.map(timestamp_to_text),
         ],
     )

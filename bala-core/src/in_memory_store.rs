@@ -158,6 +158,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            completed_at: None,
         }
     }
 
