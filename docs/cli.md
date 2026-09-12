@@ -88,7 +88,83 @@ Lists all tasks.
 bala task ls
 ```
 
-Output is one task per line: `<id> <title>`, plus ` (assigned: <name>)` when
-the task has an assignee. A task with at least one parent is indented one
-level; this is a minimal visual cue, not a full recursive tree layout (that's
-planned for the TUI).
+Output is one task per line: `[<marker>] <id> <title>`, plus
+` (assigned: <name>)` when the task has an assignee. `<marker>` is `x` for a
+completed task and a space otherwise. A task with at least one parent is
+indented one level; this is a minimal visual cue, not a full recursive tree
+layout (that's planned for the TUI).
+
+### `bala task edit`
+
+Edits an existing task. Only the fields you pass are changed; everything
+else is left as-is.
+
+```sh
+bala task edit <task-id> \
+  --title "Write docs" \
+  --description "Document the CLI commands" \
+  --start 2026-09-15 \
+  --due 2026-09-20 \
+  --assignee <user-id> \
+  --type <type-key>
+```
+
+| Flag | Description |
+| --- | --- |
+| `--title` | New title. |
+| `--description` | New description. |
+| `--clear-description` | Clear the description. Conflicts with `--description`. |
+| `--start` | New start date, `YYYY-MM-DD`. |
+| `--clear-start` | Clear the start date. Conflicts with `--start`. |
+| `--due` | New due date, `YYYY-MM-DD`. |
+| `--clear-due` | Clear the due date. Conflicts with `--due`. |
+| `--assignee` | Id of the user to assign the task to. |
+| `--clear-assignee` | Unassign the task. Conflicts with `--assignee`. |
+| `--type` | New task type key. |
+
+Prints the edited task (and any other tasks affected by the change), one
+per line in the same format as `task ls`.
+
+### `bala task delete`
+
+Deletes a task, prompting for confirmation unless `--yes` is given.
+
+```sh
+bala task delete <task-id> [--yes] [--cascade | --promote-children]
+```
+
+| Flag | Description |
+| --- | --- |
+| `--yes` | Skip the interactive confirmation prompt. |
+| `--cascade` | Delete the task's whole subtree along with it. Conflicts with `--promote-children`. |
+| `--promote-children` | Reattach the task's children to its own parents instead of deleting them. |
+
+If the task has subtasks and neither `--cascade` nor `--promote-children` is
+given, the command fails and lists the subtasks so you can choose a mode.
+
+Prints the id of each deleted task, one per line, on success.
+
+### `bala task restore`
+
+Restores a previously deleted task.
+
+```sh
+bala task restore <task-id>
+```
+
+Prints the restored task, in the same format as `task ls`.
+
+### `bala task complete`
+
+Marks a task complete.
+
+```sh
+bala task complete <task-id> [--cascade]
+```
+
+| Flag | Description |
+| --- | --- |
+| `--cascade` | Also complete every incomplete descendant. |
+
+Prints the completed task (and, with `--cascade`, each descendant it also
+completed), one per line in the same format as `task ls`.
