@@ -466,3 +466,104 @@ fn task_restore_with_unknown_id_should_fail() {
         .assert()
         .failure();
 }
+
+#[test]
+fn task_complete_leaf_task_should_show_as_complete_in_ls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Leaf task"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "complete", &task_id])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("[x]").and(contains("Leaf task")));
+}
+
+#[test]
+fn task_complete_with_unknown_task_id_should_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let unknown_task_id = uuid::Uuid::new_v4().to_string();
+
+    bala_cmd(&db_path)
+        .args(["task", "complete", &unknown_task_id])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn task_complete_task_with_incomplete_children_should_fail_with_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+
+    bala_cmd(&db_path)
+        .args(["task", "complete", &parent_id])
+        .assert()
+        .failure()
+        .stderr(contains("incomplete children").and(contains("cascade")));
+}
+
+#[test]
+fn task_complete_task_with_incomplete_children_and_cascade_should_complete_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+
+    bala_cmd(&db_path)
+        .args(["task", "complete", &parent_id, "--cascade"])
+        .assert()
+        .success();
+
+    let ls_output = bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ls_text = String::from_utf8(ls_output).unwrap();
+
+    let parent_line = ls_text
+        .lines()
+        .find(|line| line.contains("Parent task"))
+        .expect("parent line present");
+    let child_line = ls_text
+        .lines()
+        .find(|line| line.contains("Child task"))
+        .expect("child line present");
+
+    assert!(
+        parent_line.contains("[x]"),
+        "parent not marked complete: {parent_line:?}"
+    );
+    assert!(
+        child_line.contains("[x]"),
+        "child not marked complete: {child_line:?}"
+    );
+}
+
+#[test]
+fn task_ls_should_show_incomplete_marker_for_a_new_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    add_task(&db_path, &["--title", "Fresh task"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("[ ]").and(contains("Fresh task")));
+}

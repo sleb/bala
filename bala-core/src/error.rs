@@ -9,9 +9,10 @@ use crate::store::StoreError;
 /// Errors the `Core` facade can return.
 ///
 /// This is a subset of the full taxonomy in `docs/design/core-library.md`
-/// §Error Taxonomy: only the variants needed by Story 1.1 (create a task)
-/// and Story 1.1a (assign a task). Later stories add `CircularHierarchy`,
-/// `DependsOnRelative`, `CircularDependency`, and `IncompleteChildren`.
+/// §Error Taxonomy: only the variants needed by Story 1.1 (create a task),
+/// Story 1.1a (assign a task), and Story 1.4 (mark a task complete). Later
+/// stories add `CircularHierarchy`, `DependsOnRelative`, and
+/// `CircularDependency`.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("task {0:?} not found")]
@@ -34,6 +35,14 @@ pub enum CoreError {
 
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    #[error(
+        "{task:?} has incomplete children: {incomplete:?}; pass cascade=true or complete them first"
+    )]
+    IncompleteChildren {
+        task: TaskId,
+        incomplete: Vec<TaskId>,
+    },
 }
 
 #[cfg(test)]
@@ -96,5 +105,21 @@ mod tests {
     fn store_error_converts_via_from_into_core_error() {
         let err: CoreError = StoreError::Backend("boom".to_owned()).into();
         assert!(matches!(err, CoreError::Store(_)));
+    }
+
+    #[test]
+    fn incomplete_children_display_message() {
+        let task = TaskId::new();
+        let incomplete = vec![TaskId::new(), TaskId::new()];
+        let err = CoreError::IncompleteChildren {
+            task,
+            incomplete: incomplete.clone(),
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{task:?} has incomplete children: {incomplete:?}; pass cascade=true or complete them first"
+            )
+        );
     }
 }

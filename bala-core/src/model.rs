@@ -87,8 +87,7 @@ pub enum TaskStatus {
 ///
 /// Deliberately narrower than the full LLD shape for this story: fields
 /// belonging to later stories/epics (`depends_on`, `out_of_sync`,
-/// `progress`, `completed_at`) are omitted until the stories that need them
-/// land.
+/// `progress`) are omitted until the stories that need them land.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: TaskId,
@@ -111,6 +110,9 @@ pub struct Task {
     /// asked otherwise (`get_task_including_deleted`,
     /// `TreeFilter::include_deleted`).
     pub deleted_at: Option<DateTime<Utc>>,
+    /// `Some` when `status` transitioned to [`TaskStatus::Complete`] via
+    /// `Core::complete_task`; `None` for an incomplete task.
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 /// How `Core::delete_task` should treat a deleted task's children (LLD
@@ -256,6 +258,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            completed_at: None,
         };
 
         assert_eq!(task.title, "Write tests");
@@ -279,6 +282,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            completed_at: None,
         };
         let cloned = task.clone();
         assert_eq!(task, cloned);

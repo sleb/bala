@@ -6,8 +6,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use bala_core::{
-    Core, CoreError, DeleteMode, Field, NewTask, StoreError, Task, TaskId, TaskPatch, TreeFilter,
-    UserId,
+    Core, CoreError, DeleteMode, Field, NewTask, StoreError, Task, TaskId, TaskPatch, TaskStatus,
+    TreeFilter, UserId,
 };
 use bala_store::SqliteStore;
 use chrono::NaiveDate;
@@ -29,7 +29,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Task operations: `add`, `ls`, `edit`, `delete`, `restore`.
+    /// Task operations: `add`, `ls`, `edit`, `delete`, `restore`, `complete`.
     Task(TaskArgs),
     /// User operations: `add`, `ls`.
     User(UserArgs),
@@ -53,6 +53,8 @@ pub enum TaskCommands {
     Delete(DeleteArgs),
     /// Restore a previously deleted task.
     Restore(RestoreArgs),
+    /// Mark a task complete, optionally cascading to its subtasks.
+    Complete(CompleteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -151,6 +153,16 @@ pub struct RestoreArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct CompleteArgs {
+    /// Id of the task to complete.
+    pub id: Uuid,
+
+    /// Also complete every incomplete descendant.
+    #[arg(long)]
+    pub cascade: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct UserArgs {
     #[command(subcommand)]
     pub command: UserCommands,
@@ -231,6 +243,7 @@ pub fn run_task_command(db_path: &Path, command: TaskCommands) -> Result<(), Cli
         TaskCommands::Edit(args) => run_task_edit(db_path, args),
         TaskCommands::Delete(args) => run_task_delete(db_path, &args),
         TaskCommands::Restore(args) => run_task_restore(db_path, &args),
+        TaskCommands::Complete(args) => run_task_complete(db_path, &args),
     }
 }
 
@@ -280,15 +293,25 @@ fn run_task_ls(db_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Renders the one-line summary shared by `task ls` and `task edit`:
-/// `"{indent}{id} {title}{assignee_suffix}"`.
+/// Renders the one-line summary shared by `task ls`/`edit`/`delete`/
+/// `restore`/`complete`: `"{indent}[{marker}] {id} {title}{assignee_suffix}"`,
+/// where `marker` is `x` for a completed task and a space otherwise.
 fn format_task_line(task: &Task, indent: &str, names: &HashMap<UserId, String>) -> String {
     let assignee = task
         .assignee_id
         .and_then(|id| names.get(&id))
         .map(|name| format!(" (assigned: {name})"))
         .unwrap_or_default();
-    format!("{indent}{} {}{assignee}", Uuid::from(task.id), task.title)
+    let marker = if task.status == TaskStatus::Complete {
+        'x'
+    } else {
+        ' '
+    };
+    format!(
+        "{indent}[{marker}] {} {}{assignee}",
+        Uuid::from(task.id),
+        task.title
+    )
 }
 
 fn run_task_edit(db_path: &Path, args: EditArgs) -> Result<(), CliError> {
@@ -380,6 +403,21 @@ fn run_task_restore(db_path: &Path, args: &RestoreArgs) -> Result<(), CliError> 
         .collect();
     let indent = if task.parent_ids.is_empty() { "" } else { "  " };
     println!("{}", format_task_line(&task, indent, &names));
+    Ok(())
+}
+
+fn run_task_complete(db_path: &Path, args: &CompleteArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let completed = core.complete_task(TaskId::from(args.id), args.cascade)?;
+    let names: HashMap<UserId, String> = core
+        .list_users()?
+        .into_iter()
+        .map(|user| (user.id, user.name))
+        .collect();
+    for task in &completed {
+        let indent = if task.parent_ids.is_empty() { "" } else { "  " };
+        println!("{}", format_task_line(task, indent, &names));
+    }
     Ok(())
 }
 

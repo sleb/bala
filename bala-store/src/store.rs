@@ -166,6 +166,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            completed_at: None,
         }
     }
 
@@ -556,6 +557,32 @@ mod tests {
 
         let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
         assert_eq!(fetched, None);
+    }
+
+    #[test]
+    fn put_task_should_persist_completed_at_and_get_task_should_return_it() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut task = sample_task("task", TaskStatus::Complete);
+        task.completed_at = Some(Utc::now());
+
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert_eq!(fetched, Some(task));
+    }
+
+    #[test]
+    fn put_task_should_update_completed_at_on_conflict() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        task.status = TaskStatus::Complete;
+        task.completed_at = Some(Utc::now());
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert_eq!(fetched, Some(task));
     }
 
     #[test]
