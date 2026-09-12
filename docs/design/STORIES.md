@@ -61,14 +61,68 @@
 1. Task has at least two states: incomplete / complete (status field extensible later).
 2. Completing a task with incomplete subtasks prompts a warning or auto-completes children (behavior to be confirmed with stakeholders).
 3. A completed task visually indicates completion in list, tree, and Gantt views.
-4. Completing a task unblocks any dependent tasks waiting on it (see Epic 3).
+4. Completing a task unblocks any dependent tasks waiting on it (see Epic 4).
 5. Completion timestamp is recorded.
 
 ---
 
-## Epic 2: Nested Task Hierarchy
+## Epic 2: TUI Implementation
 
-### Story 2.1 — Add a Subtask to Any Task
+**Design:** [LLD-3: CLI/TUI Client](./cli-tui-client.md)
+
+### Story 2.1 — Launch the TUI and Browse the Task List
+**Description:** As a user, I want to launch bala's terminal UI and see my tasks in a navigable list, so that I can work without memorizing CLI subcommands.
+
+**Acceptance Criteria:**
+1. Running `bala` with no subcommand launches an interactive full-screen terminal UI in Normal mode.
+2. The task list pane shows each top-level task's title, type, status, and assignee (nested/tree rendering is deferred to Epic 3).
+3. Arrow keys (or `j`/`k`) move the selection; the currently selected task is visually highlighted.
+4. `q` quits the TUI cleanly, restoring the terminal to its normal state.
+5. An empty task list shows a clear "no tasks yet" state rather than a blank screen.
+
+### Story 2.2 — Create, Edit, and Delete Tasks from the TUI
+**Description:** As a user, I want to create, edit, and delete tasks using only the keyboard, so that I can manage work without leaving the terminal UI.
+
+**Acceptance Criteria:**
+1. A dedicated key opens a text-entry mode for creating a new task, honoring the title requirement from Story 1.1.
+2. Selecting a task and entering its detail view, then a dedicated key, opens edit mode for its fields (Story 1.2).
+3. `Esc` cancels an in-progress create/edit without saving.
+4. A dedicated key sequence prompts for confirmation before deleting the selected task (Story 1.3).
+5. Validation errors (e.g., empty title) are shown inline in the entry field and block save, without crashing or corrupting terminal state.
+
+### Story 2.3 — Mark Tasks Complete and Confirm Destructive Actions in the TUI
+**Description:** As a user, I want to toggle a task's completion and confirm risky actions from the keyboard, so that I don't lose work by accident.
+
+**Acceptance Criteria:**
+1. A dedicated key toggles the selected task's complete/incomplete state (Story 1.4).
+2. Destructive or hard-to-reverse actions (delete, completing a task with incomplete subtasks) route through one Confirm mode with a `y`/`n` prompt.
+3. Confirm mode's prompt states the specific consequence of the pending action before the user answers.
+4. `Esc` or `n` in Confirm mode cancels with no state change.
+5. Completed tasks are visually distinguished in the list, matching Story 1.4 AC3.
+
+### Story 2.4 — Persist TUI View State Across Sessions
+**Description:** As a user, I want the TUI to remember my last view when I relaunch it, so that I don't have to re-navigate to where I left off.
+
+**Acceptance Criteria:**
+1. The selected task, and any collapse/filter state introduced by later epics, are saved when the TUI quits.
+2. A missing or corrupt view-state file falls back to sane defaults on launch rather than erroring.
+3. View state is stored as a human-readable local file, separate from the task data store.
+4. A crash or forced kill of the TUI does not corrupt the saved view-state file.
+
+### Story 2.5 — Discover TUI Keybindings via a Help Overlay
+**Description:** As a user, I want an in-app reference for the TUI's keybindings, so that I can learn the controls without leaving the app or reading external docs.
+
+**Acceptance Criteria:**
+1. A dedicated key opens a help overlay listing every key bound in the current mode.
+2. Help overlay content is generated from the same keymap the app dispatches on, so it cannot drift out of sync with real behavior.
+3. `Esc` closes the help overlay and returns to the previous mode.
+4. Help is accessible from every mode, not just Normal.
+
+---
+
+## Epic 3: Nested Task Hierarchy
+
+### Story 3.1 — Add a Subtask to Any Task
 **Description:** As a user, I want to add a subtask under any existing task, so that I can break work into smaller pieces at any depth.
 
 **Acceptance Criteria:**
@@ -78,7 +132,7 @@
 4. A task can be moved to become a subtask of another task (re-parenting), and vice versa (promoted to top-level).
 5. Circular nesting (a task becoming its own ancestor) is prevented with a clear error.
 
-### Story 2.2 — Collapse/Expand Task Tree
+### Story 3.2 — Collapse/Expand Task Tree
 **Description:** As a user, I want to collapse and expand branches of the task tree, so that I can focus on relevant parts of a large project.
 
 **Acceptance Criteria:**
@@ -89,7 +143,7 @@
 5. Deeply nested trees (5+ levels) remain navigable without performance lag on reasonable list sizes.
 6. Completed tasks are visually distinguished in the tree view, matching the indication used in the list view (Story 1.4).
 
-### Story 2.3 — Roll Up Progress from Subtasks
+### Story 3.3 — Roll Up Progress from Subtasks
 **Description:** As a user, I want a parent task's progress to reflect its subtasks' completion, so that I can see overall status at a glance.
 
 **Acceptance Criteria:**
@@ -99,7 +153,7 @@
 4. Parent's own completion is independent of the rollup number unless explicitly configured otherwise.
 5. Empty parent (no subtasks) shows no rollup or defaults to its own status.
 
-### Story 2.4 — Label a Task's Type/Level
+### Story 3.4 — Label a Task's Type/Level
 **Description:** As a user, I want to tag a task with a level such as Initiative, Goal, Project, Story, or Task, so that I can tell at a glance what kind of work a node in the hierarchy represents.
 
 **Acceptance Criteria:**
@@ -112,9 +166,9 @@
 
 ---
 
-## Epic 3: Task Dependencies
+## Epic 4: Task Dependencies
 
-### Story 3.1 — Define a Dependency Between Tasks
+### Story 4.1 — Define a Dependency Between Tasks
 **Description:** As a user, I want to mark that one task depends on another, so that the schedule reflects real-world ordering constraints.
 
 **Acceptance Criteria:**
@@ -125,7 +179,7 @@
 5. Dependency relationships are visible on the task's detail view (both "blocked by" and "blocks" lists).
 6. Deleting a task that other tasks depend on (Story 1.3) warns the user which specific dependent tasks will be affected.
 
-### Story 3.2 — Enforce Dependency Scheduling
+### Story 4.2 — Enforce Dependency Scheduling
 **Description:** As a user, I want dependent tasks to automatically respect their predecessors' timing, so that I don't have to manually recalculate dates.
 
 **Acceptance Criteria:**
@@ -135,7 +189,7 @@
 4. Manual override is possible but flags the task as "out of sync" with its dependency.
 5. Completing Task A unblocks Task B for status purposes even if dates aren't touched.
 
-### Story 3.3 — Visualize Blocked Tasks
+### Story 4.3 — Visualize Blocked Tasks
 **Description:** As a user, I want to see which tasks are currently blocked, so that I know what I can't start yet.
 
 **Acceptance Criteria:**
@@ -147,9 +201,9 @@
 
 ---
 
-## Epic 4: Gantt Chart
+## Epic 5: Gantt Chart
 
-### Story 4.1 — Generate a Gantt Chart from Tasks
+### Story 5.1 — Generate a Gantt Chart from Tasks
 **Description:** As a user, I want to see my tasks laid out on a Gantt chart, so that I can understand the project timeline visually.
 
 **Acceptance Criteria:**
@@ -161,7 +215,7 @@
 6. Chart supports a reasonable number of tasks (e.g., 200+) without significant lag.
 7. Completed tasks are visually distinguished on the chart, matching the indication used in list/tree views (Story 1.4).
 
-### Story 4.2 — Navigate and Zoom the Gantt Chart
+### Story 5.2 — Navigate and Zoom the Gantt Chart
 **Description:** As a user, I want to zoom and scroll the Gantt timeline, so that I can view anything from a single week to a multi-month project.
 
 **Acceptance Criteria:**
@@ -171,28 +225,28 @@
 4. Collapsing a parent task in the tree collapses its bars into a single summary bar on the chart.
 5. Zoom/scale preference persists across sessions.
 
-### Story 4.3 — Reschedule a Task from the Gantt Chart via Keyboard (TUI)
+### Story 5.3 — Reschedule a Task from the Gantt Chart via Keyboard (TUI)
 **Description:** As a TUI user, I want to reschedule a task's bar using the keyboard, so that I can adjust dates from the Gantt view without a mouse.
 
 **Acceptance Criteria:**
 1. User can select a bar (arrow keys / focus) and enter a "reschedule" mode for it, distinguishable in the UI from normal navigation.
 2. In reschedule mode, nudge keys shift both start and due date together, preserving duration; modifier keys (or a separate mode) resize start or due date independently.
 3. A numeric/date-entry input is available as a faster alternative to nudging for larger date changes.
-4. Changes preview the same dependency-cascade logic as editing dates in the task form (Story 3.2 AC3) before committing.
+4. Changes preview the same dependency-cascade logic as editing dates in the task form (Story 4.2 AC3) before committing.
 5. Invalid changes (e.g., violating a dependency) are rejected with an inline message rather than committed.
 6. Change is saved and reflected in list/tree views immediately, and reschedule mode has a clear, discoverable way to exit/cancel.
 
-### Story 4.4 — Edit Dates by Dragging on the Gantt Chart (Web/GUI)
+### Story 5.4 — Edit Dates by Dragging on the Gantt Chart (Web/GUI)
 **Description:** As a web user, I want to drag a task's bar to change its dates, so that I can reschedule without switching views.
 
 **Acceptance Criteria:**
 1. Dragging the middle of a bar moves both start and due date together, preserving duration.
 2. Dragging either edge of a bar resizes start or due date independently.
-3. Changes trigger the same dependency-cascade logic as editing dates in the task form (Story 3.2).
+3. Changes trigger the same dependency-cascade logic as editing dates in the task form (Story 4.2).
 4. Invalid drags (e.g., violating a dependency) snap back or show a warning before committing.
 5. Change is saved and reflected in list/tree views immediately.
 
-### Story 4.5 — Export or Share the Gantt Chart
+### Story 5.5 — Export or Share the Gantt Chart
 **Description:** As a user, I want to export the Gantt chart, so that I can share the project timeline with people outside the app.
 
 **Acceptance Criteria:**
@@ -204,4 +258,4 @@
 
 ---
 
-These 17 stories are independently shippable and sized for roughly one sprint each. A sensible build order: **Epic 1 → Epic 2 → Epic 3 → Epic 4**, since the Gantt chart and dependency enforcement both depend on core task CRUD and hierarchy existing first. Story 4.3 (TUI) and Story 4.4 (Web/GUI) are client-specific variants of the same capability — ship whichever matches the client that exists at the time (TUI for v1, Web/GUI once the web client lands).
+These 22 stories are independently shippable and sized for roughly one sprint each. A sensible build order: **Epic 1 → Epic 2 → Epic 3 → Epic 4 → Epic 5**, since the terminal UI needs core task CRUD to exist first, and the Gantt chart and dependency enforcement both depend on core task CRUD and hierarchy existing before them. Story 5.3 (TUI) and Story 5.4 (Web/GUI) are client-specific variants of the same capability — ship whichever matches the client that exists at the time (TUI for v1, Web/GUI once the web client lands).

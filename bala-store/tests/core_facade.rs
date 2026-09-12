@@ -159,7 +159,7 @@ fn create_task_should_reject_due_date_before_start_date() {
 
 #[test]
 fn create_task_should_run_hierarchy_check_for_each_given_parent() {
-    // The hierarchy check is a no-op at this checkpoint (Story 2.1
+    // The hierarchy check is a no-op at this checkpoint (Story 3.1
     // gives it teeth), so the honest thing to assert here is that
     // attaching a task under several parents in one call still
     // succeeds and records every edge — i.e. the per-parent check

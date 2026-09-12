@@ -4,7 +4,7 @@
 //! new, childless task to zero or more existing parents, which can never
 //! create a cycle (a brand-new [`TaskId`] cannot already be an ancestor of
 //! anything). [`check_new_parent`] is therefore a no-op today, but it is
-//! the single function Story 2.1's `set_parents` will extend with the real
+//! the single function Story 3.1's `set_parents` will extend with the real
 //! DFS/BFS cycle walk described in the LLD, so callers never need to
 //! change once that check grows teeth.
 
@@ -16,7 +16,7 @@ use crate::store::{StoreError, StoreTx};
 ///
 /// Currently always succeeds: at this checkpoint's scope, `child` is
 /// always a freshly created [`TaskId`] with no existing edges, so it can
-/// never already be an ancestor of `parent`. Story 2.1 extends this with
+/// never already be an ancestor of `parent`. Story 3.1 extends this with
 /// the real ancestor-reachability walk once `set_parents` can attach an
 /// *existing* task (with its own descendants) under a new parent — at
 /// that point this will need to report `CircularHierarchy` too, likely by
@@ -33,7 +33,7 @@ use crate::store::{StoreError, StoreTx};
 ///
 /// Returns `Err` only if the backend fails while walking ancestors (not
 /// possible yet, since no walk happens today).
-// Always `Ok` today is deliberate: this is the seam Story 2.1 extends
+// Always `Ok` today is deliberate: this is the seam Story 3.1 extends
 // with the real ancestor walk, so it stays fallible now rather than
 // forcing every call site to change signature later.
 #[allow(clippy::unnecessary_wraps)]
