@@ -92,8 +92,17 @@ impl StoreTx for State {
         Ok(self.parent_edges.get(&id).cloned().unwrap_or_default())
     }
 
+    /// Idempotent, matching the LLD's edge-table contract (`bala-store`'s
+    /// SQL implementation is `INSERT OR IGNORE`): re-adding an
+    /// already-existing edge is a no-op rather than a duplicate entry, so
+    /// `list_parent_edges` never returns the same parent twice for one
+    /// child regardless of how many times `add_parent_edge` is called for
+    /// that pair.
     fn add_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError> {
-        self.parent_edges.entry(child).or_default().push(parent);
+        let parents = self.parent_edges.entry(child).or_default();
+        if !parents.contains(&parent) {
+            parents.push(parent);
+        }
         Ok(())
     }
 
@@ -259,6 +268,27 @@ mod tests {
 
         store
             .transaction(|tx| tx.add_parent_edge(parent, child))
+            .unwrap();
+
+        let edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();
+        assert_eq!(edges, vec![parent]);
+    }
+
+    #[test]
+    fn add_parent_edge_is_idempotent_on_duplicate() {
+        // Mirrors `bala-store`'s `add_parent_edge_is_idempotent_on_duplicate`
+        // (its SQL is `INSERT OR IGNORE`, so a repeat add is a silent
+        // no-op there) — the two backends must agree, and this test caught
+        // a real divergence: this fake used to `push` unconditionally.
+        let store = InMemoryStore::default();
+        let parent = TaskId::new();
+        let child = TaskId::new();
+
+        store
+            .transaction(|tx| {
+                tx.add_parent_edge(parent, child)?;
+                tx.add_parent_edge(parent, child)
+            })
             .unwrap();
 
         let edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();

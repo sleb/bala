@@ -422,12 +422,17 @@ impl<S: Store> Core<S> {
     }
 }
 
-/// Recursively tombstones `id` under [`DeleteMode::Subtree`]: sets
+/// Tombstones `id` under [`DeleteMode::Subtree`]: sets
 /// `deleted_at`/`updated_at`, drops the `id -> child` edge for every
 /// direct child, and — only for a child left with no remaining parents —
-/// recurses into it too, at arbitrary depth. A child still reachable
-/// through another live parent keeps existing untouched beyond that one
-/// dropped edge.
+/// processes it too, at arbitrary depth. A child still reachable through
+/// another live parent keeps existing untouched beyond that one dropped
+/// edge.
+///
+/// Iterative (an explicit work stack), not recursive: `create_task`
+/// permits arbitrarily deep parent chains, so a user-built hierarchy deep
+/// enough could overflow the process stack if this walked it via Rust
+/// call recursion instead.
 ///
 /// Every tombstoned (and, for a surviving child, edge-updated) [`Task`] is
 /// appended to `touched`.
@@ -437,25 +442,29 @@ fn tombstone_subtree(
     now: chrono::DateTime<Utc>,
     touched: &mut Vec<Task>,
 ) -> Result<(), StoreError> {
-    let Some(mut task) = tx.get_task_including_deleted(id)? else {
-        return Ok(());
-    };
-    task.deleted_at = Some(now);
-    task.updated_at = now;
-    tx.put_task(&task)?;
-    touched.push(task);
+    let mut pending = vec![id];
 
-    for child in tx.list_child_edges(id)? {
-        tx.remove_parent_edge(id, child)?;
-        let remaining_parents = tx.list_parent_edges(child)?;
+    while let Some(current) = pending.pop() {
+        let Some(mut task) = tx.get_task_including_deleted(current)? else {
+            continue;
+        };
+        task.deleted_at = Some(now);
+        task.updated_at = now;
+        tx.put_task(&task)?;
+        touched.push(task);
 
-        if remaining_parents.is_empty() {
-            tombstone_subtree(tx, child, now, touched)?;
-        } else if let Some(mut child_task) = tx.get_task(child)? {
-            child_task.parent_ids.retain(|&p| p != id);
-            child_task.updated_at = now;
-            tx.put_task(&child_task)?;
-            touched.push(child_task);
+        for child in tx.list_child_edges(current)? {
+            tx.remove_parent_edge(current, child)?;
+            let remaining_parents = tx.list_parent_edges(child)?;
+
+            if remaining_parents.is_empty() {
+                pending.push(child);
+            } else if let Some(mut child_task) = tx.get_task(child)? {
+                child_task.parent_ids.retain(|&p| p != current);
+                child_task.updated_at = now;
+                tx.put_task(&child_task)?;
+                touched.push(child_task);
+            }
         }
     }
 
@@ -1246,6 +1255,32 @@ mod tests {
     }
 
     #[test]
+    fn delete_task_subtree_should_not_overflow_the_stack_on_a_deep_chain() {
+        // Regression test: `create_task` places no limit on nesting depth,
+        // so `tombstone_subtree` must walk an arbitrarily deep chain via an
+        // explicit work stack rather than Rust call recursion — a naive
+        // recursive walk would overflow the process stack well before this
+        // many levels.
+        let mut core = new_core();
+        let root = core.create_task(minimal_new_task("Root")).unwrap();
+        let mut current = root.id;
+        for i in 0..5000 {
+            let task = core
+                .create_task(NewTask {
+                    parent_ids: vec![current],
+                    ..minimal_new_task(&format!("Level {i}"))
+                })
+                .unwrap();
+            current = task.id;
+        }
+
+        let touched = core.delete_task(root.id, DeleteMode::Subtree).unwrap();
+
+        assert_eq!(touched.len(), 5001);
+        assert!(touched.iter().all(|t| t.deleted_at.is_some()));
+    }
+
+    #[test]
     fn delete_task_promote_children_should_reparent_child_to_deleted_tasks_parents() {
         let mut core = new_core();
         let grandparent = core.create_task(minimal_new_task("Grandparent")).unwrap();
@@ -1317,6 +1352,38 @@ mod tests {
         let expected: std::collections::HashSet<_> =
             [other_parent.id, grandparent.id].into_iter().collect();
         assert_eq!(parents, expected);
+    }
+
+    #[test]
+    fn delete_task_promote_children_should_not_duplicate_parent_edge_when_child_already_shares_a_grandparent()
+     {
+        // Regression test: `child` already has `grandparent` as a parent
+        // (alongside `parent`, which is being deleted) — `PromoteChildren`
+        // then tries to add a `grandparent -> child` edge that already
+        // exists. `add_parent_edge` must treat that as a no-op rather than
+        // a duplicate entry, so `parent_ids` still names `grandparent`
+        // exactly once afterward.
+        let mut core = new_core();
+        let grandparent = core.create_task(minimal_new_task("Grandparent")).unwrap();
+        let parent = core
+            .create_task(NewTask {
+                parent_ids: vec![grandparent.id],
+                ..minimal_new_task("Parent")
+            })
+            .unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id, grandparent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        core.delete_task(parent.id, DeleteMode::PromoteChildren)
+            .unwrap();
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
+        assert_eq!(child_after.parent_ids, vec![grandparent.id]);
     }
 
     #[test]

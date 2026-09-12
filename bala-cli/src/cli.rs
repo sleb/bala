@@ -29,7 +29,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Task operations: `add`, `ls`.
+    /// Task operations: `add`, `ls`, `edit`, `delete`, `restore`.
     Task(TaskArgs),
     /// User operations: `add`, `ls`.
     User(UserArgs),
