@@ -463,7 +463,9 @@ impl<S: Store> Core<S> {
             let mut touched = Vec::new();
             if cascade {
                 mark_complete_subtree(tx, id, now, &mut touched)?;
-            } else if let Some(mut task) = tx.get_task(id)? {
+            } else if let Some(mut task) = tx.get_task(id)?
+                && task.status != TaskStatus::Complete
+            {
                 task.status = TaskStatus::Complete;
                 task.completed_at = Some(now);
                 task.updated_at = now;
@@ -1734,6 +1736,29 @@ mod tests {
 
         assert_eq!(touched[0].created_at, task.created_at);
         assert!(touched[0].updated_at >= task.updated_at);
+    }
+
+    #[test]
+    fn complete_task_should_be_a_no_op_when_already_complete() {
+        // Regression test: completing an already-complete leaf task must not
+        // return it as newly touched or clobber its original `completed_at`,
+        // matching `mark_complete_subtree`'s own "skip already-complete"
+        // behavior under cascade.
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let first = core.complete_task(task.id, false).unwrap();
+        let first_completed_at = first[0].completed_at;
+
+        let second = core.complete_task(task.id, false).unwrap();
+
+        assert!(second.is_empty());
+        let stored = core
+            .get_tree(TreeFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .unwrap();
+        assert_eq!(stored.completed_at, first_completed_at);
     }
 
     #[test]
