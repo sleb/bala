@@ -87,8 +87,8 @@ pub enum TaskStatus {
 ///
 /// Deliberately narrower than the full LLD shape for this story: fields
 /// belonging to later stories/epics (`depends_on`, `out_of_sync`,
-/// `progress`, `completed_at`, `deleted_at`) are omitted until the stories
-/// that need them land.
+/// `progress`, `completed_at`) are omitted until the stories that need them
+/// land.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: TaskId,
@@ -106,6 +106,22 @@ pub struct Task {
     pub assignee_id: Option<UserId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// `Some` means the task is soft-deleted; `None` means live.
+    /// `Store::get_task`/`list_tasks` exclude soft-deleted tasks unless
+    /// asked otherwise (`get_task_including_deleted`,
+    /// `TreeFilter::include_deleted`).
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+/// How `Core::delete_task` should treat a deleted task's children (LLD
+/// §Method Contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeleteMode {
+    /// Soft-delete the task and every descendant beneath it.
+    Subtree,
+    /// Soft-delete only the task itself; its children are reparented to
+    /// its parents (or become top-level if it had none).
+    PromoteChildren,
 }
 
 /// Input to `Core::create_task`.
@@ -140,9 +156,8 @@ pub struct TreeFilter {
     pub type_key: Option<String>,
     pub status: Option<TaskStatus>,
     pub assignee_id: Option<UserId>,
-    /// Default `false`: soft-deleted tasks excluded. `Task` has no
-    /// `deleted_at` field yet at this checkpoint's scope, so this is
-    /// currently a no-op in `InMemoryStore` — see its module docs.
+    /// Default `false`: soft-deleted tasks (`Task::deleted_at.is_some()`)
+    /// excluded.
     pub include_deleted: bool,
 }
 
@@ -240,6 +255,7 @@ mod tests {
             assignee_id: None,
             created_at: now,
             updated_at: now,
+            deleted_at: None,
         };
 
         assert_eq!(task.title, "Write tests");
@@ -262,6 +278,7 @@ mod tests {
             assignee_id: None,
             created_at: now,
             updated_at: now,
+            deleted_at: None,
         };
         let cloned = task.clone();
         assert_eq!(task, cloned);
@@ -344,6 +361,13 @@ mod tests {
         assert_ne!(set_x, clear);
         assert_ne!(keep, clear);
         assert_eq!(set_x, set_x_again);
+    }
+
+    #[test]
+    fn delete_mode_variants_are_distinct_and_comparable() {
+        assert_eq!(DeleteMode::Subtree, DeleteMode::Subtree);
+        assert_eq!(DeleteMode::PromoteChildren, DeleteMode::PromoteChildren);
+        assert_ne!(DeleteMode::Subtree, DeleteMode::PromoteChildren);
     }
 
     #[test]

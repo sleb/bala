@@ -1,10 +1,10 @@
 //! `tasks` row <-> [`Task`] mapping and queries.
 //!
 //! Columns unused by `bala-core`'s current `Task` shape (`out_of_sync`,
-//! `completed_at`, `deleted_at` — see crate docs) are written with fixed
-//! defaults (`NULL`/`0`) on every `put_task` and never read back into a
-//! `Task`, since `Task` has nowhere to put them yet. `assignee_id` *is*
-//! read/written, per Story 1.1a.
+//! `completed_at` — see crate docs) are written with fixed defaults
+//! (`NULL`/`0`) on every `put_task` and never read back into a `Task`,
+//! since `Task` has nowhere to put them yet. `assignee_id` (Story 1.1a)
+//! and `deleted_at` (Story 1.3) *are* read/written.
 
 use bala_core::{StoreError, Task, TaskId, TreeFilter};
 use rusqlite::{OptionalExtension, Row, ToSql, Transaction, params};
@@ -16,7 +16,7 @@ use crate::convert::{
 use crate::edges;
 
 const SELECT_COLUMNS: &str = "id, title, description, type_key, status, start_date, due_date, \
-    assignee_id, created_at, updated_at";
+    assignee_id, created_at, updated_at, deleted_at";
 
 /// Builds a [`Task`] from a row of [`SELECT_COLUMNS`], leaving `parent_ids`
 /// empty — callers fill it in from `parent_edges` separately (edges are a
@@ -32,6 +32,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
     let assignee_id: Option<Vec<u8>> = row.get(7)?;
     let created_at: String = row.get(8)?;
     let updated_at: String = row.get(9)?;
+    let deleted_at: Option<String> = row.get(10)?;
 
     Ok((|| {
         Ok(Task {
@@ -46,15 +47,18 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
             assignee_id: assignee_id.map(|b| blob_to_user_id(&b)).transpose()?,
             created_at: timestamp_from_text(&created_at)?,
             updated_at: timestamp_from_text(&updated_at)?,
+            deleted_at: deleted_at.map(|s| timestamp_from_text(&s)).transpose()?,
         })
     })())
 }
 
-pub(crate) fn get_task(tx: &Transaction, id: TaskId) -> Result<Option<Task>, StoreError> {
+/// Shared implementation for [`get_task`] and [`get_task_including_deleted`]:
+/// runs `sql` (expected to select [`SELECT_COLUMNS`] and filter on `id`),
+/// maps the row, and fills in `parent_ids`.
+fn get_task_with_sql(tx: &Transaction, sql: &str, id: TaskId) -> Result<Option<Task>, StoreError> {
     let id_blob = id_to_blob(id);
-    let sql = format!("SELECT {SELECT_COLUMNS} FROM tasks WHERE id = ?1 AND deleted_at IS NULL");
     let found = tx
-        .query_row(&sql, params![id_blob.as_slice()], task_from_row)
+        .query_row(sql, params![id_blob.as_slice()], task_from_row)
         .optional()
         .map_err(sqlite_err)?;
     let Some(mut task) = found.transpose()? else {
@@ -64,6 +68,21 @@ pub(crate) fn get_task(tx: &Transaction, id: TaskId) -> Result<Option<Task>, Sto
     Ok(Some(task))
 }
 
+pub(crate) fn get_task(tx: &Transaction, id: TaskId) -> Result<Option<Task>, StoreError> {
+    let sql = format!("SELECT {SELECT_COLUMNS} FROM tasks WHERE id = ?1 AND deleted_at IS NULL");
+    get_task_with_sql(tx, &sql, id)
+}
+
+/// Like [`get_task`], but also returns a soft-deleted row (doesn't filter
+/// on `deleted_at IS NULL`).
+pub(crate) fn get_task_including_deleted(
+    tx: &Transaction,
+    id: TaskId,
+) -> Result<Option<Task>, StoreError> {
+    let sql = format!("SELECT {SELECT_COLUMNS} FROM tasks WHERE id = ?1");
+    get_task_with_sql(tx, &sql, id)
+}
+
 pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> {
     let id_blob = id_to_blob(task.id);
     let assignee_id_blob = task.assignee_id.map(user_id_to_blob);
@@ -71,7 +90,7 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
         "INSERT INTO tasks (
             id, title, description, type_key, status, start_date, due_date,
             assignee_id, out_of_sync, created_at, updated_at, completed_at, deleted_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, NULL, NULL)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, NULL, ?11)
         ON CONFLICT(id) DO UPDATE SET
             title = excluded.title,
             description = excluded.description,
@@ -80,7 +99,8 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
             start_date = excluded.start_date,
             due_date = excluded.due_date,
             assignee_id = excluded.assignee_id,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at,
+            deleted_at = excluded.deleted_at",
         params![
             id_blob.as_slice(),
             task.title,
@@ -92,6 +112,7 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
             assignee_id_blob.as_ref().map(<[u8; 16]>::as_slice),
             timestamp_to_text(task.created_at),
             timestamp_to_text(task.updated_at),
+            task.deleted_at.map(timestamp_to_text),
         ],
     )
     .map_err(sqlite_err)?;
