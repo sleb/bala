@@ -3,7 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-08-30
 **Deciders:** Scott (product/eng)
-**Related:** [STORIES.md](./STORIES.md) (Epics 1–4)
+**Related:** [STORIES.md](./STORIES.md) (Epics 1–5)
 
 ## Context
 
@@ -55,7 +55,7 @@ flowchart LR
 | **Web API (future)** | Pure translation: HTTP routing + JSON (de)serialization + (eventually) auth — ideally ~one endpoint per Core Library method | Any domain logic. If a rule can't be phrased as "call this library method," it doesn't belong in this layer |
 | **Data Store** | Durable persistence of tasks, hierarchy edges (a task may have multiple parents), dependency edges, task types, and their timestamps, and minimal user identity rows (`id`, `name`) for task assignment | Any business rules — invariants are enforced by the Core Library before writes |
 
-This still groups Epics 1–3's logic (CRUD, hierarchy, dependencies,
+This still groups Epics 1, 3, and 4's logic (CRUD, hierarchy, dependencies,
 rollup) into one component rather than three — splitting those at this
 scale would add call/transaction boundaries between tightly-coupled
 invariants (e.g., deleting a task touches hierarchy *and* dependency
@@ -171,7 +171,7 @@ indexing, and transaction boundaries are also deferred there.
 
 ## Deferred to LLDs
 
-- **CLI/TUI Client LLD (v1):** terminal view components, text-based Gantt rendering/zoom/pan, keyboard-driven rescheduling (replacing drag), export mechanism decision (Story 5.4), local config file format for view state.
+- **CLI/TUI Client LLD (v1):** terminal view components, text-based Gantt rendering/zoom/pan, keyboard-driven rescheduling (replacing drag), export mechanism decision (Story 5.5), local config file format for view state.
 - **Core Library LLD:** method/error signatures, hierarchy invariant enforcement, dependency cycle detection algorithm, cascade scheduling algorithm (and its "preview before committing" UX per Story 4.2 AC3), progress rollup computation, task-type config storage.
 - **Data Store LLD:** engine choice (embedded, e.g. SQLite, given v1 runs locally in-process), schema, indexing strategy for tree + graph queries at 200+ tasks. Soft- vs. hard-delete for Story 1.3 AC5 is resolved (soft-delete, per Core Library LLD §Context) — the Data Store LLD implements the `deletedAt` tombstone, it doesn't re-decide the question.
 - **Web Client LLD / Web API LLD:** deferred until that phase starts; the Web API LLD should mostly fall out of the Core Library LLD's method list.
@@ -181,7 +181,7 @@ indexing, and transaction boundaries are also deferred there.
 - Domain logic lives in one library from the start, not in the CLI binary — adding the web client later is additive (new Web API + Web Client components) rather than a refactor to pull business logic out of `main()`.
 - Fewer moving parts to stand up and run for v1: no server process, no service-to-service auth, no deploy — the CLI links the library and reads/writes a local store directly.
 - The Core Library is a single point carrying real domain complexity (hierarchy + dependency + rollup together) — worth its own careful LLD, and its method boundary is now also the future HTTP API's boundary, so it's worth getting the shapes (especially error types and the "touched tasks" return values) right early.
-- No real-time sync (WebSocket/SSE) between multiple concurrent users/clients is in this HLD; "immediate" updates (Stories 1.1, 2.2, 2.3) are satisfied by direct calls into the library (v1) or normal request/response + optimistic UI (future web). Multi-client concurrent editing (e.g. CLI and web open on the same task data at once) isn't addressed here — noted so it isn't silently assumed away.
+- No real-time sync (WebSocket/SSE) between multiple concurrent users/clients is in this HLD; "immediate" updates (Stories 1.1, 3.2, 3.3) are satisfied by direct calls into the library (v1) or normal request/response + optimistic UI (future web). Multi-client concurrent editing (e.g. CLI and web open on the same task data at once) isn't addressed here — noted so it isn't silently assumed away.
 
 ## Action Items
 1. [x] Write Core Library LLD (method contract, hierarchy / scheduling / rollup modules)

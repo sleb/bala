@@ -169,7 +169,7 @@ every non-`Normal` mode maps it to "discard and return to `Normal`" — for
 simply dropped, never persisted (§Algorithm 3).
 
 **Normal mode** (default; tree pane always visible on the left, per Story
-4.1 AC2's "tree on the left" — the right pane toggles between Detail and
+5.1 AC2's "tree on the left" — the right pane toggles between Detail and
 Gantt):
 
 | Key                  | Action                                                                                                                                            |
@@ -178,7 +178,7 @@ Gantt):
 | `h`/`l`, `←`/`→`     | collapse/expand focused task (Story 3.2 AC1)                                                                                                      |
 | `gg` / `G`           | jump to first/last visible task                                                                                                                   |
 | `E` / `C`            | expand all / collapse all (Story 3.2 AC3)                                                                                                         |
-| `o` / `O`            | new subtask under focused task / new top-level task → `Insert{title}` (Stories 1.1, 2.1)                                                          |
+| `o` / `O`            | new subtask under focused task / new top-level task → `Insert{title}` (Stories 1.1, 3.1)                                                          |
 | `Enter`              | open Detail pane on focused task                                                                                                                  |
 | `i` (in Detail pane) | edit a field → `Insert` (Story 1.2)                                                                                                               |
 | `dd`                 | delete focused task → `Confirm` (Story 1.3)                                                                                                       |
@@ -254,7 +254,7 @@ keys actually do.
 
 ## Algorithms
 
-### 1. Gantt rendering: scale mapping, bars, collapsed summaries (Stories 4.1, 4.2)
+### 1. Gantt rendering: scale mapping, bars, collapsed summaries (Stories 5.1, 5.2)
 
 `GanttScale` fixes a column width in days: `Day` → 1, `Week` → 7,
 `Month` → 30 (calendar-approximate; exact month boundaries aren't needed

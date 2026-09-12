@@ -341,8 +341,8 @@ N=1.
 Core LLD's `TreeFilter` (§Data Model there) has four fields — `type_key`,
 `status`, `assignee_id`, `include_deleted` — and the indexes above
 (`type_key`, `status`, `assignee_id`, all partial on `deleted_at IS
-NULL`) cover exactly those, making the filter predicates Stories 2.4 AC4
-("filter/group by type") and 3.3 AC4 ("show only blocked/unblocked")
+NULL`) cover exactly those, making the filter predicates Stories 3.4 AC4
+("filter/group by type") and 4.3 AC4 ("show only blocked/unblocked")
 imply cheap. `include_deleted = true` simply drops the `WHERE deleted_at
 IS NULL` predicate, falling back to a full scan on the (unindexed)
 `deleted_at` column — acceptable since it's the uncommon path and still

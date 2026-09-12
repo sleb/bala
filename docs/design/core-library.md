@@ -3,7 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-08-31
 **Deciders:** Scott (product/eng)
-**Related:** [HLD.md](./HLD.md) (Core Library component), [STORIES.md](./STORIES.md) (Epics 1–4)
+**Related:** [HLD.md](./HLD.md) (Core Library component), [STORIES.md](./STORIES.md) (Epics 1, 3–4 — this library owns CRUD, hierarchy, and dependency/rollup logic; the TUI epic and the Gantt epic are rendering concerns handled by their respective clients)
 
 ## Context
 
@@ -304,7 +304,7 @@ trips.
 
 ## Algorithms
 
-### 1. Hierarchy invariant — no circular nesting (Stories 2.1 AC5)
+### 1. Hierarchy invariant — no circular nesting (Stories 3.1 AC5)
 
 Multiple parents make the hierarchy a DAG, not a tree, so "ancestor
 chain" becomes "ancestor set reachable via `parent_ids`." `set_parents(id,
