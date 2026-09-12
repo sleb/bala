@@ -9,6 +9,7 @@ pub(crate) mod mode;
 pub(crate) mod screens;
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
@@ -32,9 +33,21 @@ use app::{App, handle_key};
 ///
 /// # Errors
 ///
-/// Returns `Err` if the store can't be opened, a `Core` call fails, or a
-/// terminal I/O operation (setup, draw, or input polling) fails.
+/// Returns `Err` if stdin/stdout aren't real terminals, the store can't be
+/// opened, a `Core` call fails, or a terminal I/O operation (setup, draw,
+/// or input polling) fails.
 pub fn run(db_path: &Path) -> Result<(), CliError> {
+    // `enable_raw_mode()` only configures input handling; it neither checks
+    // nor fails on a redirected stdout. Without this check, a real-terminal
+    // stdin paired with a redirected stdout (e.g. `bala > out.txt` from an
+    // interactive shell) would enter raw mode successfully, write
+    // alternate-screen/frame control sequences into the redirected file,
+    // and sit in the event loop waiting on real keyboard input — corrupting
+    // the file instead of failing cleanly. Checked first, before anything
+    // else in `run`, since it's cheap and independent of the store.
+    ensure_is_terminal(&std::io::stdin(), "stdin")?;
+    ensure_is_terminal(&std::io::stdout(), "stdout")?;
+
     let core = cli::open_core(db_path)?;
     let tasks = core.get_tree(TreeFilter::default())?;
     let users = core.list_users()?;
@@ -82,6 +95,32 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Answers whether a stream is a real terminal. A thin, unsealed mirror of
+/// `std::io::IsTerminal` (which can't be implemented for a test fake, being
+/// sealed to `std`'s own types) so `ensure_is_terminal` can be exercised in
+/// tests without a real terminal or a real non-terminal file descriptor.
+trait TerminalCheck {
+    fn is_a_terminal(&self) -> bool;
+}
+
+impl<T: IsTerminal> TerminalCheck for T {
+    fn is_a_terminal(&self) -> bool {
+        self.is_terminal()
+    }
+}
+
+/// Fails with [`CliError::TerminalIo`] unless `stream` is a real terminal —
+/// the shared check behind both the stdin and stdout guards in [`run`].
+fn ensure_is_terminal(stream: &impl TerminalCheck, name: &str) -> Result<(), CliError> {
+    if stream.is_a_terminal() {
+        Ok(())
+    } else {
+        Err(CliError::TerminalIo(std::io::Error::other(format!(
+            "{name} is not a terminal; the interactive TUI requires a real terminal"
+        ))))
+    }
+}
+
 /// Restores the terminal (raw mode + alternate screen) on drop, so it's
 /// restored on every exit path from `run`: clean quit, an error propagated
 /// via `?`, or an early return. Errors from the restoration itself are
@@ -112,4 +151,32 @@ fn install_panic_hook() {
         restore_terminal();
         previous(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CliError, TerminalCheck, ensure_is_terminal};
+
+    /// A fake stream whose answer is fixed at construction, so
+    /// `ensure_is_terminal`'s branches can be tested without a real
+    /// terminal or a real non-terminal file descriptor.
+    struct FakeStream(bool);
+
+    impl TerminalCheck for FakeStream {
+        fn is_a_terminal(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn ensure_is_terminal_should_succeed_when_stream_is_a_terminal() {
+        assert!(ensure_is_terminal(&FakeStream(true), "stdin").is_ok());
+    }
+
+    #[test]
+    fn ensure_is_terminal_should_fail_when_stream_is_not_a_terminal() {
+        let err = ensure_is_terminal(&FakeStream(false), "stdout").unwrap_err();
+        assert!(matches!(err, CliError::TerminalIo(_)));
+        assert!(err.to_string().contains("stdout is not a terminal"));
+    }
 }
