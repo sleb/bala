@@ -3,6 +3,8 @@
 //! database via the `--db-path` flag, so tests never touch the real
 //! default OS data dir and never interfere with each other.
 
+use std::time::Duration;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
@@ -552,6 +554,24 @@ fn task_complete_task_with_incomplete_children_and_cascade_should_complete_all()
         child_line.contains("[x]"),
         "child not marked complete: {child_line:?}"
     );
+}
+
+#[test]
+fn bala_with_no_subcommand_on_non_tty_should_fail_gracefully() {
+    // No subcommand => the TUI path. `assert_cmd`'s `Command` runs with
+    // stdin/stdout not attached to a real TTY, so `enable_raw_mode()` should
+    // fail fast (propagated as `CliError::TerminalIo`) rather than the
+    // process hanging waiting for terminal input. `.timeout(..)` guards
+    // against a regression turning this into a hang that blocks the whole
+    // test suite instead of failing promptly.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    bala_cmd(&db_path)
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .failure()
+        .stderr(contains("terminal I/O error"));
 }
 
 #[test]

@@ -211,9 +211,19 @@ pub enum CliError {
 
     #[error("failed to read confirmation from stdin: {0}")]
     Io(#[from] std::io::Error),
+
+    /// I/O failure from the TUI's terminal setup, draw, or input polling.
+    ///
+    /// Can't derive `#[from] std::io::Error` here since `Io` above already
+    /// claims that `From` impl; thiserror can't derive two `From<io::Error>`
+    /// impls on one enum, and "failed to read confirmation from stdin"
+    /// wouldn't fit a terminal-setup failure anyway, so this gets its own
+    /// message and callers use `.map_err(CliError::TerminalIo)` explicitly.
+    #[error("terminal I/O error: {0}")]
+    TerminalIo(std::io::Error),
 }
 
-fn open_core(db_path: &Path) -> Result<Core<SqliteStore>, CliError> {
+pub(crate) fn open_core(db_path: &Path) -> Result<Core<SqliteStore>, CliError> {
     if let Some(parent) = db_path.parent()
         && !parent.as_os_str().is_empty()
     {
