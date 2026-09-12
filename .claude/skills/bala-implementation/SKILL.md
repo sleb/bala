@@ -162,10 +162,34 @@ every remaining checkpoint in order.
 ## Phase 4 — Comprehensive end-to-end review
 
 Once every checkpoint is done, step back and review the *story*, not
-just the sum of checkpoints:
+just the sum of checkpoints: a fresh sub-agent for the review itself
+(same reasoning as Phase 3 — it needs to read the real, current state
+of every file the story touched, not a description of it), then a
+minimal check of that agent's report before deciding the story is
+done.
 
-1. Run the full workspace suite yourself: `cargo test --workspace`,
-   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt
+### 4a. Dispatch one review sub-agent for the whole story
+
+Spawn a `general-purpose` agent with a prompt that gives it everything
+Phase 1 gave you — it's reviewing the whole story, not one checkpoint,
+so it needs the full picture a checkpoint sub-agent deliberately
+didn't get:
+
+- The repo path, the branch name, and the full issue body (every
+  checkpoint plus the "out of scope" list) verbatim.
+- The target story's full text from `docs/design/STORIES.md`.
+- Which `docs/design/HLD.md`/`docs/design/<component>.md` LLD sections
+  govern this story, so it can check the merged code against them
+  itself rather than trusting each checkpoint sub-agent's own claim of
+  compliance.
+- Instructions to find the actual diff itself (e.g. `git diff
+  <default-branch>...HEAD` or `git log` since the branch point) rather
+  than being handed a description of what changed.
+
+Ask it to work through, and report on, each of:
+
+1. Run the full workspace suite: `cargo test --workspace`, `cargo
+   clippy --workspace --all-targets -- -D warnings`, `cargo fmt
    --check`. All must be clean.
 2. Read through the actual production code changed across all
    checkpoints (not just each checkpoint's own diff in isolation) —
@@ -174,23 +198,23 @@ just the sum of checkpoints:
    whole slice, and that naming/module layout reads as one coherent
    piece of work rather than several disconnected patches.
 3. Re-verify every acceptance criterion the issue's story claims to
-   cover actually has a passing test or an honest, documented reason
-   it doesn't (deferred to a later story, per the issue's own "out of
+   cover actually has a passing test or an honest, documented reason it
+   doesn't (deferred to a later story, per the issue's own "out of
    scope" section).
-4. Re-run the plan's own "Demo" line(s) yourself, manually, for at
-   least the final checkpoint (and any earlier ones worth spot-checking)
-   — don't take a sub-agent's demo transcript on faith.
-5. Look for anything a sub-agent flagged as a deliberate deviation
-   (scope cut, placeholder error type, no-op seam for a future story)
-   and confirm each one is genuinely consistent with the plan's "out of
-   scope" list — not a silent narrowing that should have gone back to
-   the user first.
+4. Re-run the plan's own "Demo" line(s), manually, for at least the
+   final checkpoint (and any earlier ones worth spot-checking) — actual
+   commands, actual output, not a restatement of what a checkpoint's
+   own demo claimed.
+5. Check every deliberate deviation any checkpoint's own work
+   surfaced (a scope cut, a placeholder error type, a no-op seam for a
+   future story) against the plan's "out of scope" list — flag any
+   that's a silent narrowing rather than something the plan already
+   sanctioned.
 6. **Adversarial correctness/efficiency pass.** A green test suite only
    proves the plan's own named tests pass — it says nothing about bug
-   classes nobody wrote a test for yet. Re-read every changed method in
-   `bala-core`'s facade (and any store impl touched) the way a
-   reviewer looking for trouble would, not the way the author who just
-   made it pass would. Ask, for each one:
+   classes nobody wrote a test for yet. Re-read every changed method
+   the way a reviewer looking for trouble would, not the way the author
+   who just made it pass would. Ask, for each one:
    - **Could two of its `Store` calls interleave with someone else's
      write?** Any method that reads state, decides something from it,
      and then writes needs that whole sequence atomic — one
@@ -224,23 +248,52 @@ just the sum of checkpoints:
    fetch, a test-fake/real-backend divergence, unbounded recursion, a
    non-idempotent completion, stale help text) as concrete illustrations
    of each question — treat them as examples of what to look for, not
-   the complete set of what to check. If something you find doesn't fit
-   any bullet above but still smells like the code would surprise its
-   own author under a slightly different input, trust that instinct and
-   dig in rather than waiting for it to match a named category.
-7. Fix minor problems yourself directly (a stray clippy lint, a
-   formatting nit, a small inconsistency) rather than spawning another
-   sub-agent round for something trivial. A confirmed hit from step 6
-   (a real race, a real idempotency bug) is also usually small enough
-   to fix directly here — write the regression test first, then the
-   fix, then re-run the full suite from step 1, the same discipline a
-   checkpoint sub-agent would follow.
+   the complete set of what to check. If something doesn't fit any
+   bullet above but still smells like the code would surprise its own
+   author under a slightly different input, trust that instinct and dig
+   in rather than waiting for it to match a named category.
 
-**Stop and ask the user** if you find something you cannot confidently
-rule on yourself: a real behavioral discrepancy between what two
+For anything it's confident is a genuine, narrowly-scoped bug (matching
+the shapes in step 6, or an outright contradiction between two
+checkpoints), tell it to fix it directly — write the regression test
+first, then the fix, then re-run the full suite — the same discipline
+a checkpoint sub-agent follows. For anything that's a judgment call
+about design intent (a real behavioral discrepancy between what two
 checkpoints assumed, a plan step that turned out to be wrong once
-implemented, or anything that would require a design decision rather
-than a mechanical fix. Don't paper over it to reach a green build.
+implemented, an "out of scope" item that no longer looks right), it
+must not decide unilaterally — it should leave it unfixed and flag it
+clearly in its report instead.
+
+Tell it explicitly: do NOT commit or push. Ask it to report back: the
+full suite's pass/fail, every acceptance criterion's status, the
+demo's actual transcript, every fix it made (file, what, why, the
+regression test's name), and every judgment-call item it left flagged
+rather than deciding.
+
+### 4b. Minimal check, yourself, before moving on
+
+Same discipline as 3b, scaled to the whole story: don't take the
+review agent's report on faith just because it was thorough.
+
+- Re-run `cargo test --workspace`, `cargo clippy --workspace
+  --all-targets -- -D warnings`, and `cargo fmt --check` yourself.
+- Spot-check at least one of its fixes against the diff, and re-run the
+  demo command(s) yourself rather than trusting its transcript alone.
+- Read its list of flagged judgment calls; for each, decide whether
+  it's actually a story-blocking issue or a documented, in-scope
+  deferral it simply flagged out of caution.
+
+If something's off, don't silently fix it yourself and don't silently
+accept it — send the same review agent a follow-up (`SendMessage`) or
+spawn a small corrective task, and only move to Phase 5 once the story
+is actually right.
+
+**Stop and ask the user** for anything the review agent flagged as a
+judgment call that you can't confidently rule on yourself either: a
+real behavioral discrepancy between what two checkpoints assumed, a
+plan step that turned out to be wrong once implemented, or anything
+that would require a design decision rather than a mechanical fix.
+Don't paper over it to reach a green build.
 
 ## Phase 5 — Commit, push, PR
 
@@ -292,9 +345,22 @@ merging.
 - The comprehensive review (Phase 4) is not optional busywork — it's
   the step that catches what individual-checkpoint testing structurally
   cannot: two checkpoints that are each internally consistent but
-  disagree with each other, and the bug shapes step 6 asks about, which
-  a plan's own named tests don't set out to catch because the plan was
-  written before the code existed to have them.
+  disagree with each other, and the bug shapes its own step 6 asks
+  about, which a plan's own named tests don't set out to catch because
+  the plan was written before the code existed to have them.
+- Phase 4's review agent gets the whole story's diff and every
+  checkpoint's context at once — unlike a checkpoint sub-agent, which
+  is deliberately scoped narrow, the review agent's entire job is
+  seeing across checkpoints, so don't trim what you hand it the way you
+  would for Phase 3a.
+- The review agent may fix a genuine, narrowly-scoped bug itself
+  (regression test first, same as a checkpoint sub-agent), but must
+  never resolve a design judgment call on its own — that distinction is
+  the same "fix vs. flag" line 3a's sub-agents already draw for
+  cross-checkpoint scope creep, just applied to the whole story instead
+  of one checkpoint's boundaries.
 - If the user says "stop if you can't rule on yourself," take that
-  literally in Phase 4: a genuine judgment call about design intent
-  goes back to the user, not into a code comment justifying a guess.
+  literally in Phase 4: a genuine judgment call about design intent —
+  whether it surfaces from the review agent's report or from your own
+  4b check — goes back to the user, not into a code comment justifying
+  a guess.
