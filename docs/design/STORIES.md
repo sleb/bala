@@ -25,11 +25,7 @@
 5. Created task gets a unique ID and a "created at" timestamp.
 6. Task defaults to top-level (no parent) unless created from within another task.
 
-**Note:** Assignee was originally listed as an optional field at creation (AC2), but no
-story yet defines user/assignee management (no `User` entity, no assignee store or
-validation). Deferred to Story 1.1a below rather than built ahead of that design.
-
-### Story 1.1a — Assign a Task *(new, split from 1.1)* [![Issue #9](https://img.shields.io/github/issues/detail/state/sleb/bala/9)](https://github.com/sleb/bala/issues/9)
+### Story 1.1a — Assign a Task *(split from 1.1: no `User` entity or assignee store/validation existed yet)* [![Issue #9](https://img.shields.io/github/issues/detail/state/sleb/bala/9)](https://github.com/sleb/bala/issues/9)
 **Description:** As a user, I want to set a task's assignee, so that it's clear who owns the work.
 
 **Acceptance Criteria:**
@@ -58,11 +54,6 @@ validation). Deferred to Story 1.1a below rather than built ahead of that design
 4. Deleted task is removed from all views (list, board, Gantt) immediately.
 5. Deletion is either soft (recoverable for N days) or accompanied by an "undo" toast — decision noted for later design.
 
-**Note:** AC3 depends on the dependency model (Epic 3), which doesn't exist yet — no
-`depends_on` field, no `add_dependency` method. Until Story 3.1 ships, no task can
-possibly depend on another, so AC3 is vacuously satisfied; real enforcement (warning
-which specific dependents are affected) lands with Story 3.1's dependency model.
-
 ### Story 1.4 — Mark a Task Complete [![Issue #13](https://img.shields.io/github/issues/detail/state/sleb/bala/13)](https://github.com/sleb/bala/issues/13)
 **Description:** As a user, I want to mark a task as done, so that I can track progress.
 
@@ -72,16 +63,6 @@ which specific dependents are affected) lands with Story 3.1's dependency model.
 3. A completed task visually indicates completion in list, tree, and Gantt views.
 4. Completing a task unblocks any dependent tasks waiting on it (see Epic 3).
 5. Completion timestamp is recorded.
-
-**Note:** AC3's tree and Gantt views don't exist yet (Epic 2's Story 2.2 tree
-collapse/expand, Epic 4's Gantt chart) — this story visually indicates completion
-only in the CLI's flat list output (`task ls`/`task edit`/`task complete`). Tree/Gantt
-rendering picks up the same `status`/`completed_at` fields once those views are built.
-
-**Note:** AC4 depends on the dependency model (Epic 3), which doesn't exist yet — no
-`depends_on` field, no blocking/unblocking logic. Until Story 3.1/3.2 land, no task can
-possibly be "waiting" on another, so AC4 is vacuously satisfied; real unblocking
-behavior lands with Epic 3's scheduling model.
 
 ---
 
@@ -106,6 +87,7 @@ behavior lands with Epic 3's scheduling model.
 3. "Expand all" / "collapse all" controls are available at the top level.
 4. Collapsed parent still shows a summary indicator (e.g., "3/7 subtasks complete").
 5. Deeply nested trees (5+ levels) remain navigable without performance lag on reasonable list sizes.
+6. Completed tasks are visually distinguished in the tree view, matching the indication used in the list view (Story 1.4).
 
 ### Story 2.3 — Roll Up Progress from Subtasks
 **Description:** As a user, I want a parent task's progress to reflect its subtasks' completion, so that I can see overall status at a glance.
@@ -141,6 +123,7 @@ behavior lands with Epic 3's scheduling model.
 3. Circular dependencies (A→B→A) are detected and rejected with a clear message.
 4. Dependencies can be removed as easily as they're added.
 5. Dependency relationships are visible on the task's detail view (both "blocked by" and "blocks" lists).
+6. Deleting a task that other tasks depend on (Story 1.3) warns the user which specific dependent tasks will be affected.
 
 ### Story 3.2 — Enforce Dependency Scheduling
 **Description:** As a user, I want dependent tasks to automatically respect their predecessors' timing, so that I don't have to manually recalculate dates.
@@ -176,6 +159,7 @@ behavior lands with Epic 3's scheduling model.
 4. Dependency arrows are drawn between predecessor and dependent task bars.
 5. Chart updates automatically when task dates, hierarchy, or dependencies change elsewhere in the app.
 6. Chart supports a reasonable number of tasks (e.g., 200+) without significant lag.
+7. Completed tasks are visually distinguished on the chart, matching the indication used in list/tree views (Story 1.4).
 
 ### Story 4.2 — Navigate and Zoom the Gantt Chart
 **Description:** As a user, I want to zoom and scroll the Gantt timeline, so that I can view anything from a single week to a multi-month project.
