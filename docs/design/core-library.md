@@ -321,7 +321,7 @@ once regardless of how many paths reach it. `create_task` runs the same
 check per entry in `NewTask.parent_ids` (an id can't be its own ancestor
 at creation, but the check is shared code, not special-cased away).
 
-### 2. Dependency invariants (Story 3.1 AC2–3)
+### 2. Dependency invariants (Story 4.1 AC2–3)
 
 `add_dependency(id, predecessor, dep_type)`:
 1. Reject if `id == predecessor` (self-dependency).
@@ -349,7 +349,7 @@ at creation, but the check is shared code, not special-cased away).
 `remove_dependency` has no invariant to check — removing an edge can
 never introduce a cycle or a relative-dependency violation.
 
-### 3. Cascade scheduling (Story 3.2 AC1–4)
+### 3. Cascade scheduling (Story 4.2 AC1–4)
 
 Each `DependencyType` anchors a different field of the predecessor to a
 different field of the successor:
@@ -416,14 +416,14 @@ further out (multiple incoming edges), but each push strictly increases
 its constrained field, so the loop terminates. `preview_cascade` runs
 this against an in-memory copy of the affected subgraph and returns the
 result **without** calling `Store::put_task` — same computation, no
-commit, satisfying Story 3.2 AC3's "preview before committing".
+commit, satisfying Story 4.2 AC3's "preview before committing".
 
 `update_task` calls `cascade` whenever `start_date` or `due_date` moves,
 then persists `[changed_task] + touched` inside one `Store::transaction`,
 and returns the full `Vec<Task>` so a caller can refresh every affected
 view without re-querying (HLD §Interfaces guarantee).
 
-### 4. Progress rollup (Story 2.3 AC1–5)
+### 4. Progress rollup (Story 3.3 AC1–5)
 
 Computed on read inside `get_tree`, never stored, never computed by a
 caller (HLD guarantee). Single post-order traversal per call:
@@ -565,7 +565,7 @@ flagged at the HLD level, not solved by adding locking here.
   `TreeFilter`'s fields — are now resolved above: `list_child_edges`/
   `list_successor_edges` and §Data Model's `TreeFilter`.)
 - **CLI/TUI Client LLD:** how `preview_cascade`'s result is rendered as a
-  confirmation prompt (Story 3.2 AC3) and how `IncompleteChildren`/
+  confirmation prompt (Story 4.2 AC3) and how `IncompleteChildren`/
   `CircularHierarchy`/etc. map to on-screen messages.
 - **Web API LLD:** near-mechanical mapping of this method contract onto
   routes; `CoreError` variants map onto HTTP status + JSON error body.
@@ -584,7 +584,7 @@ flagged at the HLD level, not solved by adding locking here.
 - `preview_cascade` and the committing path in `update_task` share the
   same `cascade()` function by construction — there's no way for preview
   to drift from what actually commits, which is the whole point of
-  Story 3.2 AC3.
+  Story 4.2 AC3.
 - Multiple parents turn the hierarchy into a DAG, which is now load-bearing
   on §1's invariant check, §2's ancestor/descendant walk, §4's rollup,
   and delete cascade semantics (§Method Contract) — a future move back to
