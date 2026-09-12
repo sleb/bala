@@ -1,7 +1,8 @@
 # Bala CLI
 
-`bala` is a command-line task tracker. This document covers the commands
-implemented so far.
+`bala` is a command-line task tracker with both a scriptable subcommand set
+and an interactive terminal UI. This document covers what's implemented so
+far.
 
 ## Database location
 
@@ -25,8 +26,27 @@ locations per OS.
 bala
 ```
 
-Prints a placeholder message and exits successfully. There is no interactive
-TUI yet.
+Launches an interactive full-screen terminal UI showing your top-level
+tasks, rather than dispatching to one of the subcommands below.
+
+The task list shows each top-level task's title, type, status, and
+assignee (nested/tree rendering is planned for a later release; for now
+subtasks are simply not shown here — use `bala task ls` to see everything,
+including subtasks). An empty task list shows a "No tasks yet." message
+instead of a blank screen.
+
+| Key | Action |
+| --- | --- |
+| `j` / `↓` | Move the selection down. |
+| `k` / `↑` | Move the selection up. |
+| `q` | Quit, restoring the terminal to its normal state. |
+
+Selection stops at the first/last row rather than wrapping around.
+
+The TUI requires a real terminal (a TTY) on stdin: running it in a
+non-interactive context (e.g. piped/redirected input, as CI or scripting
+harnesses do) fails immediately with a "terminal I/O error" message and a
+nonzero exit code, rather than hanging.
 
 ## `bala user`
 
