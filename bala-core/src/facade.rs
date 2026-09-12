@@ -447,9 +447,12 @@ impl<S: Store> Core<S> {
     /// - [`CoreError::Store`] if the backend fails.
     pub fn complete_task(&mut self, id: TaskId, cascade: bool) -> Result<Vec<Task>, CoreError> {
         let touched = self.store.transaction(|tx| {
-            if tx.get_task(id)?.is_none() {
+            // Fetched once and reused below (non-cascade branch) rather than
+            // re-fetched, since it's the same row `Store::get_task` already
+            // returned for the existence check.
+            let Some(task) = tx.get_task(id)? else {
                 return Ok(Err(CoreError::NotFound(id)));
-            }
+            };
 
             let incomplete_children = direct_incomplete_children(tx, id)?;
             if !incomplete_children.is_empty() && !cascade {
@@ -463,9 +466,8 @@ impl<S: Store> Core<S> {
             let mut touched = Vec::new();
             if cascade {
                 mark_complete_subtree(tx, id, now, &mut touched)?;
-            } else if let Some(mut task) = tx.get_task(id)?
-                && task.status != TaskStatus::Complete
-            {
+            } else if task.status != TaskStatus::Complete {
+                let mut task = task;
                 task.status = TaskStatus::Complete;
                 task.completed_at = Some(now);
                 task.updated_at = now;
