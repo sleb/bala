@@ -84,7 +84,7 @@
 **Description:** As a user, I want to create, edit, and delete tasks using only the keyboard, so that I can manage work without leaving the terminal UI.
 
 **Acceptance Criteria:**
-1. A dedicated key opens a text-entry mode for creating a new task, honoring the title requirement from Story 1.1.
+1. A dedicated key opens a text-entry mode for creating a new task, honoring the title requirement from Story 1.1. Bound to `O` (new top-level task); `o` (new subtask under the focused task) is deferred to Story 3.1, since the TUI has no hierarchy/tree view yet.
 2. Selecting a task and entering its detail view, then a dedicated key, opens edit mode for its fields (Story 1.2).
 3. `Esc` cancels an in-progress create/edit without saving.
 4. A dedicated key sequence prompts for confirmation before deleting the selected task (Story 1.3).
@@ -126,7 +126,7 @@
 **Description:** As a user, I want to add a subtask under any existing task, so that I can break work into smaller pieces at any depth.
 
 **Acceptance Criteria:**
-1. User can add a subtask from any task, including a subtask (i.e., nesting has no fixed depth limit).
+1. User can add a subtask from any task, including a subtask (i.e., nesting has no fixed depth limit). In the TUI, this binds `o` (new subtask under the focused task), completing the `o`/`O` split deferred from Story 2.2 AC1.
 2. New subtask inherits no fields by default except an optional prompt to inherit assignee/dates.
 3. Subtask appears nested under its parent in the tree/list view, indented or visually grouped.
 4. A task can be moved to become a subtask of another task (re-parenting), and vice versa (promoted to top-level).
