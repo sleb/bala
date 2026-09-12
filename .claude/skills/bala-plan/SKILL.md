@@ -66,6 +66,12 @@ Read, in this order:
    Epic is not greenfield — don't re-propose scaffolding a crate, schema,
    or trait that an earlier story's plan already built. Only plan the
    delta this story actually adds.
+5. **User-facing docs** (`docs/*.md` outside `docs/design/` — e.g.
+   `docs/cli.md`, `docs/config.md`): skim whichever ones describe the
+   surface this story touches (a command, flag, keybinding, config
+   format, file layout). These describe *shipped* behavior, not design
+   intent, so a story that adds or changes any of it has a doc update due
+   alongside the code, not as an afterthought — see Phase 3.
 
 ## Phase 2 — Find and resolve scope gaps
 
@@ -114,6 +120,12 @@ For each checkpoint:
   applies.
 - Say what minimal production code makes each test pass — cite real
   types/methods from the LLDs (§Phase 1.3), not placeholders.
+- If the checkpoint adds or changes anything a user-facing doc from
+  Phase 1.5 describes (a command, flag, keybinding, config format), its
+  production code includes the matching doc update in the *same*
+  checkpoint — not a trailing "update docs" checkpoint at the end, since
+  that lets several checkpoints' worth of doc drift accumulate before
+  anyone notices.
 - End with a one-line **Demo**: the concrete command or test run that
   proves the checkpoint works (`cargo test -p bala-core`, or a `cargo
   run -- ...` invocation once a CLI checkpoint exists).
