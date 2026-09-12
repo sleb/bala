@@ -1,9 +1,11 @@
-//! `bala` CLI entry point: parses argv and dispatches to the `cli` module.
-//! No subcommand launches a real TUI yet — that's later work; running
-//! `bala` alone just prints a placeholder message.
+//! `bala` CLI entry point: parses argv and dispatches to either the
+//! interactive TUI (no subcommand given) or the `cli` module's subcommand
+//! handlers.
 
 mod cli;
 mod config;
+mod render;
+mod tui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -15,11 +17,6 @@ use cli::{Cli, Commands};
 fn main() -> ExitCode {
     let args = Cli::parse();
 
-    let Some(command) = args.command else {
-        println!("No subcommand given. Run `bala --help` for usage.");
-        return ExitCode::SUCCESS;
-    };
-
     let db_path = match resolve_db_path(args.db_path) {
         Ok(path) => path,
         Err(err) => {
@@ -28,9 +25,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let result = match command {
-        Commands::Task(task_args) => cli::run_task_command(&db_path, task_args.command),
-        Commands::User(user_args) => cli::run_user_command(&db_path, user_args.command),
+    let result = match args.command {
+        None => tui::run(&db_path),
+        Some(Commands::Task(task_args)) => cli::run_task_command(&db_path, task_args.command),
+        Some(Commands::User(user_args)) => cli::run_user_command(&db_path, user_args.command),
     };
 
     match result {
