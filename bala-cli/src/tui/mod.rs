@@ -5,6 +5,7 @@
 //! mode; `run` is the crossterm-backed event loop that ties them together.
 
 pub(crate) mod app;
+pub(crate) mod keymap;
 pub(crate) mod mode;
 pub(crate) mod screens;
 
@@ -48,7 +49,7 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
     ensure_is_terminal(&std::io::stdin(), "stdin")?;
     ensure_is_terminal(&std::io::stdout(), "stdout")?;
 
-    let core = cli::open_core(db_path)?;
+    let mut core = cli::open_core(db_path)?;
     let tasks = core.get_tree(TreeFilter::default())?;
     let users = core.list_users()?;
     let types = core.list_task_types()?;
@@ -58,8 +59,14 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
         .into_iter()
         .map(|task_type| (task_type.key, task_type.label))
         .collect();
+    let descriptions: HashMap<_, _> = tasks
+        .iter()
+        .map(|task| (task.id, task.description.clone()))
+        .collect();
     let rows = render::task_rows(&tasks, &type_labels, &user_names);
-    let mut app = App::new(rows);
+    let mut app = App::new(rows)
+        .with_lookup_maps(type_labels, user_names)
+        .with_descriptions(descriptions);
 
     install_panic_hook();
     crossterm::terminal::enable_raw_mode().map_err(CliError::TerminalIo)?;
@@ -85,7 +92,7 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
             let event = crossterm::event::read().map_err(CliError::TerminalIo)?;
             if let Event::Key(key) = event
                 && key.kind == KeyEventKind::Press
-                && handle_key(&mut app, key).is_break()
+                && handle_key(&mut app, &mut core, key).is_break()
             {
                 break;
             }
