@@ -237,9 +237,11 @@ pub fn apply_action<S: Store>(
             ControlFlow::Continue(())
         }
         Action::EnterDetail => {
-            app.pane = Pane::Detail;
-            app.detail_field = DetailField::Title;
-            app.error = None;
+            if app.selected_row().is_some() {
+                app.pane = Pane::Detail;
+                app.detail_field = DetailField::Title;
+                app.error = None;
+            }
             ControlFlow::Continue(())
         }
         Action::LeaveDetail => {
@@ -738,6 +740,16 @@ mod tests {
 
         assert_eq!(app.pane(), Pane::Detail);
         assert_eq!(app.detail_field(), DetailField::Title);
+    }
+
+    #[test]
+    fn apply_action_enter_detail_should_be_noop_when_no_row_is_selected() {
+        let mut app = App::new(vec![]);
+        let mut core = core();
+
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+
+        assert_eq!(app.pane(), Pane::List);
     }
 
     #[test]
