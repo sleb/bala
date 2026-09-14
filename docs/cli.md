@@ -37,11 +37,41 @@ instead of a blank screen.
 
 | Key | Action |
 | --- | --- |
-| `j` / `↓` | Move the selection down. |
-| `k` / `↑` | Move the selection up. |
+| `j` / `↓` (in the list) | Move the selection down. |
+| `k` / `↑` (in the list) | Move the selection up. |
+| `O` | Create a new top-level task: opens a text-entry line for its title. `Enter` submits, `Esc` cancels. |
+| `Enter` (in the list) | Open the Detail pane for the selected task. |
+| `j` / `↓` (in the Detail pane) | Move the field cursor down (Title → Description). |
+| `k` / `↑` (in the Detail pane) | Move the field cursor up (Description → Title). |
+| `i` (in the Detail pane) | Edit the field under the cursor: opens a text-entry line prefilled with its current value. `Enter` submits, `Esc` cancels. |
+| `Esc` (in the Detail pane) | Leave the Detail pane, back to the list. |
+| `dd` (in the list) | Delete the selected task: press `d` twice in a row to prompt for confirmation. `y` confirms, `n`/`Esc` cancels. |
 | `q` | Quit, restoring the terminal to its normal state. |
 
 Selection stops at the first/last row rather than wrapping around.
+
+Pressing `O` opens a `New task: ` input line at the bottom of the screen.
+Type the title and press `Enter` to create it (it's appended to the list and
+selected), or `Esc` to cancel without creating anything. An empty title is
+rejected with an inline error message shown under the input line; fix the
+title and press `Enter` again, or `Esc` to give up.
+
+Pressing `Enter` on a task in the list opens its Detail pane, showing the
+task's title and description with the field cursor (highlighted) starting on
+the title. `j`/`k` move the cursor between the two fields (the same physical
+keys used to move the list selection, but scoped to the Detail pane while
+it's open); `i` opens a text-entry line prefilled with the focused field's
+current value — `Enter` saves the change and returns to the Detail pane
+showing the new value, `Esc` discards it. An empty title is rejected the
+same way as in `O`'s new-task entry (inline error, stays in the entry line);
+an empty description is accepted. `Esc` in the Detail pane itself (not
+mid-edit) leaves it and returns to the list.
+
+Pressing `d` twice in a row on a selected task shows a confirmation prompt
+naming the task, at the bottom of the screen: press `y` to delete it (along
+with its subtasks, if it has any), or `n`/`Esc` to cancel without deleting
+anything. Pressing `d` once and then any other key (rather than a second
+`d`) does not count toward the sequence — the next `d` starts fresh.
 
 The TUI requires a real terminal (a TTY) on stdin: running it in a
 non-interactive context (e.g. piped/redirected input, as CI or scripting
