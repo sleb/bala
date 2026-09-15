@@ -118,6 +118,11 @@
 3. View state is stored as a human-readable local file, separate from the task data store.
 4. A crash or forced kill of the TUI does not corrupt the saved view-state file.
 
+**Note:** The LLD's `ViewState` also lists `collapsed`/`filter`/`gantt_*`
+fields — those are added when Epics 3/4/5 give the TUI's `App` the
+corresponding state to persist. This story ships `selected` only, in a
+TOML shape (`[tree]` table) that extends without a format break.
+
 ### Story 2.5 — Discover TUI Keybindings via a Help Overlay
 **Description:** As a user, I want an in-app reference for the TUI's keybindings, so that I can learn the controls without leaving the app or reading external docs.
 

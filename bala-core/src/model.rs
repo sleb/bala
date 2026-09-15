@@ -36,6 +36,20 @@ impl From<TaskId> for Uuid {
     }
 }
 
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::str::FromStr for TaskId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::from_str(s).map(Self)
+    }
+}
+
 /// Identifies a user, e.g. as a task assignee. Wraps a [`Uuid`]; see
 /// [`TaskId`] for why this is a distinct type rather than a shared alias.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -234,6 +248,27 @@ mod tests {
         let b = a;
         assert_eq!(a, b);
         assert!(!format!("{a:?}").is_empty());
+    }
+
+    #[test]
+    fn task_id_display_should_render_hyphenated_uuid() {
+        let uuid = Uuid::new_v4();
+        let task_id = TaskId::from(uuid);
+        assert_eq!(task_id.to_string(), uuid.to_string());
+    }
+
+    #[test]
+    fn task_id_from_str_should_round_trip_display_output() {
+        let task_id = TaskId::new();
+        let rendered = task_id.to_string();
+        let parsed: TaskId = rendered.parse().expect("valid uuid string");
+        assert_eq!(parsed, task_id);
+    }
+
+    #[test]
+    fn task_id_from_str_should_reject_invalid_uuid() {
+        let result = "not-a-uuid".parse::<TaskId>();
+        assert!(result.is_err());
     }
 
     #[test]

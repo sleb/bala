@@ -159,6 +159,23 @@ impl App {
     pub fn description_of(&self, id: TaskId) -> Option<&str> {
         self.descriptions.get(&id)?.as_deref()
     }
+
+    /// Selects the row whose id matches `id`, restoring a previously
+    /// persisted selection (see `tui::mod::run`, which loads a `ViewState`
+    /// and calls this right after constructing `App`).
+    ///
+    /// Leaves the current selection completely untouched when `id` is
+    /// `None`, or when it's `Some` but no row matches (e.g. the persisted
+    /// task was since deleted) — in either case `App::new`'s own default
+    /// (first row, if any) stands.
+    pub fn select_by_id(&mut self, id: Option<TaskId>) {
+        let Some(id) = id else {
+            return;
+        };
+        if let Some(index) = self.rows.iter().position(|row| row.id == id) {
+            self.selected = Some(index);
+        }
+    }
 }
 
 /// Dispatches one key event against `app`, delegating to `key_to_action`
@@ -1332,5 +1349,39 @@ mod tests {
         assert_eq!(app.mode(), &Mode::Normal);
         assert!(app.rows().is_empty());
         assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn select_by_id_should_select_matching_row() {
+        let row_a = row("First");
+        let row_b = row("Second");
+        let id_b = row_b.id;
+        let mut app = App::new(vec![row_a, row_b.clone()]);
+
+        app.select_by_id(Some(id_b));
+
+        assert_eq!(app.selected_row(), Some(&row_b));
+    }
+
+    #[test]
+    fn select_by_id_should_leave_default_selection_when_id_not_found() {
+        let row_a = row("First");
+        let row_b = row("Second");
+        let mut app = App::new(vec![row_a.clone(), row_b]);
+
+        app.select_by_id(Some(TaskId::new()));
+
+        assert_eq!(app.selected_row(), Some(&row_a));
+    }
+
+    #[test]
+    fn select_by_id_with_none_should_be_noop() {
+        let row_a = row("First");
+        let row_b = row("Second");
+        let mut app = App::new(vec![row_a.clone(), row_b]);
+
+        app.select_by_id(None);
+
+        assert_eq!(app.selected_row(), Some(&row_a));
     }
 }
