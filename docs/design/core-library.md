@@ -262,6 +262,7 @@ impl<S: Store> Core<S> {
     pub fn add_dependency(&mut self, id: TaskId, predecessor: TaskId, dep_type: DependencyType) -> Result<Task, CoreError>;
     pub fn remove_dependency(&mut self, id: TaskId, predecessor: TaskId) -> Result<Task, CoreError>;
     pub fn complete_task(&mut self, id: TaskId, cascade: bool) -> Result<Vec<Task>, CoreError>;
+    pub fn reopen_task(&mut self, id: TaskId) -> Result<Task, CoreError>;
     pub fn preview_cascade(&self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError>;
     pub fn get_tree(&self, filter: TreeFilter) -> Result<Vec<Task>, CoreError>;
     pub fn list_task_types(&self) -> Result<Vec<TaskType>, CoreError>;
@@ -456,19 +457,30 @@ recomputed once per path to it.
 
 ```
 fn complete_task(id, cascade) -> Result<Vec<Task>, CoreError> {
-    let incomplete_children = direct_incomplete_children(id);
-    if !incomplete_children.is_empty() && !cascade {
-        return Err(CoreError::IncompleteChildren { task: id, incomplete: incomplete_children });
+    let incomplete = incomplete_descendants(id);  // every depth, not just direct children
+    if !incomplete.is_empty() && !cascade {
+        return Err(CoreError::IncompleteChildren { task: id, incomplete });
     }
     // cascade == true: complete the whole subtree; cascade == false with
-    // no incomplete children: complete just this task.
+    // no incomplete descendants: complete just this task.
     mark_complete(id, recursive: cascade)
 }
 ```
 
+`incomplete_descendants` walks the whole subtree, not just direct
+children, so `IncompleteChildren.incomplete` always names exactly the set
+`cascade: true` would go on to complete — a caller rendering a
+confirmation prompt from this error (e.g. the TUI's cascade-confirm,
+Story 2.3 AC3) gets an accurate count without re-walking the hierarchy
+itself.
+
 Returns every task actually completed (one, or the whole touched
 subtree) — again so a caller refreshes views from the return value
 rather than re-querying.
+
+`reopen_task` is the reverse transition Story 1.4 didn't ship, closing
+the gap STORIES.md noted once Story 2.3's TUI toggle needed a real path
+back from Complete to Incomplete.
 
 ## Storage Boundary
 

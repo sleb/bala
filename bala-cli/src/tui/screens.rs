@@ -4,6 +4,7 @@
 //! `ratatui::backend::TestBackend` (no real terminal) before the real
 //! crossterm event loop wires it up.
 
+use bala_core::TaskStatus;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -63,13 +64,23 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .rows()
         .iter()
         .map(|row| {
-            ListItem::new(format!(
-                "{}  [{}]  {:?}  {}",
+            let marker = if row.status == TaskStatus::Complete {
+                'x'
+            } else {
+                ' '
+            };
+            let line = format!(
+                "[{marker}] {}  [{}]  {}",
                 row.title,
                 row.type_label,
-                row.status,
                 row.assignee_name.as_deref().unwrap_or("Unassigned")
-            ))
+            );
+            let item = ListItem::new(line);
+            if row.status == TaskStatus::Complete {
+                item.style(Style::new().add_modifier(Modifier::DIM))
+            } else {
+                item
+            }
         })
         .collect();
 
@@ -204,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_should_render_each_row_title_and_status() {
+    fn draw_should_render_completed_row_with_checkbox_marker_and_dim_style() {
         let rows = vec![
             row("First task", TaskStatus::Incomplete),
             row("Second task", TaskStatus::Complete),
@@ -216,10 +227,26 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("First task"));
-        assert!(text.contains("Second task"));
-        assert!(text.contains("Incomplete"));
-        assert!(text.contains("Complete"));
+        assert!(text.contains("[ ] First task"));
+        assert!(text.contains("[x] Second task"));
+
+        let buffer = terminal.backend().buffer();
+        let completed_row_style = buffer.cell((0, 1)).unwrap().style();
+        assert!(completed_row_style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn draw_should_render_incomplete_row_without_dim_style() {
+        let rows = vec![row("First task", TaskStatus::Incomplete)];
+        let app = App::new(rows);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let incomplete_row_style = buffer.cell((0, 0)).unwrap().style();
+        assert!(!incomplete_row_style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]

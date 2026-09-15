@@ -27,12 +27,12 @@ pub enum Mode {
 
 /// An action awaiting `y`/`n` confirmation in `Mode::Confirm`.
 ///
-/// Only `Delete` exists for this checkpoint (Story 2.2's `dd` sequence);
-/// Story 2.3 is expected to add a completion-cascade variant for tasks with
-/// incomplete children.
+/// `Delete` is Story 2.2's `dd` sequence; `CompleteCascade` is Story 2.3's
+/// confirmation for completing a task that has incomplete children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingAction {
     Delete(TaskId),
+    CompleteCascade(TaskId),
 }
 
 /// Which pane is focused in `Mode::Normal`.
