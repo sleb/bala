@@ -1230,6 +1230,44 @@ mod tests {
     }
 
     #[test]
+    fn apply_action_toggle_complete_with_multi_level_incomplete_descendants_should_count_full_cascade()
+     {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let _grandchild = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![child.id],
+                ..minimal_new_task("Grandchild")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent)]);
+
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        match app.mode() {
+            Mode::Confirm { prompt, .. } => {
+                // Two incomplete descendants (child + grandchild) will be
+                // completed by the cascade, not just the one direct child —
+                // the prompt must name the full cascade count, not just
+                // direct children.
+                assert!(
+                    prompt.contains('2'),
+                    "prompt should report both incomplete descendants, got: {prompt:?}"
+                );
+            }
+            other => panic!("expected Mode::Confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_action_confirm_yes_complete_cascade_should_call_complete_task_with_cascade_true_and_update_rows()
      {
         let mut core = core();

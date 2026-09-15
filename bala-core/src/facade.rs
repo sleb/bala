@@ -462,13 +462,17 @@ impl<S: Store> Core<S> {
     /// Completes a task per LLD §Algorithm 5 (Story 1.4): marks `id`
     /// `status = Complete`, `completed_at = Some(now)`, `updated_at = now`.
     ///
-    /// If `id` has any direct child whose `status` is still
+    /// If `id` has any descendant, at any depth, whose `status` is still
     /// [`TaskStatus::Incomplete`], the call is rejected with
     /// [`CoreError::IncompleteChildren`] and nothing is written — unless
     /// `cascade` is `true`, in which case `id`'s entire subtree is marked
     /// complete instead (every not-yet-complete descendant, walked
     /// iteratively so an arbitrarily deep hierarchy can't overflow the
-    /// stack).
+    /// stack). The rejection's `incomplete` list names every one of those
+    /// descendants, not just direct children, so it always matches exactly
+    /// what passing `cascade: true` would actually touch — a caller (e.g.
+    /// the TUI's cascade-confirm prompt) can render an accurate count
+    /// straight from this error without walking the hierarchy itself.
     ///
     /// Everything runs inside one [`Store::transaction`]. Returns every
     /// [`Task`] actually completed by this call — a single-element `Vec`
@@ -479,8 +483,8 @@ impl<S: Store> Core<S> {
     /// # Errors
     ///
     /// - [`CoreError::NotFound`] if `id` names no existing, live task.
-    /// - [`CoreError::IncompleteChildren`] if `id` has a direct child that
-    ///   is still incomplete and `cascade` is `false`.
+    /// - [`CoreError::IncompleteChildren`] if `id` has a descendant, at any
+    ///   depth, that is still incomplete and `cascade` is `false`.
     /// - [`CoreError::Store`] if the backend fails.
     pub fn complete_task(&mut self, id: TaskId, cascade: bool) -> Result<Vec<Task>, CoreError> {
         let touched = self.store.transaction(|tx| {
@@ -491,11 +495,11 @@ impl<S: Store> Core<S> {
                 return Ok(Err(CoreError::NotFound(id)));
             };
 
-            let incomplete_children = direct_incomplete_children(tx, id)?;
-            if !incomplete_children.is_empty() && !cascade {
+            let incomplete = incomplete_descendants(tx, id)?;
+            if !incomplete.is_empty() && !cascade {
                 return Ok(Err(CoreError::IncompleteChildren {
                     task: id,
-                    incomplete: incomplete_children,
+                    incomplete,
                 }));
             }
 
@@ -519,19 +523,37 @@ impl<S: Store> Core<S> {
     }
 }
 
-/// Collects the ids of every direct child of `id` whose `status` is still
-/// [`TaskStatus::Incomplete`]. A child id that no longer resolves via
-/// [`StoreTx::get_task`] (already deleted) is skipped, matching how other
-/// code in this module treats missing lookups.
-fn direct_incomplete_children(tx: &mut dyn StoreTx, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+/// Collects the ids of every descendant of `id`, at any depth, whose
+/// `status` is still [`TaskStatus::Incomplete`] — the same set
+/// [`mark_complete_subtree`] would flip to [`TaskStatus::Complete`] under
+/// `cascade: true`, so `Core::complete_task`'s rejection always names
+/// exactly what committing would touch.
+///
+/// Iterative (an explicit work stack), not recursive, for the same
+/// deep-chain-safety reason as `mark_complete_subtree`/`tombstone_subtree`.
+/// A task reachable through two parents is visited (and, if incomplete,
+/// counted) only once, via `visited`. A child id that no longer resolves
+/// via [`StoreTx::get_task`] (already deleted) is skipped, matching how
+/// other code in this module treats missing lookups.
+fn incomplete_descendants(tx: &mut dyn StoreTx, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
     let mut incomplete = Vec::new();
-    for child in tx.list_child_edges(id)? {
-        if let Some(child_task) = tx.get_task(child)?
-            && child_task.status == TaskStatus::Incomplete
-        {
-            incomplete.push(child);
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = tx.list_child_edges(id)?;
+
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
         }
+
+        let Some(task) = tx.get_task(current)? else {
+            continue;
+        };
+        if task.status == TaskStatus::Incomplete {
+            incomplete.push(current);
+        }
+        pending.extend(tx.list_child_edges(current)?);
     }
+
     Ok(incomplete)
 }
 
@@ -1734,6 +1756,42 @@ mod tests {
         let tree = core.get_tree(TreeFilter::default()).unwrap();
         let parent_after = tree.iter().find(|t| t.id == parent.id).unwrap();
         assert_eq!(parent_after.status, TaskStatus::Incomplete);
+    }
+
+    #[test]
+    fn complete_task_should_report_every_incomplete_descendant_across_multiple_levels() {
+        let mut core = new_core();
+        let root = core.create_task(minimal_new_task("Root")).unwrap();
+        let mid = core
+            .create_task(NewTask {
+                parent_ids: vec![root.id],
+                ..minimal_new_task("Mid")
+            })
+            .unwrap();
+        let leaf = core
+            .create_task(NewTask {
+                parent_ids: vec![mid.id],
+                ..minimal_new_task("Leaf")
+            })
+            .unwrap();
+
+        let result = core.complete_task(root.id, false);
+
+        let Err(CoreError::IncompleteChildren { task, incomplete }) = result else {
+            panic!("expected IncompleteChildren, got {result:?}");
+        };
+        assert_eq!(task, root.id);
+        let incomplete: std::collections::HashSet<_> = incomplete.into_iter().collect();
+        assert_eq!(
+            incomplete,
+            std::collections::HashSet::from([mid.id, leaf.id]),
+            "the reported set should match every task cascade:true would actually touch, \
+             not just direct children"
+        );
+
+        // Nothing should have been written.
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        assert!(tree.iter().all(|t| t.status == TaskStatus::Incomplete));
     }
 
     #[test]

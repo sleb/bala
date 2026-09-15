@@ -457,15 +457,22 @@ recomputed once per path to it.
 
 ```
 fn complete_task(id, cascade) -> Result<Vec<Task>, CoreError> {
-    let incomplete_children = direct_incomplete_children(id);
-    if !incomplete_children.is_empty() && !cascade {
-        return Err(CoreError::IncompleteChildren { task: id, incomplete: incomplete_children });
+    let incomplete = incomplete_descendants(id);  // every depth, not just direct children
+    if !incomplete.is_empty() && !cascade {
+        return Err(CoreError::IncompleteChildren { task: id, incomplete });
     }
     // cascade == true: complete the whole subtree; cascade == false with
-    // no incomplete children: complete just this task.
+    // no incomplete descendants: complete just this task.
     mark_complete(id, recursive: cascade)
 }
 ```
+
+`incomplete_descendants` walks the whole subtree, not just direct
+children, so `IncompleteChildren.incomplete` always names exactly the set
+`cascade: true` would go on to complete — a caller rendering a
+confirmation prompt from this error (e.g. the TUI's cascade-confirm,
+Story 2.3 AC3) gets an accurate count without re-walking the hierarchy
+itself.
 
 Returns every task actually completed (one, or the whole touched
 subtree) — again so a caller refreshes views from the return value
