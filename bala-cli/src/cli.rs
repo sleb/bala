@@ -29,7 +29,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Task operations: `add`, `ls`, `edit`, `delete`, `restore`, `complete`.
+    /// Task operations: `add`, `ls`, `edit`, `delete`, `restore`, `complete`,
+    /// `reopen`.
     Task(TaskArgs),
     /// User operations: `add`, `ls`.
     User(UserArgs),
@@ -55,6 +56,8 @@ pub enum TaskCommands {
     Restore(RestoreArgs),
     /// Mark a task complete, optionally cascading to its subtasks.
     Complete(CompleteArgs),
+    /// Reopen a previously completed task.
+    Reopen(ReopenArgs),
 }
 
 #[derive(Debug, Args)]
@@ -163,6 +166,12 @@ pub struct CompleteArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ReopenArgs {
+    /// Id of the task to reopen.
+    pub id: Uuid,
+}
+
+#[derive(Debug, Args)]
 pub struct UserArgs {
     #[command(subcommand)]
     pub command: UserCommands,
@@ -254,6 +263,7 @@ pub fn run_task_command(db_path: &Path, command: TaskCommands) -> Result<(), Cli
         TaskCommands::Delete(args) => run_task_delete(db_path, &args),
         TaskCommands::Restore(args) => run_task_restore(db_path, &args),
         TaskCommands::Complete(args) => run_task_complete(db_path, &args),
+        TaskCommands::Reopen(args) => run_task_reopen(db_path, &args),
     }
 }
 
@@ -428,6 +438,19 @@ fn run_task_complete(db_path: &Path, args: &CompleteArgs) -> Result<(), CliError
         let indent = if task.parent_ids.is_empty() { "" } else { "  " };
         println!("{}", format_task_line(task, indent, &names));
     }
+    Ok(())
+}
+
+fn run_task_reopen(db_path: &Path, args: &ReopenArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let task = core.reopen_task(TaskId::from(args.id))?;
+    let names: HashMap<UserId, String> = core
+        .list_users()?
+        .into_iter()
+        .map(|user| (user.id, user.name))
+        .collect();
+    let indent = if task.parent_ids.is_empty() { "" } else { "  " };
+    println!("{}", format_task_line(&task, indent, &names));
     Ok(())
 }
 

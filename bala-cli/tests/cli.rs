@@ -557,6 +557,56 @@ fn task_complete_task_with_incomplete_children_and_cascade_should_complete_all()
 }
 
 #[test]
+fn task_reopen_completed_task_should_show_as_incomplete_in_ls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Leaf task"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "complete", &task_id])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "reopen", &task_id])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("[ ]").and(contains("Leaf task")));
+}
+
+#[test]
+fn task_reopen_with_unknown_task_id_should_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let unknown_task_id = uuid::Uuid::new_v4().to_string();
+
+    bala_cmd(&db_path)
+        .args(["task", "reopen", &unknown_task_id])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn task_reopen_already_incomplete_task_should_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Never completed"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "reopen", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("[ ]").and(contains("Never completed")));
+}
+
+#[test]
 fn bala_with_no_subcommand_on_non_tty_should_fail_gracefully() {
     // No subcommand => the TUI path. `assert_cmd`'s `Command` runs with
     // stdin/stdout not attached to a real TTY, so `enable_raw_mode()` should
