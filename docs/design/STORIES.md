@@ -102,6 +102,13 @@
 4. `Esc` or `n` in Confirm mode cancels with no state change.
 5. Completed tasks are visually distinguished in the list, matching Story 1.4 AC3.
 
+### Story 2.3a — Reopen a Task from the CLI *(split from 2.3: CLI surface deferred)* [![Issue #32](https://img.shields.io/github/issues/detail/state/sleb/bala/32)](https://github.com/sleb/bala/issues/32)
+**Description:** As a scripting user, I want to reopen a completed task from the command line, so that I have a scriptable path back to Incomplete without using the TUI.
+
+**Acceptance Criteria:**
+1. `bala task reopen <id>` maps directly onto `Core::reopen_task`, mirroring `bala task complete`'s shape and output.
+2. An unknown task id fails with a nonzero exit and the standard `NotFound` stderr rendering (§Error Rendering).
+
 ### Story 2.4 — Persist TUI View State Across Sessions
 **Description:** As a user, I want the TUI to remember my last view when I relaunch it, so that I don't have to re-navigate to where I left off.
 
