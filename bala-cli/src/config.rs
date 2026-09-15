@@ -1,14 +1,18 @@
-//! Minimal configuration: resolving the default SQLite database path.
-//!
-//! No `view.toml`/`ViewState` at this checkpoint — just enough to find (and
-//! create) a directory to put `bala.db` in.
+//! Configuration: resolving the default SQLite database path, and
+//! loading/saving the persisted TUI `ViewState` (`view.toml`).
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use bala_core::TaskId;
 use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
 
-/// Errors resolving or preparing the default db path.
+/// Errors resolving or preparing a bala config/data directory.
+// The shared "Dir" postfix pairs two orthogonal concepts (data vs. config
+// dir; not-found vs. create-failed), not near-duplicate variants — keeping
+// it is clearer than inventing dissimilar names to dodge the lint.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("could not determine a data directory for bala")]
@@ -16,6 +20,12 @@ pub enum ConfigError {
 
     #[error("failed to create data directory: {0}")]
     CreateDataDir(#[source] io::Error),
+
+    #[error("could not determine a config directory for bala")]
+    NoConfigDir,
+
+    #[error("failed to create config directory: {0}")]
+    CreateConfigDir(#[source] io::Error),
 }
 
 /// Resolves the default SQLite database path (per-OS data dir + `bala.db`),
@@ -30,4 +40,185 @@ pub fn default_db_path() -> Result<PathBuf, ConfigError> {
     let data_dir = dirs.data_dir();
     std::fs::create_dir_all(data_dir).map_err(ConfigError::CreateDataDir)?;
     Ok(data_dir.join("bala.db"))
+}
+
+/// Resolves the path to the persisted TUI view state (per-OS config dir +
+/// `view.toml`), creating the containing directory if it doesn't already
+/// exist.
+///
+/// # Errors
+///
+/// Returns `Err` if no config directory can be determined for this OS, or if
+/// creating it fails.
+pub fn view_state_path() -> Result<PathBuf, ConfigError> {
+    let dirs = ProjectDirs::from("", "", "bala").ok_or(ConfigError::NoConfigDir)?;
+    let config_dir = dirs.config_dir();
+    std::fs::create_dir_all(config_dir).map_err(ConfigError::CreateConfigDir)?;
+    Ok(config_dir.join("view.toml"))
+}
+
+/// Persisted TUI view state: which task (if any) is currently selected in
+/// the tree.
+///
+/// Other fields (`collapsed`, `gantt_scale`, `gantt_anchor`, `filter`,
+/// `blocked_only`, ...) described in the design doc are deliberately out of
+/// scope for this story and may join later without a format break, since
+/// they'd live alongside `selected` inside the same `[tree]` table (or a
+/// sibling table).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewState {
+    pub selected: Option<TaskId>,
+}
+
+/// On-disk shape of `view.toml`. Kept private and separate from
+/// [`ViewState`] so `TaskId` itself never needs to implement `serde`
+/// traits — it's converted to/from `String` at this boundary via its
+/// `Display`/`FromStr` impls.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ViewStateShape {
+    tree: TreeShape,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TreeShape {
+    selected: Option<String>,
+}
+
+impl From<&ViewState> for ViewStateShape {
+    fn from(state: &ViewState) -> Self {
+        Self {
+            tree: TreeShape {
+                selected: state.selected.map(|id| id.to_string()),
+            },
+        }
+    }
+}
+
+impl From<ViewStateShape> for ViewState {
+    fn from(shape: ViewStateShape) -> Self {
+        Self {
+            selected: shape.tree.selected.and_then(|s| s.parse().ok()),
+        }
+    }
+}
+
+/// Loads the persisted view state from `path`.
+///
+/// A missing file, an unreadable file, or a file whose contents don't parse
+/// as valid `view.toml` all fall back to [`ViewState::default`] rather than
+/// surfacing an error — persisted view state is a convenience, never a
+/// reason to block startup.
+#[must_use]
+pub fn load_view_state(path: &Path) -> ViewState {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return ViewState::default();
+    };
+    toml::from_str::<ViewStateShape>(&contents).map_or_else(|_| ViewState::default(), Into::into)
+}
+
+/// Saves `state` to `path`, replacing any existing file.
+///
+/// The new contents are written to a sibling temp file first and then
+/// renamed over `path`, so a crash or power loss mid-write can never leave
+/// `path` holding a partially-written (corrupt) file.
+///
+/// # Errors
+///
+/// Returns `Err` if serialization fails, or if writing or renaming the temp
+/// file fails.
+pub fn save_view_state(path: &Path, state: &ViewState) -> io::Result<()> {
+    let shape = ViewStateShape::from(state);
+    let contents = toml::to_string_pretty(&shape).map_err(io::Error::other)?;
+
+    let temp_path = path.with_extension("toml.tmp");
+    std::fs::write(&temp_path, contents)?;
+    std::fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+    use std::str::FromStr as _;
+
+    #[test]
+    fn view_state_should_round_trip_through_toml() {
+        let id = TaskId::from_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
+        let state = ViewState { selected: Some(id) };
+
+        let shape = ViewStateShape::from(&state);
+        let toml_text = toml::to_string_pretty(&shape).expect("serialize");
+        let parsed: ViewStateShape = toml::from_str(&toml_text).expect("parse");
+        let round_tripped: ViewState = parsed.into();
+
+        assert_eq!(round_tripped, state);
+    }
+
+    #[test]
+    fn load_view_state_should_return_default_when_file_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+
+        let state = load_view_state(&path);
+
+        assert_eq!(state, ViewState::default());
+    }
+
+    #[test]
+    fn load_view_state_should_return_default_when_file_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+        fs::write(&path, "this is not valid toml [[[").expect("write corrupt file");
+
+        let state = load_view_state(&path);
+
+        assert_eq!(state, ViewState::default());
+    }
+
+    #[test]
+    fn save_view_state_should_overwrite_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+        let old_id = TaskId::from_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
+        save_view_state(
+            &path,
+            &ViewState {
+                selected: Some(old_id),
+            },
+        )
+        .expect("save old state");
+
+        let new_id = TaskId::from_str("00000000-0000-0000-0000-000000000002").expect("valid uuid");
+        save_view_state(
+            &path,
+            &ViewState {
+                selected: Some(new_id),
+            },
+        )
+        .expect("save new state");
+
+        let loaded = load_view_state(&path);
+        assert_eq!(
+            loaded,
+            ViewState {
+                selected: Some(new_id)
+            }
+        );
+    }
+
+    #[test]
+    fn save_view_state_should_leave_no_temp_file_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+
+        save_view_state(&path, &ViewState::default()).expect("save state");
+
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("view.toml")]);
+    }
 }

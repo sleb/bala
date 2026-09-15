@@ -21,6 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::cli::{self, CliError};
+use crate::config::{self, ViewState};
 use crate::render;
 use app::{App, handle_key};
 
@@ -68,6 +69,26 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
         .with_lookup_maps(type_labels, user_names)
         .with_descriptions(descriptions);
 
+    // Resolving the view-state path can fail only for a rare OS-level reason
+    // (no config directory determinable, or it can't be created) — that's
+    // not a reason to block the TUI from starting, so it's downgraded to a
+    // stderr warning and treated as "no usable path", same as `run` treats
+    // any other config-loading hiccup: `view_state_path` itself is `None`
+    // hereafter, which also means the closing save step is skipped rather
+    // than attempted against a path we couldn't resolve.
+    let view_state_path = match config::view_state_path() {
+        Ok(path) => Some(path),
+        Err(err) => {
+            eprintln!("warning: failed to resolve view state path: {err}");
+            None
+        }
+    };
+    let view_state = view_state_path
+        .as_deref()
+        .map(config::load_view_state)
+        .unwrap_or_default();
+    app.select_by_id(view_state.selected);
+
     install_panic_hook();
     crossterm::terminal::enable_raw_mode().map_err(CliError::TerminalIo)?;
     // From here on, `_guard`'s `Drop` restores the terminal on every exit
@@ -96,6 +117,15 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
             {
                 break;
             }
+        }
+    }
+
+    if let Some(path) = view_state_path.as_deref() {
+        let new_state = ViewState {
+            selected: app.selected_row().map(|row| row.id),
+        };
+        if let Err(err) = config::save_view_state(path, &new_state) {
+            eprintln!("warning: failed to save view state: {err}");
         }
     }
 
