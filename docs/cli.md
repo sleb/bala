@@ -218,3 +218,13 @@ bala task complete <task-id> [--cascade]
 
 Prints the completed task (and, with `--cascade`, each descendant it also
 completed), one per line in the same format as `task ls`.
+
+### `bala task reopen`
+
+Reopens a previously completed task, marking it incomplete again.
+
+```sh
+bala task reopen <task-id>
+```
+
+Prints the reopened task, in the same format as `task ls`.

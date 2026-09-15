@@ -29,7 +29,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Task operations: `add`, `ls`, `edit`, `delete`, `restore`, `complete`.
+    /// Task operations: `add`, `ls`, `edit`, `delete`, `restore`, `complete`,
+    /// `reopen`.
     Task(TaskArgs),
     /// User operations: `add`, `ls`.
     User(UserArgs),
@@ -55,6 +56,8 @@ pub enum TaskCommands {
     Restore(RestoreArgs),
     /// Mark a task complete, optionally cascading to its subtasks.
     Complete(CompleteArgs),
+    /// Reopen a previously completed task.
+    Reopen(ReopenArgs),
 }
 
 #[derive(Debug, Args)]
@@ -163,6 +166,12 @@ pub struct CompleteArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ReopenArgs {
+    /// Id of the task to reopen.
+    pub id: Uuid,
+}
+
+#[derive(Debug, Args)]
 pub struct UserArgs {
     #[command(subcommand)]
     pub command: UserCommands,
@@ -254,6 +263,7 @@ pub fn run_task_command(db_path: &Path, command: TaskCommands) -> Result<(), Cli
         TaskCommands::Delete(args) => run_task_delete(db_path, &args),
         TaskCommands::Restore(args) => run_task_restore(db_path, &args),
         TaskCommands::Complete(args) => run_task_complete(db_path, &args),
+        TaskCommands::Reopen(args) => run_task_reopen(db_path, &args),
     }
 }
 
@@ -294,19 +304,21 @@ fn run_task_ls(db_path: &Path) -> Result<(), CliError> {
         .map(|user| (user.id, user.name))
         .collect();
     for task in &tasks {
-        // Minimal nesting: indent one level under a task's first parent
-        // (if any) so a child visibly nests under it — full recursive tree
-        // layout is the TUI's job later.
-        let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-        println!("{}", format_task_line(task, indent, &names));
+        println!("{}", format_task_line(task, &names));
     }
     Ok(())
 }
 
 /// Renders the one-line summary shared by `task ls`/`edit`/`delete`/
-/// `restore`/`complete`: `"{indent}[{marker}] {id} {title}{assignee_suffix}"`,
-/// where `marker` is `x` for a completed task and a space otherwise.
-fn format_task_line(task: &Task, indent: &str, names: &HashMap<UserId, String>) -> String {
+/// `restore`/`complete`/`reopen`:
+/// `"{indent}[{marker}] {id} {title}{assignee_suffix}"`, where `marker` is
+/// `x` for a completed task and a space otherwise, and `indent` nests one
+/// level under a task's first parent (if any) so a child visibly nests
+/// under it — full recursive tree layout is the TUI's job later. Indent is
+/// derived from the task itself rather than taken as a parameter so every
+/// call site computes it the same way.
+fn format_task_line(task: &Task, names: &HashMap<UserId, String>) -> String {
+    let indent = if task.parent_ids.is_empty() { "" } else { "  " };
     let assignee = task
         .assignee_id
         .and_then(|id| names.get(&id))
@@ -341,8 +353,7 @@ fn run_task_edit(db_path: &Path, args: EditArgs) -> Result<(), CliError> {
         .map(|user| (user.id, user.name))
         .collect();
     for task in &updated {
-        let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-        println!("{}", format_task_line(task, indent, &names));
+        println!("{}", format_task_line(task, &names));
     }
     Ok(())
 }
@@ -411,8 +422,7 @@ fn run_task_restore(db_path: &Path, args: &RestoreArgs) -> Result<(), CliError> 
         .into_iter()
         .map(|user| (user.id, user.name))
         .collect();
-    let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-    println!("{}", format_task_line(&task, indent, &names));
+    println!("{}", format_task_line(&task, &names));
     Ok(())
 }
 
@@ -425,9 +435,20 @@ fn run_task_complete(db_path: &Path, args: &CompleteArgs) -> Result<(), CliError
         .map(|user| (user.id, user.name))
         .collect();
     for task in &completed {
-        let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-        println!("{}", format_task_line(task, indent, &names));
+        println!("{}", format_task_line(task, &names));
     }
+    Ok(())
+}
+
+fn run_task_reopen(db_path: &Path, args: &ReopenArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let task = core.reopen_task(TaskId::from(args.id))?;
+    let names: HashMap<UserId, String> = core
+        .list_users()?
+        .into_iter()
+        .map(|user| (user.id, user.name))
+        .collect();
+    println!("{}", format_task_line(&task, &names));
     Ok(())
 }
 
