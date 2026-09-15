@@ -11,11 +11,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use crate::tui::app::App;
+use crate::tui::keymap;
 use crate::tui::mode::{DetailField, EditableField, Mode, Pane};
 
 /// Draws the current `App` state into `frame`.
 ///
-/// Dispatches on `app.pane()`: `Pane::List` renders a centered "No tasks
+/// When `app` is in `Mode::Help`, [`draw_help`] takes over the whole frame
+/// area and nothing else is drawn this frame: a bordered overlay with no
+/// alpha blending visually replaces whatever pane/mode was showing beneath
+/// it anyway, so drawing that content first would be wasted work. Otherwise
+/// dispatches on `app.pane()`: `Pane::List` renders a centered "No tasks
 /// yet." message when there are no rows, otherwise a `List` of one line per
 /// row with the selected row highlighted; `Pane::Detail` renders the
 /// selected task's title and description via [`draw_detail`]. When `app` is
@@ -24,6 +29,12 @@ use crate::tui::mode::{DetailField, EditableField, Mode, Pane};
 /// regardless of pane.
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+
+    if let Mode::Help { previous } = app.mode() {
+        draw_help(frame, previous, app.pane(), app.detail_field(), area);
+        return;
+    }
+
     let (content_area, input_area) = split_for_input(app, area);
 
     match app.pane() {
@@ -134,6 +145,28 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
     let line = Paragraph::new(prompt.as_str()).style(Style::new().fg(Color::Yellow));
     frame.render_widget(line, prompt_area);
+}
+
+/// Renders the keybinding help overlay: one line per [`keymap::HelpEntry`]
+/// for the mode/pane/field Help was opened from (`previous`, `pane`,
+/// `detail_field` — passed straight to [`keymap::help_entries`]), each as
+/// `"{key} — {description}"`, inside a bordered `Block` titled `"Help"`,
+/// plus a fixed trailing `"Esc — close help"` line.
+fn draw_help(
+    frame: &mut Frame,
+    previous: &Mode,
+    pane: Pane,
+    detail_field: DetailField,
+    area: Rect,
+) {
+    let mut lines: Vec<String> = keymap::help_entries(previous, pane, detail_field)
+        .iter()
+        .map(|entry| format!("{} — {}", entry.key, entry.description))
+        .collect();
+    lines.push("Esc — close help".to_string());
+
+    let paragraph = Paragraph::new(lines.join("\n")).block(Block::bordered().title("Help"));
+    frame.render_widget(paragraph, area);
 }
 
 /// Renders the "No tasks yet." message, centered within `area`.
@@ -361,5 +394,72 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("Write docs"));
         assert!(text.contains("y/n"));
+    }
+
+    #[test]
+    fn draw_should_render_help_overlay_listing_normal_list_bindings_when_help_opened_from_normal_list()
+     {
+        let task_row = row("Write docs", TaskStatus::Incomplete);
+        let mut app = App::new(vec![task_row]);
+        let mut core = core();
+        let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Help"));
+        assert!(text.contains("j/↓ — Move the selection down"));
+        assert!(text.contains("dd — Delete the selected task (press d twice)"));
+    }
+
+    #[test]
+    fn draw_should_render_help_overlay_reflecting_insert_mode_bindings_when_help_opened_from_insert()
+     {
+        let mut app = App::new(vec![]);
+        let mut core = core();
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewTitle);
+        let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("F1 — Show the keybinding help overlay"));
+        assert!(!text.contains("j/↓ — Move the selection down"));
+    }
+
+    #[test]
+    fn draw_should_render_esc_close_hint_in_help_overlay() {
+        let task_row = row("Write docs", TaskStatus::Incomplete);
+        let mut app = App::new(vec![task_row]);
+        let mut core = core();
+        let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
+
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Esc — close help"));
+    }
+
+    #[test]
+    fn draw_should_render_help_overlay_over_detail_pane_when_help_opened_from_detail() {
+        let task_row = row("Write docs", TaskStatus::Incomplete);
+        let mut app = App::new(vec![task_row]);
+        let mut core = core();
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Esc — Leave the Detail pane, back to the list"));
+        assert!(text.contains("i — Edit title"));
     }
 }
