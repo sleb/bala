@@ -388,6 +388,43 @@ impl<S: Store> Core<S> {
         Ok(touched)
     }
 
+    /// Reopens a completed task per Story 2.3: the reverse of
+    /// `complete_task`, closing the gap noted in STORIES.md where Story 1.4
+    /// only ever shipped the forward Incomplete→Complete transition.
+    /// Looks `id` up via [`StoreTx::get_task`] — a soft-deleted task is not
+    /// reopenable, matching `delete_task`'s own use of `get_task` rather
+    /// than `get_task_including_deleted` — sets `status =`
+    /// [`TaskStatus::Incomplete`], clears `completed_at`, bumps
+    /// `updated_at`, and persists.
+    ///
+    /// Idempotent: calling this on a task that's already
+    /// [`TaskStatus::Incomplete`] is not an error — `status` and
+    /// `completed_at` were already at their target values — but
+    /// `updated_at` still bumps, mirroring `restore_task`'s own convention
+    /// of always bumping `updated_at` on any successful call regardless of
+    /// what the call actually changed.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::NotFound`] if `id` names no existing, live task.
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn reopen_task(&mut self, id: TaskId) -> Result<Task, CoreError> {
+        let task = self.store.transaction(|tx| {
+            let Some(mut task) = tx.get_task(id)? else {
+                return Ok(Err(CoreError::NotFound(id)));
+            };
+
+            task.status = TaskStatus::Incomplete;
+            task.completed_at = None;
+            task.updated_at = Utc::now();
+            tx.put_task(&task)?;
+
+            Ok(Ok(task))
+        })??;
+
+        Ok(task)
+    }
+
     /// Restores a soft-deleted task per LLD §Algorithm (Story 1.3, AC5):
     /// looks `id` up via [`StoreTx::get_task_including_deleted`] — unlike
     /// `delete_task`'s `get_task`, this must see a tombstoned row, not
@@ -1576,6 +1613,52 @@ mod tests {
         let restored = core.restore_task(task.id).unwrap();
 
         assert!(restored.updated_at >= task.updated_at);
+    }
+
+    #[test]
+    fn reopen_task_should_reject_when_task_not_found() {
+        let mut core = new_core();
+        let missing = TaskId::new();
+
+        let result = core.reopen_task(missing);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
+    #[test]
+    fn reopen_task_should_clear_completed_at_and_set_status_incomplete() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        core.complete_task(task.id, false).unwrap();
+
+        let reopened = core.reopen_task(task.id).unwrap();
+
+        assert_eq!(reopened.status, TaskStatus::Incomplete);
+        assert!(reopened.completed_at.is_none());
+    }
+
+    #[test]
+    fn reopen_task_should_be_idempotent_when_task_already_incomplete() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let reopened = core.reopen_task(task.id).unwrap();
+
+        assert_eq!(reopened.status, TaskStatus::Incomplete);
+        assert!(reopened.completed_at.is_none());
+        assert_eq!(reopened.id, task.id);
+    }
+
+    #[test]
+    fn reopen_task_should_bump_updated_at() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let completed = core.complete_task(task.id, false).unwrap();
+        let completed_updated_at = completed[0].updated_at;
+
+        let reopened = core.reopen_task(task.id).unwrap();
+
+        assert!(reopened.updated_at >= completed_updated_at);
     }
 
     #[test]

@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
-use bala_core::{Core, DeleteMode, Field, NewTask, Store, TaskId, TaskPatch, UserId};
+use bala_core::{
+    Core, CoreError, DeleteMode, Field, NewTask, Store, TaskId, TaskPatch, TaskStatus, UserId,
+};
 use crossterm::event::KeyEvent;
 
 use crate::render::{self, TaskRow};
@@ -258,27 +260,11 @@ pub fn apply_action<S: Store>(
             ControlFlow::Continue(())
         }
         Action::StartEditTitle => {
-            if let Some(row) = app.selected_row() {
-                let id = row.id;
-                let title = row.title.clone();
-                app.mode = Mode::Insert {
-                    field: EditableField::Title(id),
-                    buffer: title,
-                };
-                app.error = None;
-            }
+            start_edit_title(app);
             ControlFlow::Continue(())
         }
         Action::StartEditDescription => {
-            if let Some(row) = app.selected_row() {
-                let id = row.id;
-                let buffer = app.description_of(id).unwrap_or_default().to_string();
-                app.mode = Mode::Insert {
-                    field: EditableField::Description(id),
-                    buffer,
-                };
-                app.error = None;
-            }
+            start_edit_description(app);
             ControlFlow::Continue(())
         }
         Action::DKeyPressed => {
@@ -293,7 +279,98 @@ pub fn apply_action<S: Store>(
             app.mode = Mode::Normal;
             ControlFlow::Continue(())
         }
+        Action::ToggleComplete => {
+            handle_toggle_complete(app, core);
+            ControlFlow::Continue(())
+        }
         Action::Noop => ControlFlow::Continue(()),
+    }
+}
+
+/// Handles `Action::ToggleComplete`: no-op with no selection. For an
+/// `Incomplete` task, calls `Core::complete_task(id, false)` — on success
+/// refreshes every touched row's status (a single-element result for a leaf
+/// task); on `CoreError::IncompleteChildren`, enters `Mode::Confirm` with
+/// `PendingAction::CompleteCascade(id)` and a prompt naming the task and the
+/// incomplete-child count; on any other error sets `app.error`. For a
+/// `Complete` task, calls `Core::reopen_task(id)` and refreshes that one
+/// row on success (mirroring the same error-handling shape).
+fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let id = row.id;
+    let title = row.title.clone();
+
+    match row.status {
+        TaskStatus::Incomplete => match core.complete_task(id, false) {
+            Ok(touched) => {
+                refresh_row_statuses(app, &touched);
+                app.error = None;
+            }
+            Err(CoreError::IncompleteChildren { incomplete, .. }) => {
+                let count = incomplete.len();
+                app.mode = Mode::Confirm {
+                    prompt: format!(
+                        "Complete \"{title}\"? {count} incomplete subtask(s) will also be completed. (y/n)"
+                    ),
+                    action: PendingAction::CompleteCascade(id),
+                };
+            }
+            Err(err) => {
+                app.error = Some(err.to_string());
+            }
+        },
+        TaskStatus::Complete => match core.reopen_task(id) {
+            Ok(task) => {
+                refresh_row_statuses(app, std::slice::from_ref(&task));
+                app.error = None;
+            }
+            Err(err) => {
+                app.error = Some(err.to_string());
+            }
+        },
+    }
+}
+
+/// Updates `app.rows`' `status` field for every task in `touched`, matched
+/// by id. Shared by [`handle_toggle_complete`] and [`confirm_yes`]'s
+/// `CompleteCascade` arm so both "refresh every row a `Core` call actually
+/// touched" call sites use the same lookup-by-id loop.
+fn refresh_row_statuses(app: &mut App, touched: &[bala_core::Task]) {
+    for task in touched {
+        if let Some(row) = app.rows.iter_mut().find(|row| row.id == task.id) {
+            row.status = task.status;
+        }
+    }
+}
+
+/// Handles `Action::StartEditTitle`: enters `Mode::Insert` prefilled with
+/// the selected task's current title. No-op when there's no selection.
+fn start_edit_title(app: &mut App) {
+    if let Some(row) = app.selected_row() {
+        let id = row.id;
+        let title = row.title.clone();
+        app.mode = Mode::Insert {
+            field: EditableField::Title(id),
+            buffer: title,
+        };
+        app.error = None;
+    }
+}
+
+/// Handles `Action::StartEditDescription`: enters `Mode::Insert` prefilled
+/// with the selected task's current description (empty string when it has
+/// none). No-op when there's no selection.
+fn start_edit_description(app: &mut App) {
+    if let Some(row) = app.selected_row() {
+        let id = row.id;
+        let buffer = app.description_of(id).unwrap_or_default().to_string();
+        app.mode = Mode::Insert {
+            field: EditableField::Description(id),
+            buffer,
+        };
+        app.error = None;
     }
 }
 
@@ -330,30 +407,50 @@ fn handle_d_key_pressed(app: &mut App, was_pending_d: bool) {
 /// makes sense). On failure `app.error` is set and `app` still returns to
 /// `Mode::Normal` — there's no in-progress input to preserve here, unlike
 /// `submit_insert`'s failure path.
+///
+/// For `PendingAction::CompleteCascade(id)`, calls
+/// `Core::complete_task(id, true)`. On success every touched row's status is
+/// refreshed (same lookup-by-id loop as [`handle_toggle_complete`]'s
+/// non-cascade path) and `app` returns to `Mode::Normal`, leaving `app.pane`
+/// untouched — unlike `Delete`, completing a task doesn't invalidate its
+/// Detail view. On failure `app.error` is set and `app` returns to
+/// `Mode::Normal`.
 fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
     let Mode::Confirm { action, .. } = &app.mode else {
         return;
     };
-    let PendingAction::Delete(id) = *action;
 
-    match core.delete_task(id, DeleteMode::Subtree) {
-        Ok(deleted) => {
-            let deleted_ids: std::collections::HashSet<TaskId> =
-                deleted.iter().map(|task| task.id).collect();
-            app.rows.retain(|row| !deleted_ids.contains(&row.id));
-            app.selected = if app.rows.is_empty() {
-                None
-            } else {
-                Some(app.selected.unwrap_or(0).min(app.rows.len() - 1))
-            };
-            app.pane = Pane::List;
-            app.mode = Mode::Normal;
-            app.error = None;
-        }
-        Err(err) => {
-            app.mode = Mode::Normal;
-            app.error = Some(err.to_string());
-        }
+    match *action {
+        PendingAction::Delete(id) => match core.delete_task(id, DeleteMode::Subtree) {
+            Ok(deleted) => {
+                let deleted_ids: std::collections::HashSet<TaskId> =
+                    deleted.iter().map(|task| task.id).collect();
+                app.rows.retain(|row| !deleted_ids.contains(&row.id));
+                app.selected = if app.rows.is_empty() {
+                    None
+                } else {
+                    Some(app.selected.unwrap_or(0).min(app.rows.len() - 1))
+                };
+                app.pane = Pane::List;
+                app.mode = Mode::Normal;
+                app.error = None;
+            }
+            Err(err) => {
+                app.mode = Mode::Normal;
+                app.error = Some(err.to_string());
+            }
+        },
+        PendingAction::CompleteCascade(id) => match core.complete_task(id, true) {
+            Ok(touched) => {
+                refresh_row_statuses(app, &touched);
+                app.mode = Mode::Normal;
+                app.error = None;
+            }
+            Err(err) => {
+                app.mode = Mode::Normal;
+                app.error = Some(err.to_string());
+            }
+        },
     }
 }
 
@@ -1054,5 +1151,148 @@ mod tests {
             status: task.status,
             assignee_name: None,
         }
+    }
+
+    fn minimal_new_task(title: &str) -> bala_core::NewTask {
+        bala_core::NewTask {
+            title: title.to_string(),
+            description: None,
+            parent_ids: Vec::new(),
+            type_key: None,
+            start_date: None,
+            due_date: None,
+            assignee_id: None,
+        }
+    }
+
+    #[test]
+    fn apply_action_toggle_complete_should_complete_incomplete_leaf_and_update_row_status() {
+        let mut core = core();
+        let task = core
+            .create_task(minimal_new_task("Write docs"))
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&task)]);
+
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.rows()[0].status, TaskStatus::Complete);
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn apply_action_toggle_complete_should_reopen_completed_task_and_update_row_status() {
+        let mut core = core();
+        let task = core
+            .create_task(minimal_new_task("Write docs"))
+            .expect("create_task should succeed");
+        core.complete_task(task.id, false)
+            .expect("complete_task should succeed");
+        let mut row = row_for(&task);
+        row.status = TaskStatus::Complete;
+        let mut app = App::new(vec![row]);
+
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.rows()[0].status, TaskStatus::Incomplete);
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn apply_action_toggle_complete_with_incomplete_children_should_enter_confirm_mode_with_cascade_prompt()
+     {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let _child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent)]);
+
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        match app.mode() {
+            Mode::Confirm { prompt, action } => {
+                assert!(prompt.contains("Parent"));
+                assert!(prompt.contains('1'));
+                assert_eq!(
+                    *action,
+                    crate::tui::mode::PendingAction::CompleteCascade(parent.id)
+                );
+            }
+            other => panic!("expected Mode::Confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_action_confirm_yes_complete_cascade_should_call_complete_task_with_cascade_true_and_update_rows()
+     {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent), row_for(&child)]);
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        let parent_row = app.rows().iter().find(|row| row.id == parent.id).unwrap();
+        let child_row = app.rows().iter().find(|row| row.id == child.id).unwrap();
+        assert_eq!(parent_row.status, TaskStatus::Complete);
+        assert_eq!(child_row.status, TaskStatus::Complete);
+    }
+
+    #[test]
+    fn apply_action_confirm_no_should_leave_task_incomplete_after_cascade_prompt() {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let _child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent)]);
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmNo);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.rows()[0].status, TaskStatus::Incomplete);
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let updated = tasks
+            .into_iter()
+            .find(|task| task.id == parent.id)
+            .expect("task should still exist");
+        assert_eq!(updated.status, TaskStatus::Incomplete);
+    }
+
+    #[test]
+    fn apply_action_toggle_complete_with_no_selection_should_be_noop() {
+        let mut app = App::new(vec![]);
+        let mut core = core();
+
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert!(app.rows().is_empty());
+        assert_eq!(app.error(), None);
     }
 }

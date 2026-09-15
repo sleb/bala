@@ -262,6 +262,7 @@ impl<S: Store> Core<S> {
     pub fn add_dependency(&mut self, id: TaskId, predecessor: TaskId, dep_type: DependencyType) -> Result<Task, CoreError>;
     pub fn remove_dependency(&mut self, id: TaskId, predecessor: TaskId) -> Result<Task, CoreError>;
     pub fn complete_task(&mut self, id: TaskId, cascade: bool) -> Result<Vec<Task>, CoreError>;
+    pub fn reopen_task(&mut self, id: TaskId) -> Result<Task, CoreError>;
     pub fn preview_cascade(&self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError>;
     pub fn get_tree(&self, filter: TreeFilter) -> Result<Vec<Task>, CoreError>;
     pub fn list_task_types(&self) -> Result<Vec<TaskType>, CoreError>;
@@ -469,6 +470,10 @@ fn complete_task(id, cascade) -> Result<Vec<Task>, CoreError> {
 Returns every task actually completed (one, or the whole touched
 subtree) — again so a caller refreshes views from the return value
 rather than re-querying.
+
+`reopen_task` is the reverse transition Story 1.4 didn't ship, closing
+the gap STORIES.md noted once Story 2.3's TUI toggle needed a real path
+back from Complete to Incomplete.
 
 ## Storage Boundary
 

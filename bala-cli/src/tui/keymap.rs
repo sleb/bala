@@ -36,6 +36,9 @@ pub enum Action {
     /// `Normal` mode, `Detail` pane, `i` with the description field under
     /// the cursor: start editing the focused task's description.
     StartEditDescription,
+    /// `Normal` mode, `List`/`Detail` pane, `x`/`Space`: toggle the selected
+    /// task's complete/incomplete state.
+    ToggleComplete,
     /// `Insert` mode: append a character to the edit buffer.
     InsertChar(char),
     /// `Insert` mode: remove the last character from the edit buffer.
@@ -74,6 +77,7 @@ pub fn key_to_action(mode: &Mode, pane: Pane, detail_field: DetailField, key: Ke
                 KeyCode::Char('O') => Action::StartInsertNewTitle,
                 KeyCode::Enter => Action::EnterDetail,
                 KeyCode::Char('d') => Action::DKeyPressed,
+                KeyCode::Char('x' | ' ') => Action::ToggleComplete,
                 _ => Action::Noop,
             },
             Pane::Detail => match key.code {
@@ -85,6 +89,7 @@ pub fn key_to_action(mode: &Mode, pane: Pane, detail_field: DetailField, key: Ke
                     DetailField::Title => Action::StartEditTitle,
                     DetailField::Description => Action::StartEditDescription,
                 },
+                KeyCode::Char('x' | ' ') => Action::ToggleComplete,
                 _ => Action::Noop,
             },
         },
@@ -301,6 +306,42 @@ mod tests {
         );
 
         assert_eq!(action, Action::ConfirmNo);
+    }
+
+    #[test]
+    fn key_to_action_should_map_x_in_normal_list_to_toggle_complete() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::ToggleComplete);
+    }
+
+    #[test]
+    fn key_to_action_should_map_space_in_normal_list_to_toggle_complete() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::ToggleComplete);
+    }
+
+    #[test]
+    fn key_to_action_should_map_x_in_normal_detail_pane_to_toggle_complete() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::Detail,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::ToggleComplete);
     }
 
     #[test]
