@@ -28,6 +28,14 @@ pub enum ConfigError {
     CreateConfigDir(#[source] io::Error),
 }
 
+/// Resolves bala's `ProjectDirs`, the shared starting point for both the
+/// data dir (`default_db_path`) and the config dir (`view_state_path`), so
+/// the `ProjectDirs::from("", "", "bala")` call itself lives in exactly one
+/// place.
+fn project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("", "", "bala")
+}
+
 /// Resolves the default SQLite database path (per-OS data dir + `bala.db`),
 /// creating the containing directory if it doesn't already exist.
 ///
@@ -36,7 +44,7 @@ pub enum ConfigError {
 /// Returns `Err` if no data directory can be determined for this OS, or if
 /// creating it fails.
 pub fn default_db_path() -> Result<PathBuf, ConfigError> {
-    let dirs = ProjectDirs::from("", "", "bala").ok_or(ConfigError::NoDataDir)?;
+    let dirs = project_dirs().ok_or(ConfigError::NoDataDir)?;
     let data_dir = dirs.data_dir();
     std::fs::create_dir_all(data_dir).map_err(ConfigError::CreateDataDir)?;
     Ok(data_dir.join("bala.db"))
@@ -51,7 +59,7 @@ pub fn default_db_path() -> Result<PathBuf, ConfigError> {
 /// Returns `Err` if no config directory can be determined for this OS, or if
 /// creating it fails.
 pub fn view_state_path() -> Result<PathBuf, ConfigError> {
-    let dirs = ProjectDirs::from("", "", "bala").ok_or(ConfigError::NoConfigDir)?;
+    let dirs = project_dirs().ok_or(ConfigError::NoConfigDir)?;
     let config_dir = dirs.config_dir();
     std::fs::create_dir_all(config_dir).map_err(ConfigError::CreateConfigDir)?;
     Ok(config_dir.join("view.toml"))
