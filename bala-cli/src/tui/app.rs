@@ -203,7 +203,9 @@ pub fn handle_key<S: Store>(app: &mut App, core: &mut Core<S>, key: KeyEvent) ->
 /// `DetailCursorUp` move `app.detail_field`; `StartEditTitle`/
 /// `StartEditDescription` enter `Mode::Insert` prefilled with the selected
 /// task's current title/description (empty string when there's no
-/// description). `Noop` does nothing.
+/// description). `OpenHelp` enters `Mode::Help`, remembering the current mode
+/// as `previous`; `CloseHelp` restores `previous` if `app` is currently in
+/// `Mode::Help`, otherwise it does nothing. `Noop` does nothing.
 pub fn apply_action<S: Store>(
     app: &mut App,
     core: &mut Core<S>,
@@ -298,6 +300,18 @@ pub fn apply_action<S: Store>(
         }
         Action::ToggleComplete => {
             handle_toggle_complete(app, core);
+            ControlFlow::Continue(())
+        }
+        Action::OpenHelp => {
+            app.mode = Mode::Help {
+                previous: Box::new(app.mode.clone()),
+            };
+            ControlFlow::Continue(())
+        }
+        Action::CloseHelp => {
+            if let Mode::Help { previous } = &app.mode {
+                app.mode = (**previous).clone();
+            }
             ControlFlow::Continue(())
         }
         Action::Noop => ControlFlow::Continue(()),
@@ -1099,6 +1113,79 @@ mod tests {
         let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
 
         assert_eq!(app.mode(), &Mode::Normal);
+    }
+
+    #[test]
+    fn apply_action_open_help_should_enter_help_mode_remembering_normal_as_previous() {
+        let mut app = App::new(vec![row("First")]);
+        let mut core = core();
+
+        let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
+
+        match app.mode() {
+            Mode::Help { previous } => assert_eq!(**previous, Mode::Normal),
+            other => panic!("expected Mode::Help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_action_open_help_from_confirm_mode_should_remember_confirm_as_previous() {
+        let task_row = row("Write docs");
+        let id = task_row.id;
+        let mut app = App::new(vec![task_row]);
+        let mut core = core();
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let confirm_mode = app.mode().clone();
+        assert!(matches!(confirm_mode, Mode::Confirm { .. }));
+
+        let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
+
+        match app.mode() {
+            Mode::Help { previous } => {
+                assert_eq!(**previous, confirm_mode);
+                match previous.as_ref() {
+                    Mode::Confirm { action, .. } => {
+                        assert_eq!(*action, crate::tui::mode::PendingAction::Delete(id));
+                    }
+                    other => panic!("expected Mode::Confirm, got {other:?}"),
+                }
+            }
+            other => panic!("expected Mode::Help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_action_close_help_should_restore_the_previous_mode() {
+        let mut app = App::new(vec![row("First")]);
+        let mut core = core();
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
+
+        let _ = apply_action(&mut app, &mut core, Action::CloseHelp);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.pane(), Pane::Detail);
+    }
+
+    #[test]
+    fn apply_action_close_help_opened_mid_insert_should_preserve_the_in_progress_buffer() {
+        let mut app = App::new(vec![row("First")]);
+        let mut core = core();
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewTitle);
+        let _ = apply_action(&mut app, &mut core, Action::InsertChar('H'));
+        let _ = apply_action(&mut app, &mut core, Action::InsertChar('i'));
+
+        let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
+        let _ = apply_action(&mut app, &mut core, Action::CloseHelp);
+
+        match app.mode() {
+            Mode::Insert { field, buffer } => {
+                assert_eq!(*field, EditableField::NewTitle);
+                assert_eq!(buffer, "Hi");
+            }
+            other => panic!("expected Mode::Insert with buffer preserved, got {other:?}"),
+        }
     }
 
     #[test]

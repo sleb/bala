@@ -46,6 +46,10 @@ instead of a blank screen.
 | `i` (in the Detail pane) | Edit the field under the cursor: opens a text-entry line prefilled with its current value. `Enter` submits, `Esc` cancels. |
 | `Esc` (in the Detail pane) | Leave the Detail pane, back to the list. |
 | `dd` (in the list) | Delete the selected task: press `d` twice in a row to prompt for confirmation. `y` confirms, `n`/`Esc` cancels. |
+| `x` / `Space` (in the list or Detail pane) | Toggle the selected task's complete/incomplete state. Completing a task with incomplete subtasks prompts for confirmation: `y` completes the whole cascade, `n`/`Esc` cancels. |
+| `?` | Open the help overlay, listing every key bound in the current mode. Not available in Insert mode, where `?` types a literal question mark — use `F1` there instead. |
+| `F1` (in a text-entry line) | Open the help overlay. |
+| `Esc` (in the help overlay) | Close the overlay and return to whatever you were doing. |
 | `q` | Quit, restoring the terminal to its normal state. |
 
 Selection stops at the first/last row rather than wrapping around.

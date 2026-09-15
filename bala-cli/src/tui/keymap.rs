@@ -55,8 +55,191 @@ pub enum Action {
     ConfirmYes,
     /// `Confirm` mode, `n`/`Esc`: cancel back to `Normal`.
     ConfirmNo,
+    /// `Normal` mode (either pane) or `Confirm` mode, `?`; `Insert` mode,
+    /// `F1`: open the keybinding help overlay.
+    OpenHelp,
+    /// `Help` mode, `Esc`: close the overlay, restoring the previous mode.
+    CloseHelp,
     /// No mapping for this key in this mode/pane.
     Noop,
+}
+
+/// A single key binding: the physical key(s) that trigger `action`, plus the
+/// human-facing text [`help_entries`] shows for it.
+///
+/// `label`/`description` are unused by dispatch itself (see
+/// [`key_to_action`]) but let [`help_entries`] read them straight off these
+/// tables rather than maintaining a hand-written second copy of the keymap.
+#[derive(Debug, Clone, Copy)]
+pub struct Binding {
+    /// The key(s) that trigger `action`. Multiple keys may map to the same
+    /// action (e.g. `j` and `Down` both move down).
+    pub keys: &'static [KeyCode],
+    /// The action this binding produces.
+    pub action: Action,
+    /// Short human-facing label for the key(s), e.g. `"j/↓"`.
+    pub label: &'static str,
+    /// Human-facing description of what the action does.
+    pub description: &'static str,
+}
+
+/// Bindings active in `Mode::Normal`, `Pane::List`.
+pub static NORMAL_LIST_BINDINGS: &[Binding] = &[
+    Binding {
+        keys: &[KeyCode::Char('j'), KeyCode::Down],
+        action: Action::MoveDown,
+        label: "j/↓",
+        description: "Move the selection down",
+    },
+    Binding {
+        keys: &[KeyCode::Char('k'), KeyCode::Up],
+        action: Action::MoveUp,
+        label: "k/↑",
+        description: "Move the selection up",
+    },
+    Binding {
+        keys: &[KeyCode::Char('q')],
+        action: Action::Quit,
+        label: "q",
+        description: "Quit, restoring the terminal to its normal state",
+    },
+    Binding {
+        keys: &[KeyCode::Char('O')],
+        action: Action::StartInsertNewTitle,
+        label: "O",
+        description: "Create a new top-level task",
+    },
+    Binding {
+        keys: &[KeyCode::Enter],
+        action: Action::EnterDetail,
+        label: "Enter",
+        description: "Open the Detail pane for the selected task",
+    },
+    Binding {
+        keys: &[KeyCode::Char('d')],
+        action: Action::DKeyPressed,
+        label: "dd",
+        description: "Delete the selected task (press d twice)",
+    },
+    Binding {
+        keys: &[KeyCode::Char('x'), KeyCode::Char(' ')],
+        action: Action::ToggleComplete,
+        label: "x/Space",
+        description: "Toggle complete/incomplete",
+    },
+    Binding {
+        keys: &[KeyCode::Char('?')],
+        action: Action::OpenHelp,
+        label: "?",
+        description: "Show the keybinding help overlay",
+    },
+];
+
+/// Bindings active in `Mode::Normal`, `Pane::Detail`.
+///
+/// Detail's `i` key is not listed here: it maps to `StartEditTitle` or
+/// `StartEditDescription` depending on `detail_field`, so it isn't a fixed
+/// key-to-action binding and is special-cased in [`key_to_action`] instead.
+pub static NORMAL_DETAIL_BINDINGS: &[Binding] = &[
+    Binding {
+        keys: &[KeyCode::Esc],
+        action: Action::LeaveDetail,
+        label: "Esc",
+        description: "Leave the Detail pane, back to the list",
+    },
+    Binding {
+        keys: &[KeyCode::Char('j'), KeyCode::Down],
+        action: Action::DetailCursorDown,
+        label: "j/↓",
+        description: "Move the field cursor down",
+    },
+    Binding {
+        keys: &[KeyCode::Char('k'), KeyCode::Up],
+        action: Action::DetailCursorUp,
+        label: "k/↑",
+        description: "Move the field cursor up",
+    },
+    Binding {
+        keys: &[KeyCode::Char('q')],
+        action: Action::Quit,
+        label: "q",
+        description: "Quit, restoring the terminal to its normal state",
+    },
+    Binding {
+        keys: &[KeyCode::Char('x'), KeyCode::Char(' ')],
+        action: Action::ToggleComplete,
+        label: "x/Space",
+        description: "Toggle complete/incomplete",
+    },
+    Binding {
+        keys: &[KeyCode::Char('?')],
+        action: Action::OpenHelp,
+        label: "?",
+        description: "Show the keybinding help overlay",
+    },
+];
+
+/// Bindings active in `Mode::Insert`.
+///
+/// The generic `Char(c)` catch-all (any other character maps to
+/// `Action::InsertChar(c)`) isn't a fixed key either, so it's handled as a
+/// fallback in [`key_to_action`] after this table.
+pub static INSERT_BINDINGS: &[Binding] = &[
+    Binding {
+        keys: &[KeyCode::Esc],
+        action: Action::CancelInsert,
+        label: "Esc",
+        description: "Discard the edit and return",
+    },
+    Binding {
+        keys: &[KeyCode::Enter],
+        action: Action::SubmitInsert,
+        label: "Enter",
+        description: "Submit the edit",
+    },
+    Binding {
+        keys: &[KeyCode::Backspace],
+        action: Action::Backspace,
+        label: "Backspace",
+        description: "Remove the last character",
+    },
+    Binding {
+        keys: &[KeyCode::F(1)],
+        action: Action::OpenHelp,
+        label: "F1",
+        description: "Show the keybinding help overlay",
+    },
+];
+
+/// Bindings active in `Mode::Confirm`.
+pub static CONFIRM_BINDINGS: &[Binding] = &[
+    Binding {
+        keys: &[KeyCode::Char('y')],
+        action: Action::ConfirmYes,
+        label: "y",
+        description: "Confirm",
+    },
+    Binding {
+        keys: &[KeyCode::Char('n'), KeyCode::Esc],
+        action: Action::ConfirmNo,
+        label: "n/Esc",
+        description: "Cancel",
+    },
+    Binding {
+        keys: &[KeyCode::Char('?')],
+        action: Action::OpenHelp,
+        label: "?",
+        description: "Show the keybinding help overlay",
+    },
+];
+
+/// Looks up `code` in `bindings`, returning the first matching binding's
+/// action, or `None` if no binding covers `code`.
+fn lookup(bindings: &[Binding], code: KeyCode) -> Option<Action> {
+    bindings
+        .iter()
+        .find(|binding| binding.keys.contains(&code))
+        .map(|binding| binding.action)
 }
 
 /// Maps `key` to an `Action`, given the current `mode`, `pane`, and (when in
@@ -70,41 +253,88 @@ pub enum Action {
 pub fn key_to_action(mode: &Mode, pane: Pane, detail_field: DetailField, key: KeyEvent) -> Action {
     match mode {
         Mode::Normal => match pane {
-            Pane::List => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
-                KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
-                KeyCode::Char('q') => Action::Quit,
-                KeyCode::Char('O') => Action::StartInsertNewTitle,
-                KeyCode::Enter => Action::EnterDetail,
-                KeyCode::Char('d') => Action::DKeyPressed,
-                KeyCode::Char('x' | ' ') => Action::ToggleComplete,
-                _ => Action::Noop,
-            },
-            Pane::Detail => match key.code {
-                KeyCode::Esc => Action::LeaveDetail,
-                KeyCode::Char('j') | KeyCode::Down => Action::DetailCursorDown,
-                KeyCode::Char('k') | KeyCode::Up => Action::DetailCursorUp,
-                KeyCode::Char('q') => Action::Quit,
-                KeyCode::Char('i') => match detail_field {
-                    DetailField::Title => Action::StartEditTitle,
-                    DetailField::Description => Action::StartEditDescription,
-                },
-                KeyCode::Char('x' | ' ') => Action::ToggleComplete,
-                _ => Action::Noop,
-            },
+            Pane::List => lookup(NORMAL_LIST_BINDINGS, key.code).unwrap_or(Action::Noop),
+            Pane::Detail => {
+                if key.code == KeyCode::Char('i') {
+                    return match detail_field {
+                        DetailField::Title => Action::StartEditTitle,
+                        DetailField::Description => Action::StartEditDescription,
+                    };
+                }
+                lookup(NORMAL_DETAIL_BINDINGS, key.code).unwrap_or(Action::Noop)
+            }
         },
-        Mode::Insert { .. } => match key.code {
-            KeyCode::Esc => Action::CancelInsert,
-            KeyCode::Enter => Action::SubmitInsert,
-            KeyCode::Backspace => Action::Backspace,
+        Mode::Insert { .. } => lookup(INSERT_BINDINGS, key.code).unwrap_or(match key.code {
             KeyCode::Char(c) => Action::InsertChar(c),
             _ => Action::Noop,
-        },
-        Mode::Confirm { .. } => match key.code {
-            KeyCode::Char('y') => Action::ConfirmYes,
-            KeyCode::Char('n') | KeyCode::Esc => Action::ConfirmNo,
+        }),
+        Mode::Confirm { .. } => lookup(CONFIRM_BINDINGS, key.code).unwrap_or(Action::Noop),
+        Mode::Help { .. } => match key.code {
+            KeyCode::Esc => Action::CloseHelp,
             _ => Action::Noop,
         },
+    }
+}
+
+/// The description shown for the Detail pane's `i` key given which field is
+/// under the cursor.
+///
+/// This matches on the same [`DetailField`] variants that [`key_to_action`]'s
+/// Detail-pane `i` handling matches on, so adding a new `DetailField` variant
+/// makes both `match`es non-exhaustive and fail to compile until both are
+/// updated — the two descriptions of "what `i` does" can't silently drift
+/// apart.
+fn detail_edit_label(field: DetailField) -> &'static str {
+    match field {
+        DetailField::Title => "Edit title",
+        DetailField::Description => "Edit description",
+    }
+}
+
+/// One row of a help overlay listing: a key label and what it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelpEntry {
+    /// Short human-facing label for the key(s), e.g. `"j/↓"`.
+    pub key: &'static str,
+    /// Human-facing description of what the action does.
+    pub description: &'static str,
+}
+
+impl From<&Binding> for HelpEntry {
+    fn from(binding: &Binding) -> Self {
+        HelpEntry {
+            key: binding.label,
+            description: binding.description,
+        }
+    }
+}
+
+/// Builds the help overlay's key listing for the mode/pane/field the overlay
+/// is showing keys for.
+///
+/// `mode` is the mode `Mode::Help`'s `previous` holds, not `Help` itself:
+/// callers pass along whatever mode Help is fronting for so the listing
+/// reflects the keys that will apply once the overlay is closed. Entries are
+/// generated straight from the same [`Binding`] tables [`key_to_action`]
+/// dispatches from, so the listing can't drift from actual dispatch.
+#[must_use]
+pub fn help_entries(mode: &Mode, pane: Pane, detail_field: DetailField) -> Vec<HelpEntry> {
+    match mode {
+        Mode::Normal => match pane {
+            Pane::List => NORMAL_LIST_BINDINGS.iter().map(HelpEntry::from).collect(),
+            Pane::Detail => {
+                let mut entries: Vec<HelpEntry> =
+                    NORMAL_DETAIL_BINDINGS.iter().map(HelpEntry::from).collect();
+                entries.push(HelpEntry {
+                    key: "i",
+                    description: detail_edit_label(detail_field),
+                });
+                entries
+            }
+        },
+        Mode::Insert { .. } => INSERT_BINDINGS.iter().map(HelpEntry::from).collect(),
+        Mode::Confirm { .. } => CONFIRM_BINDINGS.iter().map(HelpEntry::from).collect(),
+        Mode::Help { .. } => vec![],
     }
 }
 
@@ -112,7 +342,7 @@ pub fn key_to_action(mode: &Mode, pane: Pane, detail_field: DetailField, key: Ke
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{Action, key_to_action};
+    use super::{Action, help_entries, key_to_action};
     use crate::tui::mode::{DetailField, EditableField, Mode, Pane};
 
     #[test]
@@ -359,5 +589,172 @@ mod tests {
         );
 
         assert_eq!(action, Action::ConfirmNo);
+    }
+
+    #[test]
+    fn key_to_action_should_map_question_mark_in_normal_list_to_open_help() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::OpenHelp);
+    }
+
+    #[test]
+    fn key_to_action_should_map_question_mark_in_normal_detail_to_open_help() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::Detail,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::OpenHelp);
+    }
+
+    #[test]
+    fn key_to_action_should_map_question_mark_in_confirm_mode_to_open_help() {
+        let mode = Mode::Confirm {
+            prompt: "Delete \"Task\"? (y/n)".to_string(),
+            action: crate::tui::mode::PendingAction::Delete(bala_core::TaskId::new()),
+        };
+
+        let action = key_to_action(
+            &mode,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::OpenHelp);
+    }
+
+    #[test]
+    fn key_to_action_should_map_f1_in_insert_mode_to_open_help() {
+        let mode = Mode::Insert {
+            field: EditableField::NewTitle,
+            buffer: String::new(),
+        };
+
+        let action = key_to_action(
+            &mode,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::OpenHelp);
+    }
+
+    #[test]
+    fn key_to_action_should_still_map_question_mark_char_in_insert_mode_to_insert_char() {
+        let mode = Mode::Insert {
+            field: EditableField::NewTitle,
+            buffer: String::new(),
+        };
+
+        let action = key_to_action(
+            &mode,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::InsertChar('?'));
+    }
+
+    #[test]
+    fn key_to_action_should_map_esc_in_help_mode_to_close_help() {
+        let mode = Mode::Help {
+            previous: Box::new(Mode::Normal),
+        };
+
+        let action = key_to_action(
+            &mode,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::CloseHelp);
+    }
+
+    #[test]
+    fn help_entries_for_normal_list_should_include_move_and_delete_and_toggle_bindings() {
+        let entries = help_entries(&Mode::Normal, Pane::List, DetailField::Title);
+
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "j/↓" && e.description == "Move the selection down")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "dd" && e.description.contains("Delete"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "x/Space" && e.description == "Toggle complete/incomplete")
+        );
+    }
+
+    #[test]
+    fn help_entries_for_normal_detail_should_describe_i_binding_by_focused_field() {
+        let title_entries = help_entries(&Mode::Normal, Pane::Detail, DetailField::Title);
+        let description_entries =
+            help_entries(&Mode::Normal, Pane::Detail, DetailField::Description);
+
+        assert!(
+            title_entries
+                .iter()
+                .any(|e| e.key == "i" && e.description == "Edit title")
+        );
+        assert!(
+            description_entries
+                .iter()
+                .any(|e| e.key == "i" && e.description == "Edit description")
+        );
+    }
+
+    #[test]
+    fn help_entries_for_insert_should_include_f1_and_exclude_open_help_from_normal_list() {
+        let mode = Mode::Insert {
+            field: EditableField::NewTitle,
+            buffer: String::new(),
+        };
+
+        let entries = help_entries(&mode, Pane::List, DetailField::Title);
+
+        assert!(entries.iter().any(|e| e.key == "F1"));
+        assert!(!entries.iter().any(|e| e.key == "?"));
+    }
+
+    #[test]
+    fn help_entries_for_confirm_should_include_y_and_n_bindings() {
+        let mode = Mode::Confirm {
+            prompt: "Delete \"Task\"? (y/n)".to_string(),
+            action: crate::tui::mode::PendingAction::Delete(bala_core::TaskId::new()),
+        };
+
+        let entries = help_entries(&mode, Pane::List, DetailField::Title);
+
+        assert!(entries.iter().any(|e| e.key == "y"));
+        assert!(entries.iter().any(|e| e.key == "n/Esc"));
+    }
+
+    #[test]
+    fn help_entries_for_help_mode_should_return_empty() {
+        let mode = Mode::Help {
+            previous: Box::new(Mode::Normal),
+        };
+
+        let entries = help_entries(&mode, Pane::List, DetailField::Title);
+
+        assert!(entries.is_empty());
     }
 }

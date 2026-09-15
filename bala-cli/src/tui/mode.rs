@@ -23,6 +23,11 @@ pub enum Mode {
         prompt: String,
         action: PendingAction,
     },
+    /// The keybinding help overlay, entered from any other mode with `?`
+    /// (or `F1` from `Insert`) and left with `Esc`, restoring `previous`.
+    Help {
+        previous: Box<Mode>,
+    },
 }
 
 /// An action awaiting `y`/`n` confirmation in `Mode::Confirm`.
