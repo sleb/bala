@@ -304,19 +304,21 @@ fn run_task_ls(db_path: &Path) -> Result<(), CliError> {
         .map(|user| (user.id, user.name))
         .collect();
     for task in &tasks {
-        // Minimal nesting: indent one level under a task's first parent
-        // (if any) so a child visibly nests under it — full recursive tree
-        // layout is the TUI's job later.
-        let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-        println!("{}", format_task_line(task, indent, &names));
+        println!("{}", format_task_line(task, &names));
     }
     Ok(())
 }
 
 /// Renders the one-line summary shared by `task ls`/`edit`/`delete`/
-/// `restore`/`complete`: `"{indent}[{marker}] {id} {title}{assignee_suffix}"`,
-/// where `marker` is `x` for a completed task and a space otherwise.
-fn format_task_line(task: &Task, indent: &str, names: &HashMap<UserId, String>) -> String {
+/// `restore`/`complete`/`reopen`:
+/// `"{indent}[{marker}] {id} {title}{assignee_suffix}"`, where `marker` is
+/// `x` for a completed task and a space otherwise, and `indent` nests one
+/// level under a task's first parent (if any) so a child visibly nests
+/// under it — full recursive tree layout is the TUI's job later. Indent is
+/// derived from the task itself rather than taken as a parameter so every
+/// call site computes it the same way.
+fn format_task_line(task: &Task, names: &HashMap<UserId, String>) -> String {
+    let indent = if task.parent_ids.is_empty() { "" } else { "  " };
     let assignee = task
         .assignee_id
         .and_then(|id| names.get(&id))
@@ -351,8 +353,7 @@ fn run_task_edit(db_path: &Path, args: EditArgs) -> Result<(), CliError> {
         .map(|user| (user.id, user.name))
         .collect();
     for task in &updated {
-        let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-        println!("{}", format_task_line(task, indent, &names));
+        println!("{}", format_task_line(task, &names));
     }
     Ok(())
 }
@@ -421,8 +422,7 @@ fn run_task_restore(db_path: &Path, args: &RestoreArgs) -> Result<(), CliError> 
         .into_iter()
         .map(|user| (user.id, user.name))
         .collect();
-    let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-    println!("{}", format_task_line(&task, indent, &names));
+    println!("{}", format_task_line(&task, &names));
     Ok(())
 }
 
@@ -435,8 +435,7 @@ fn run_task_complete(db_path: &Path, args: &CompleteArgs) -> Result<(), CliError
         .map(|user| (user.id, user.name))
         .collect();
     for task in &completed {
-        let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-        println!("{}", format_task_line(task, indent, &names));
+        println!("{}", format_task_line(task, &names));
     }
     Ok(())
 }
@@ -449,8 +448,7 @@ fn run_task_reopen(db_path: &Path, args: &ReopenArgs) -> Result<(), CliError> {
         .into_iter()
         .map(|user| (user.id, user.name))
         .collect();
-    let indent = if task.parent_ids.is_empty() { "" } else { "  " };
-    println!("{}", format_task_line(&task, indent, &names));
+    println!("{}", format_task_line(&task, &names));
     Ok(())
 }
 
