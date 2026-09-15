@@ -64,6 +64,8 @@
 4. Completing a task unblocks any dependent tasks waiting on it (see Epic 4).
 5. Completion timestamp is recorded.
 
+**Note:** This story shipped only the forward transition (`Core::complete_task`, Incomplete → Complete). Reverting a completed task back to incomplete had no Core method until Story 2.3 added `reopen_task`, once the TUI needed a real toggle rather than a one-way mark.
+
 ---
 
 ## Epic 2: TUI Implementation
@@ -94,7 +96,7 @@
 **Description:** As a user, I want to toggle a task's completion and confirm risky actions from the keyboard, so that I don't lose work by accident.
 
 **Acceptance Criteria:**
-1. A dedicated key toggles the selected task's complete/incomplete state (Story 1.4).
+1. A dedicated key toggles the selected task's complete/incomplete state (Story 1.4), calling the new `Core::reopen_task` when reverting from Complete to Incomplete — Core had no path back from Complete until this story added it.
 2. Destructive or hard-to-reverse actions (delete, completing a task with incomplete subtasks) route through one Confirm mode with a `y`/`n` prompt.
 3. Confirm mode's prompt states the specific consequence of the pending action before the user answers.
 4. `Esc` or `n` in Confirm mode cancels with no state change.
