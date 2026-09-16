@@ -15,7 +15,7 @@ workspace = true
 bala-core = { path = "../bala-core" }
 bala-store = { path = "../bala-store" }
 clap = { version = "4", features = ["derive"] }
-directories = "5"
+directories = "6"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"

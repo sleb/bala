@@ -9,7 +9,7 @@ workspace = true
 
 [dependencies]
 bala-core = { path = "../bala-core" }
-rusqlite = { version = "0.32", features = ["bundled"] }
-refinery = { version = "0.8", features = ["rusqlite"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+refinery = { version = "0.9", features = ["rusqlite"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
