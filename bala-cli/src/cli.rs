@@ -362,21 +362,10 @@ fn run_task_delete(db_path: &Path, args: &DeleteArgs) -> Result<(), CliError> {
     let mut core = open_core(db_path)?;
     let target_id = TaskId::from(args.id);
 
-    // `Core` exposes no single-task lookup or "children of id" method, so
-    // finding the target and its children both require scanning the full
-    // tree — but one fetch is enough for both; the CLI-level inefficiency
-    // this replaces was calling `get_tree` twice for the same snapshot.
-    let mut tasks = core.get_tree(TreeFilter::default())?;
-    let target_index = tasks
-        .iter()
-        .position(|task| task.id == target_id)
+    let target = core
+        .get_task(target_id)?
         .ok_or(CoreError::NotFound(target_id))?;
-    let target = tasks.swap_remove(target_index);
-
-    let children: Vec<Task> = tasks
-        .into_iter()
-        .filter(|task| task.parent_ids.contains(&target_id))
-        .collect();
+    let children = core.list_children(target_id)?;
 
     let mode = match (args.cascade, args.promote_children) {
         (true, _) => DeleteMode::Subtree,

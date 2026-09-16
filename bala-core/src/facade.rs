@@ -170,6 +170,44 @@ impl<S: Store> Core<S> {
         Ok(task)
     }
 
+    /// Looks up a task by id.
+    ///
+    /// A thin pass-through to [`StoreTx::get_task`]: like every other read
+    /// in this module (`update_task`, `delete_task`, `complete_task`), a
+    /// soft-deleted task reads as `Ok(None)`, not `Ok(Some(_))` — use
+    /// `Store::get_task_including_deleted` directly (as `restore_task`
+    /// does) if a tombstoned task must still be found.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    pub fn get_task(&self, id: TaskId) -> Result<Option<Task>, CoreError> {
+        Ok(self.store.transaction(|tx| tx.get_task(id))?)
+    }
+
+    /// Lists `id`'s direct children only — not grandchildren or any deeper
+    /// descendant.
+    ///
+    /// A thin pass-through composing [`StoreTx::list_child_edges`] with
+    /// [`StoreTx::get_task`]: an id with no recorded child edges returns an
+    /// empty `Vec`, not an error, matching `list_child_edges`'s own
+    /// convention. A child edge whose task no longer resolves via
+    /// `get_task` (soft-deleted or otherwise missing) is silently skipped,
+    /// mirroring how `incomplete_descendants` and `mark_complete_subtree`
+    /// already treat a missing lookup elsewhere in this module.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    pub fn list_children(&self, id: TaskId) -> Result<Vec<Task>, CoreError> {
+        Ok(self.store.transaction(|tx| {
+            tx.list_child_edges(id)?
+                .into_iter()
+                .filter_map(|child_id| tx.get_task(child_id).transpose())
+                .collect::<Result<Vec<Task>, StoreError>>()
+        })?)
+    }
+
     /// Lists tasks matching `filter`.
     ///
     /// Scoped to this checkpoint: a thin pass-through to
@@ -1927,5 +1965,77 @@ mod tests {
 
         assert_eq!(touched.len(), 5001);
         assert!(touched.iter().all(|t| t.status == TaskStatus::Complete));
+    }
+
+    #[test]
+    fn get_task_should_return_none_when_task_not_found() {
+        let core = new_core();
+        let missing = TaskId::new();
+
+        let result = core.get_task(missing);
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn get_task_should_return_the_task_when_it_exists() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let result = core.get_task(task.id).unwrap();
+
+        assert_eq!(result, Some(task));
+    }
+
+    #[test]
+    fn get_task_should_return_none_for_soft_deleted_task() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        core.delete_task(task.id, DeleteMode::Subtree).unwrap();
+
+        let result = core.get_task(task.id);
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn list_children_should_return_empty_vec_when_task_has_no_children() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Leaf")).unwrap();
+
+        let children = core.list_children(task.id).unwrap();
+
+        assert!(children.is_empty());
+    }
+
+    #[test]
+    fn list_children_should_return_only_direct_children_not_grandchildren() {
+        let mut core = new_core();
+        let root = core.create_task(minimal_new_task("Root")).unwrap();
+        let mid = core
+            .create_task(NewTask {
+                parent_ids: vec![root.id],
+                ..minimal_new_task("Mid")
+            })
+            .unwrap();
+        core.create_task(NewTask {
+            parent_ids: vec![mid.id],
+            ..minimal_new_task("Leaf")
+        })
+        .unwrap();
+
+        let children = core.list_children(root.id).unwrap();
+
+        assert_eq!(children, vec![mid]);
+    }
+
+    #[test]
+    fn list_children_should_return_empty_vec_for_unknown_task_id() {
+        let core = new_core();
+        let missing = TaskId::new();
+
+        let children = core.list_children(missing).unwrap();
+
+        assert!(children.is_empty());
     }
 }

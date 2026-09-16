@@ -265,6 +265,8 @@ impl<S: Store> Core<S> {
     pub fn reopen_task(&mut self, id: TaskId) -> Result<Task, CoreError>;
     pub fn preview_cascade(&self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError>;
     pub fn get_tree(&self, filter: TreeFilter) -> Result<Vec<Task>, CoreError>;
+    pub fn get_task(&self, id: TaskId) -> Result<Option<Task>, CoreError>;
+    pub fn list_children(&self, id: TaskId) -> Result<Vec<Task>, CoreError>;
     pub fn list_task_types(&self) -> Result<Vec<TaskType>, CoreError>;
     pub fn upsert_task_type(&mut self, t: TaskType) -> Result<TaskType, CoreError>;
 }
