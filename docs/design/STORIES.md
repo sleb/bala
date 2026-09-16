@@ -70,9 +70,11 @@
 
 ## Epic 2: TUI Implementation
 
+[![Epic 2 progress](https://img.shields.io/github/milestones/progress-percent/sleb/bala/2)](https://github.com/sleb/bala/milestone/2)
+
 **Design:** [LLD-3: CLI/TUI Client](./cli-tui-client.md)
 
-### Story 2.1 — Launch the TUI and Browse the Task List
+### Story 2.1 — Launch the TUI and Browse the Task List [![Issue #24](https://img.shields.io/github/issues/detail/state/sleb/bala/24)](https://github.com/sleb/bala/issues/24)
 **Description:** As a user, I want to launch bala's terminal UI and see my tasks in a navigable list, so that I can work without memorizing CLI subcommands.
 
 **Acceptance Criteria:**
@@ -82,7 +84,7 @@
 4. `q` quits the TUI cleanly, restoring the terminal to its normal state.
 5. An empty task list shows a clear "no tasks yet" state rather than a blank screen.
 
-### Story 2.2 — Create, Edit, and Delete Tasks from the TUI
+### Story 2.2 — Create, Edit, and Delete Tasks from the TUI [![Issue #25](https://img.shields.io/github/issues/detail/state/sleb/bala/25)](https://github.com/sleb/bala/issues/25)
 **Description:** As a user, I want to create, edit, and delete tasks using only the keyboard, so that I can manage work without leaving the terminal UI.
 
 **Acceptance Criteria:**
@@ -92,7 +94,7 @@
 4. A dedicated key sequence prompts for confirmation before deleting the selected task (Story 1.3).
 5. Validation errors (e.g., empty title) are shown inline in the entry field and block save, without crashing or corrupting terminal state.
 
-### Story 2.3 — Mark Tasks Complete and Confirm Destructive Actions in the TUI
+### Story 2.3 — Mark Tasks Complete and Confirm Destructive Actions in the TUI [![Issue #26](https://img.shields.io/github/issues/detail/state/sleb/bala/26)](https://github.com/sleb/bala/issues/26)
 **Description:** As a user, I want to toggle a task's completion and confirm risky actions from the keyboard, so that I don't lose work by accident.
 
 **Acceptance Criteria:**
@@ -109,7 +111,7 @@
 1. `bala task reopen <id>` maps directly onto `Core::reopen_task`, mirroring `bala task complete`'s shape and output.
 2. An unknown task id fails with a nonzero exit and the standard `NotFound` stderr rendering (§Error Rendering).
 
-### Story 2.4 — Persist TUI View State Across Sessions
+### Story 2.4 — Persist TUI View State Across Sessions [![Issue #27](https://img.shields.io/github/issues/detail/state/sleb/bala/27)](https://github.com/sleb/bala/issues/27)
 **Description:** As a user, I want the TUI to remember my last view when I relaunch it, so that I don't have to re-navigate to where I left off.
 
 **Acceptance Criteria:**
@@ -123,7 +125,7 @@ fields — those are added when Epics 3/4/5 give the TUI's `App` the
 corresponding state to persist. This story ships `selected` only, in a
 TOML shape (`[tree]` table) that extends without a format break.
 
-### Story 2.5 — Discover TUI Keybindings via a Help Overlay
+### Story 2.5 — Discover TUI Keybindings via a Help Overlay [![Issue #28](https://img.shields.io/github/issues/detail/state/sleb/bala/28)](https://github.com/sleb/bala/issues/28)
 **Description:** As a user, I want an in-app reference for the TUI's keybindings, so that I can learn the controls without leaving the app or reading external docs.
 
 **Acceptance Criteria:**
