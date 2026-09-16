@@ -138,7 +138,9 @@ TOML shape (`[tree]` table) that extends without a format break.
 
 ## Epic 3: Nested Task Hierarchy
 
-### Story 3.1 — Add a Subtask to Any Task
+[![Epic 3 progress](https://img.shields.io/github/milestones/progress-percent/sleb/bala/3)](https://github.com/sleb/bala/milestone/3)
+
+### Story 3.1 — Add a Subtask to Any Task [![Issue #37](https://img.shields.io/github/issues/detail/state/sleb/bala/37)](https://github.com/sleb/bala/issues/37)
 **Description:** As a user, I want to add a subtask under any existing task, so that I can break work into smaller pieces at any depth.
 
 **Acceptance Criteria:**
@@ -148,7 +150,7 @@ TOML shape (`[tree]` table) that extends without a format break.
 4. A task can be moved to become a subtask of another task (re-parenting), and vice versa (promoted to top-level).
 5. Circular nesting (a task becoming its own ancestor) is prevented with a clear error.
 
-### Story 3.2 — Collapse/Expand Task Tree
+### Story 3.2 — Collapse/Expand Task Tree [![Issue #38](https://img.shields.io/github/issues/detail/state/sleb/bala/38)](https://github.com/sleb/bala/issues/38)
 **Description:** As a user, I want to collapse and expand branches of the task tree, so that I can focus on relevant parts of a large project.
 
 **Acceptance Criteria:**
@@ -159,7 +161,7 @@ TOML shape (`[tree]` table) that extends without a format break.
 5. Deeply nested trees (5+ levels) remain navigable without performance lag on reasonable list sizes.
 6. Completed tasks are visually distinguished in the tree view, matching the indication used in the list view (Story 1.4).
 
-### Story 3.3 — Roll Up Progress from Subtasks
+### Story 3.3 — Roll Up Progress from Subtasks [![Issue #39](https://img.shields.io/github/issues/detail/state/sleb/bala/39)](https://github.com/sleb/bala/issues/39)
 **Description:** As a user, I want a parent task's progress to reflect its subtasks' completion, so that I can see overall status at a glance.
 
 **Acceptance Criteria:**
@@ -169,7 +171,7 @@ TOML shape (`[tree]` table) that extends without a format break.
 4. Parent's own completion is independent of the rollup number unless explicitly configured otherwise.
 5. Empty parent (no subtasks) shows no rollup or defaults to its own status.
 
-### Story 3.4 — Label a Task's Type/Level
+### Story 3.4 — Label a Task's Type/Level [![Issue #40](https://img.shields.io/github/issues/detail/state/sleb/bala/40)](https://github.com/sleb/bala/issues/40)
 **Description:** As a user, I want to tag a task with a level such as Initiative, Goal, Project, Story, or Task, so that I can tell at a glance what kind of work a node in the hierarchy represents.
 
 **Acceptance Criteria:**
