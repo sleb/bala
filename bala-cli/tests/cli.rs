@@ -637,3 +637,251 @@ fn task_ls_should_show_incomplete_marker_for_a_new_task() {
         .success()
         .stdout(contains("[ ]").and(contains("Fresh task")));
 }
+
+#[test]
+fn task_mv_should_reparent_task_and_show_new_parent_in_ls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let movable_id = add_task(&db_path, &["--title", "Task A"]);
+    let new_parent_id = add_task(&db_path, &["--title", "Task B"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "mv", &movable_id, "--parents", &new_parent_id])
+        .assert()
+        .success();
+
+    let ls_output = bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ls_text = String::from_utf8(ls_output).unwrap();
+
+    let a_line = ls_text
+        .lines()
+        .find(|line| line.contains("Task A"))
+        .expect("task A line present");
+    let b_line = ls_text
+        .lines()
+        .find(|line| line.contains("Task B"))
+        .expect("task B line present");
+
+    let a_indent = a_line.len() - a_line.trim_start().len();
+    let b_indent = b_line.len() - b_line.trim_start().len();
+    assert!(
+        a_indent > b_indent,
+        "expected reparented task A to be indented more than top-level task B: a={a_line:?} b={b_line:?}"
+    );
+}
+
+#[test]
+fn task_mv_with_empty_parents_should_promote_to_top_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    let child_id = add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+
+    bala_cmd(&db_path)
+        .args(["task", "mv", &child_id])
+        .assert()
+        .success();
+
+    let ls_output = bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ls_text = String::from_utf8(ls_output).unwrap();
+
+    let child_line = ls_text
+        .lines()
+        .find(|line| line.contains("Child task"))
+        .expect("child line present");
+    let child_indent = child_line.len() - child_line.trim_start().len();
+    assert_eq!(
+        child_indent, 0,
+        "expected promoted child to be top-level (no indent): {child_line:?}"
+    );
+}
+
+#[test]
+fn task_add_with_inherit_should_copy_assignee_and_dates_from_first_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let user_id = String::from_utf8(
+        bala_cmd(&db_path)
+            .args(["user", "add", "--name", "Ada"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    let parent_id = add_task(
+        &db_path,
+        &[
+            "--title",
+            "Parent task",
+            "--assignee",
+            &user_id,
+            "--start",
+            "2026-01-01",
+            "--due",
+            "2026-01-31",
+        ],
+    );
+
+    add_task(
+        &db_path,
+        &["--title", "Child task", "--parent", &parent_id, "--inherit"],
+    );
+
+    // `task ls` doesn't print start/due dates at all (see `format_task_line`
+    // in `bala-cli/src/cli.rs`), so the date-inheritance half of this
+    // behavior isn't observable through CLI stdout. The assignee-name
+    // suffix is, so that's what's asserted here as the observable proxy for
+    // "inherit actually ran".
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(
+            contains("Child task")
+                .and(contains("Ada"))
+                .and(contains(&user_id).not()),
+        );
+}
+
+#[test]
+fn task_add_with_inherit_and_explicit_assignee_should_prefer_explicit_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_user_id = String::from_utf8(
+        bala_cmd(&db_path)
+            .args(["user", "add", "--name", "Ada"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    let child_user_id = String::from_utf8(
+        bala_cmd(&db_path)
+            .args(["user", "add", "--name", "Grace"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    let parent_id = add_task(
+        &db_path,
+        &["--title", "Parent task", "--assignee", &parent_user_id],
+    );
+
+    add_task(
+        &db_path,
+        &[
+            "--title",
+            "Child task",
+            "--parent",
+            &parent_id,
+            "--inherit",
+            "--assignee",
+            &child_user_id,
+        ],
+    );
+
+    let ls_output = bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ls_text = String::from_utf8(ls_output).unwrap();
+
+    let child_line = ls_text
+        .lines()
+        .find(|line| line.contains("Child task"))
+        .expect("child line present");
+    assert!(
+        child_line.contains("Grace") && !child_line.contains("Ada"),
+        "expected child to show the explicit assignee, not the inherited one: {child_line:?}"
+    );
+}
+
+#[test]
+fn task_add_with_inherit_should_leave_fields_unset_when_parent_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+
+    add_task(
+        &db_path,
+        &["--title", "Child task", "--parent", &parent_id, "--inherit"],
+    );
+
+    let ls_output = bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ls_text = String::from_utf8(ls_output).unwrap();
+
+    let child_line = ls_text
+        .lines()
+        .find(|line| line.contains("Child task"))
+        .expect("child line present");
+    assert!(
+        !child_line.contains("assigned:"),
+        "expected child to have no assignee: {child_line:?}"
+    );
+}
+
+#[test]
+fn task_add_with_inherit_and_no_parent_should_fail_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    bala_cmd(&db_path)
+        .args(["task", "add", "--title", "X", "--inherit"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn task_mv_with_circular_parent_should_fail_with_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Task A"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "mv", &task_id, "--parents", &task_id])
+        .assert()
+        .failure();
+}

@@ -81,7 +81,8 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
                 ' '
             };
             let line = format!(
-                "[{marker}] {}  [{}]  {}",
+                "{}[{marker}] {}  [{}]  {}",
+                "  ".repeat(row.depth),
                 row.title,
                 row.type_label,
                 row.assignee_name.as_deref().unwrap_or("Unassigned")
@@ -117,6 +118,8 @@ fn draw_insert_input(frame: &mut Frame, app: &App, area: Rect) {
         EditableField::NewTitle => "New task",
         EditableField::Title(_) => "Title",
         EditableField::Description(_) => "Description",
+        EditableField::NewSubtaskTitle(_) => "New subtask",
+        EditableField::Parents(_) => "Parents (comma-separated ids)",
     };
     let [buffer_area, error_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -236,6 +239,7 @@ mod tests {
             type_label: "task".to_string(),
             status,
             assignee_name: None,
+            depth: 0,
         }
     }
 
@@ -266,6 +270,31 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let completed_row_style = buffer.cell((0, 1)).unwrap().style();
         assert!(completed_row_style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn draw_should_indent_nested_row_under_its_parent() {
+        let mut parent_row = row("Parent task", TaskStatus::Incomplete);
+        parent_row.depth = 0;
+        let mut child_row = row("Child task", TaskStatus::Incomplete);
+        child_row.depth = 1;
+        let app = App::new(vec![parent_row, child_row]);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let leading_spaces = |y: u16| -> usize {
+            (0..buffer.area().width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .take_while(|symbol| *symbol == " ")
+                .count()
+        };
+
+        let parent_leading_spaces = leading_spaces(0);
+        let child_leading_spaces = leading_spaces(1);
+        assert_eq!(child_leading_spaces, parent_leading_spaces + 2);
     }
 
     #[test]

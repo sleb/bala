@@ -2,9 +2,9 @@
 //! point every caller (CLI today, Web API later) drives.
 //!
 //! Scoped to exactly what Story 1.1 needs: `create_task`, `get_tree`, and
-//! thin `TaskType` pass-throughs. `set_parents`, dependency methods,
-//! cascade, rollup, and `complete_task` belong to later stories/epics and
-//! are deliberately absent.
+//! thin `TaskType` pass-throughs. Dependency methods, cascade, and rollup
+//! belong to later stories/epics and are deliberately absent.
+//! `set_parents` (Story 3.1) is the bulk, atomic reparent method.
 
 use chrono::Utc;
 
@@ -103,6 +103,12 @@ impl<S: Store> Core<S> {
     ///   existing task.
     /// - [`CoreError::UnknownUser`] if `new.assignee_id` is `Some` and
     ///   names no existing [`User`].
+    /// - [`CoreError::CircularHierarchy`] if any of `new.parent_ids` would
+    ///   make the new task its own ancestor — not reachable in practice
+    ///   today, since a brand-new [`TaskId`] can never already be an
+    ///   ancestor of anything, but [`hierarchy::check_new_parent`] runs
+    ///   unconditionally so this stays true once a later checkpoint's
+    ///   `set_parents` can reattach an *existing* task.
     /// - [`CoreError::Store`] if the backend fails.
     pub fn create_task(&mut self, new: NewTask) -> Result<Task, CoreError> {
         if new.title.trim().is_empty() {
@@ -161,11 +167,13 @@ impl<S: Store> Core<S> {
         self.store.transaction(|tx| {
             tx.put_task(&task)?;
             for &parent_id in &task.parent_ids {
-                check_new_parent(tx, parent_id, task.id)?;
+                if let Err(e) = check_new_parent(tx, parent_id, task.id) {
+                    return Ok(Err(e));
+                }
                 tx.add_parent_edge(parent_id, task.id)?;
             }
-            Ok(())
-        })?;
+            Ok(Ok(()))
+        })??;
 
         Ok(task)
     }
@@ -559,6 +567,58 @@ impl<S: Store> Core<S> {
 
         Ok(touched)
     }
+
+    /// Bulk, atomic reparent per LLD §Method Contract (AC4, AC5): replaces
+    /// `id`'s entire parent set with `new_parents` in one commit.
+    ///
+    /// Every candidate in `new_parents` is checked — for existence and for
+    /// the hierarchy invariant via [`check_new_parent`] — before any edge is
+    /// touched, so a bad candidate anywhere in the list (existence failure
+    /// or a would-be cycle) leaves `id`'s existing parent edges completely
+    /// untouched rather than partially reparented. An empty `new_parents`
+    /// promotes `id` to top-level.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::NotFound`] if `id`, or any entry in `new_parents`,
+    ///   names no existing task.
+    /// - [`CoreError::CircularHierarchy`] if attaching `id` under any entry
+    ///   in `new_parents` would make `id` its own ancestor.
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn set_parents(&mut self, id: TaskId, new_parents: Vec<TaskId>) -> Result<Task, CoreError> {
+        let task = self.store.transaction(|tx| {
+            let Some(mut task) = tx.get_task(id)? else {
+                return Ok(Err(CoreError::NotFound(id)));
+            };
+
+            for &candidate in &new_parents {
+                if tx.get_task(candidate)?.is_none() {
+                    return Ok(Err(CoreError::NotFound(candidate)));
+                }
+            }
+
+            for &candidate in &new_parents {
+                if let Err(e) = check_new_parent(tx, candidate, id) {
+                    return Ok(Err(e));
+                }
+            }
+
+            for &old_parent in &task.parent_ids {
+                tx.remove_parent_edge(old_parent, id)?;
+            }
+            for &new_parent in &new_parents {
+                tx.add_parent_edge(new_parent, id)?;
+            }
+
+            task.parent_ids = new_parents;
+            task.updated_at = Utc::now();
+            tx.put_task(&task)?;
+
+            Ok(Ok(task))
+        })??;
+
+        Ok(task)
+    }
 }
 
 /// Collects the ids of every descendant of `id`, at any depth, whose
@@ -839,13 +899,13 @@ mod tests {
 
     #[test]
     fn create_task_should_run_hierarchy_check_for_each_given_parent() {
-        // The hierarchy check is a no-op at this checkpoint (Story 3.1
-        // gives it teeth), so the honest thing to assert here is that
-        // attaching a task under several parents in one call still
-        // succeeds and records every edge — i.e. the per-parent check
+        // A freshly created task has no existing edges, so it can never
+        // already be an ancestor of any of its given parents — this
+        // asserts that attaching it under several parents in one call
+        // succeeds and records every edge, i.e. the per-parent check
         // (`hierarchy::check_new_parent`) runs without rejecting any of
-        // them. `hierarchy::tests::check_new_parent_always_succeeds_for_a_fresh_child`
-        // separately unit-tests the function itself.
+        // them. `hierarchy::tests` separately unit-tests the cycle-rejection
+        // paths of the function itself.
         let mut core = new_core();
         let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
         let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
@@ -2037,5 +2097,146 @@ mod tests {
         let children = core.list_children(missing).unwrap();
 
         assert!(children.is_empty());
+    }
+
+    #[test]
+    fn set_parents_should_reject_when_task_not_found() {
+        let mut core = new_core();
+        let missing = TaskId::new();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+
+        let result = core.set_parents(missing, vec![parent.id]);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
+    #[test]
+    fn set_parents_should_reject_when_new_parent_does_not_exist() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let missing_parent = TaskId::new();
+
+        let result = core.set_parents(task.id, vec![missing_parent]);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing_parent));
+    }
+
+    #[test]
+    fn set_parents_should_replace_existing_parents_with_new_ones() {
+        let mut core = new_core();
+        let old_parent = core.create_task(minimal_new_task("Old parent")).unwrap();
+        let new_parent = core.create_task(minimal_new_task("New parent")).unwrap();
+        let task = core
+            .create_task(NewTask {
+                parent_ids: vec![old_parent.id],
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+
+        let updated = core.set_parents(task.id, vec![new_parent.id]).unwrap();
+
+        assert_eq!(updated.parent_ids, vec![new_parent.id]);
+        let old_parent_children = core.list_children(old_parent.id).unwrap();
+        assert!(!old_parent_children.iter().any(|t| t.id == task.id));
+        let new_parent_children = core.list_children(new_parent.id).unwrap();
+        assert!(new_parent_children.iter().any(|t| t.id == task.id));
+    }
+
+    #[test]
+    fn set_parents_should_promote_task_to_top_level_when_given_empty_list() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let task = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+
+        let updated = core.set_parents(task.id, Vec::new()).unwrap();
+
+        assert!(updated.parent_ids.is_empty());
+        let parent_children = core.list_children(parent.id).unwrap();
+        assert!(!parent_children.iter().any(|t| t.id == task.id));
+    }
+
+    #[test]
+    fn set_parents_should_reject_self_parenting_with_circular_hierarchy_error() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let result = core.set_parents(task.id, vec![task.id]);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::CircularHierarchy { task: t, attempted_parent })
+                if t == task.id && attempted_parent == task.id
+        ));
+    }
+
+    #[test]
+    fn set_parents_should_reject_when_candidate_is_a_descendant_of_the_task() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let descendant = core
+            .create_task(NewTask {
+                parent_ids: vec![task.id],
+                ..minimal_new_task("Descendant")
+            })
+            .unwrap();
+
+        let result = core.set_parents(task.id, vec![descendant.id]);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::CircularHierarchy { task: t, attempted_parent })
+                if t == task.id && attempted_parent == descendant.id
+        ));
+    }
+
+    #[test]
+    fn set_parents_should_leave_existing_parents_unchanged_when_one_of_several_candidates_creates_a_cycle()
+     {
+        let mut core = new_core();
+        let original_parent = core
+            .create_task(minimal_new_task("Original parent"))
+            .unwrap();
+        let fine_candidate = core
+            .create_task(minimal_new_task("Fine candidate"))
+            .unwrap();
+        let task = core
+            .create_task(NewTask {
+                parent_ids: vec![original_parent.id],
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+        let cycle_candidate = core
+            .create_task(NewTask {
+                parent_ids: vec![task.id],
+                ..minimal_new_task("Cycle candidate")
+            })
+            .unwrap();
+
+        let result = core.set_parents(task.id, vec![fine_candidate.id, cycle_candidate.id]);
+
+        assert!(matches!(result, Err(CoreError::CircularHierarchy { .. })));
+        let current = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(current.parent_ids, vec![original_parent.id]);
+        let original_parent_children = core.list_children(original_parent.id).unwrap();
+        assert!(original_parent_children.iter().any(|t| t.id == task.id));
+        let fine_candidate_children = core.list_children(fine_candidate.id).unwrap();
+        assert!(!fine_candidate_children.iter().any(|t| t.id == task.id));
+    }
+
+    #[test]
+    fn set_parents_should_bump_updated_at() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let new_parent = core.create_task(minimal_new_task("New parent")).unwrap();
+
+        let updated = core.set_parents(task.id, vec![new_parent.id]).unwrap();
+
+        assert_eq!(updated.created_at, task.created_at);
+        assert!(updated.updated_at >= task.updated_at);
     }
 }
