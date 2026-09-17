@@ -165,11 +165,20 @@ impl<S: Store> Core<S> {
         };
 
         self.store.transaction(|tx| {
-            tx.put_task(&task)?;
+            // Every hierarchy check runs before any write (`put_task` or
+            // `add_parent_edge`) — matching `set_parents`'s "validate every
+            // candidate before mutating anything" discipline. A rejected
+            // `Ok(Err(_))` here is still `Ok` from `Store::transaction`'s own
+            // point of view, so it commits whatever was written before it
+            // returned; checking first means there's nothing to commit.
             for &parent_id in &task.parent_ids {
                 if let Err(e) = check_new_parent(tx, parent_id, task.id) {
                     return Ok(Err(e));
                 }
+            }
+
+            tx.put_task(&task)?;
+            for &parent_id in &task.parent_ids {
                 tx.add_parent_edge(parent_id, task.id)?;
             }
             Ok(Ok(()))
@@ -585,7 +594,20 @@ impl<S: Store> Core<S> {
     /// - [`CoreError::CircularHierarchy`] if attaching `id` under any entry
     ///   in `new_parents` would make `id` its own ancestor.
     /// - [`CoreError::Store`] if the backend fails.
+    ///
+    /// A duplicate id in `new_parents` (e.g. a CLI/TUI caller passing the
+    /// same parent twice) is deduplicated up front, keeping the first
+    /// occurrence's position: `task.parent_ids` and the written edges never
+    /// contain a duplicate, which matters because `render::task_rows`
+    /// builds its child index straight off `parent_ids` and would otherwise
+    /// render the task twice under the same parent.
     pub fn set_parents(&mut self, id: TaskId, new_parents: Vec<TaskId>) -> Result<Task, CoreError> {
+        let mut seen = std::collections::HashSet::new();
+        let new_parents: Vec<TaskId> = new_parents
+            .into_iter()
+            .filter(|parent| seen.insert(*parent))
+            .collect();
+
         let task = self.store.transaction(|tx| {
             let Some(mut task) = tx.get_task(id)? else {
                 return Ok(Err(CoreError::NotFound(id)));
@@ -2238,5 +2260,19 @@ mod tests {
 
         assert_eq!(updated.created_at, task.created_at);
         assert!(updated.updated_at >= task.updated_at);
+    }
+
+    #[test]
+    fn set_parents_should_deduplicate_repeated_parent_ids_preserving_first_occurrence_order() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
+        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
+
+        let updated = core
+            .set_parents(task.id, vec![parent_a.id, parent_b.id, parent_a.id])
+            .unwrap();
+
+        assert_eq!(updated.parent_ids, vec![parent_a.id, parent_b.id]);
     }
 }

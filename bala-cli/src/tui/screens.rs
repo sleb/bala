@@ -69,6 +69,18 @@ fn split_for_input(app: &App, area: Rect) -> (Rect, Option<Rect>) {
     }
 }
 
+/// Indentation is capped at this many levels: beyond it, deeper rows all
+/// render at the same (maximal) indent rather than growing further.
+///
+/// Without a cap, indenting a chain of `n` tasks allocates `"  ".repeat(0)`
+/// through `"  ".repeat(n-1)` — quadratic total work in `n` (a 5,000-level
+/// chain, which `render::task_rows` supports with no depth limit per AC1,
+/// would format roughly 25 million space characters on every single
+/// redraw). A cap most users will never visually notice (a terminal rarely
+/// shows more than this many columns of pure indentation usefully anyway)
+/// bounds the per-row cost to a constant instead.
+const MAX_INDENT_DEPTH: usize = 40;
+
 /// Renders the task list with the selected row highlighted.
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
@@ -82,7 +94,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             };
             let line = format!(
                 "{}[{marker}] {}  [{}]  {}",
-                "  ".repeat(row.depth),
+                "  ".repeat(row.depth.min(MAX_INDENT_DEPTH)),
                 row.title,
                 row.type_label,
                 row.assignee_name.as_deref().unwrap_or("Unassigned")
@@ -227,7 +239,7 @@ mod tests {
 
     use bala_core::{Core, InMemoryStore};
 
-    use super::draw;
+    use super::{MAX_INDENT_DEPTH, draw};
     use crate::render::TaskRow;
     use crate::tui::app::{App, apply_action};
     use crate::tui::keymap::Action;
@@ -295,6 +307,34 @@ mod tests {
         let parent_leading_spaces = leading_spaces(0);
         let child_leading_spaces = leading_spaces(1);
         assert_eq!(child_leading_spaces, parent_leading_spaces + 2);
+    }
+
+    #[test]
+    fn draw_should_cap_indentation_at_max_indent_depth() {
+        // Regression test for the indentation cap: without it, formatting a
+        // row's indent string costs work proportional to its `depth`, so a
+        // list with many deeply-nested rows would cost quadratic total work
+        // per redraw. A row far beyond the cap must render with the SAME
+        // indentation as a row exactly at the cap, not keep growing.
+        let mut at_cap = row("At cap", TaskStatus::Incomplete);
+        at_cap.depth = MAX_INDENT_DEPTH;
+        let mut way_beyond_cap = row("Way beyond cap", TaskStatus::Incomplete);
+        way_beyond_cap.depth = MAX_INDENT_DEPTH + 1000;
+        let app = App::new(vec![at_cap, way_beyond_cap]);
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let leading_spaces = |y: u16| -> usize {
+            (0..buffer.area().width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .take_while(|symbol| *symbol == " ")
+                .count()
+        };
+
+        assert_eq!(leading_spaces(0), leading_spaces(1));
     }
 
     #[test]

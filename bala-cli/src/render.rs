@@ -79,6 +79,35 @@ pub fn task_rows(
             );
         }
     }
+
+    // Defensive fallback: if every task in `tasks` forms a cycle among
+    // themselves (each one's `parent_ids` names another task also present
+    // in `tasks`), `is_root` is false for all of them and the loop above
+    // renders nothing at all, silently disappearing every task rather than
+    // just failing to indent it correctly. This should never arise through
+    // `Core::set_parents`'s invariant, but the same defensive posture this
+    // function already takes for a missing parent (see `is_root`'s doc
+    // comment) applies here too: any task not reached by a normal root's
+    // walk is rendered as its own root instead of vanishing. `rendered_ids`
+    // is updated as we go (not just computed once) so a cyclic component
+    // rendered by an earlier iteration's `visit` call isn't rendered a
+    // second time when this loop reaches its other members.
+    let mut rendered_ids: HashSet<TaskId> = rows.iter().map(|row| row.id).collect();
+    for task in tasks {
+        if rendered_ids.contains(&task.id) {
+            continue;
+        }
+        let before = rows.len();
+        visit(
+            task,
+            &children_by_parent,
+            type_labels,
+            user_names,
+            &mut rows,
+        );
+        rendered_ids.extend(rows[before..].iter().map(|row| row.id));
+    }
+
     rows
 }
 
@@ -272,6 +301,32 @@ mod tests {
         assert_eq!(rows[0].depth, 0);
         assert_eq!(rows[1].id, child_b.id);
         assert_eq!(rows[1].depth, 0);
+    }
+
+    #[test]
+    fn task_rows_should_render_every_task_once_when_all_tasks_form_a_pure_cycle() {
+        // Defensive regression: `Core::set_parents`'s invariant should make
+        // this unreachable through normal use, but `task_rows` shouldn't
+        // silently drop every task if it ever is (see the fallback loop's
+        // doc comment in `task_rows` itself). A 2-cycle (A's parent is B,
+        // B's parent is A) has no task whose `parent_ids` are empty or
+        // wholly absent from the input, so `is_root` is false for both.
+        let id_a = TaskId::new();
+        let id_b = TaskId::new();
+        let task_a = task(id_a, "A", vec![id_b]);
+        let task_b = task(id_b, "B", vec![id_a]);
+        let tasks = vec![task_a, task_b];
+
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "each task in the cycle rendered exactly once"
+        );
+        let rendered_ids: HashSet<TaskId> = rows.iter().map(|row| row.id).collect();
+        assert!(rendered_ids.contains(&id_a));
+        assert!(rendered_ids.contains(&id_b));
     }
 
     #[test]

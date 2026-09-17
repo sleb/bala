@@ -430,17 +430,23 @@ fn start_insert_new_subtask(app: &mut App) {
 /// selected task, prefilled with its current parent ids as a
 /// comma-separated list of UUIDs (empty string when it's already
 /// top-level). No-op when there's no selection, or when a fresh
-/// `Core::get_task` fetch for the selected id comes back `Ok(None)`/`Err`
-/// (the task vanished out from under the list — nothing sensible to
-/// prefill, so we leave `app` in `Mode::Normal` rather than entering Insert
-/// with stale data).
+/// `Core::get_task` fetch for the selected id comes back `Ok(None)` (the
+/// task vanished out from under the list — nothing sensible to prefill, so
+/// we leave `app` in `Mode::Normal` rather than entering Insert with stale
+/// data). A genuine backend failure (`Err`) is surfaced via `app.error`
+/// rather than silently treated the same as a missing task.
 fn start_reparent<S: Store>(app: &mut App, core: &Core<S>) {
     let Some(row) = app.selected_row() else {
         return;
     };
     let id = row.id;
-    let Ok(Some(task)) = core.get_task(id) else {
-        return;
+    let task = match core.get_task(id) {
+        Ok(Some(task)) => task,
+        Ok(None) => return,
+        Err(err) => {
+            app.error = Some(err.to_string());
+            return;
+        }
     };
 
     let buffer = task
@@ -572,14 +578,24 @@ fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
 
 /// Handles `PendingAction::InheritFromParent`'s `ConfirmYes` path: refetches
 /// `parent` and patches `child` with its assignee/dates via
-/// `Core::update_task`. If `parent` has since vanished (or the store errors
-/// on the refetch), there's nothing sensible to inherit, so `child` is left
-/// as created. On an `update_task` failure `app.error` is set; on success
-/// `app.rows` is refreshed via `refresh_rows_from_tree` so the child's row
-/// reflects any newly-set assignee immediately.
+/// `Core::update_task`. If `parent` has since vanished, there's nothing
+/// sensible to inherit, so `child` is left as created; a genuine backend
+/// failure on the refetch is surfaced via `app.error` rather than treated
+/// the same as a missing parent. On an `update_task` failure `app.error` is
+/// set; on success `app.rows` is refreshed via `refresh_rows_from_tree` so
+/// the child's row reflects any newly-set assignee immediately — any error
+/// `refresh_rows_from_tree` itself sets (e.g. the follow-up `get_tree`
+/// failing) is preserved rather than immediately overwritten, since the
+/// mutation already committed and the user still needs to know the
+/// displayed rows may now be stale.
 fn inherit_from_parent<S: Store>(app: &mut App, core: &mut Core<S>, child: TaskId, parent: TaskId) {
-    let Ok(Some(parent_task)) = core.get_task(parent) else {
-        return;
+    let parent_task = match core.get_task(parent) {
+        Ok(Some(parent_task)) => parent_task,
+        Ok(None) => return,
+        Err(err) => {
+            app.error = Some(err.to_string());
+            return;
+        }
     };
 
     let patch = TaskPatch {
@@ -591,8 +607,8 @@ fn inherit_from_parent<S: Store>(app: &mut App, core: &mut Core<S>, child: TaskI
 
     match core.update_task(child, patch) {
         Ok(_) => {
-            refresh_rows_from_tree(app, core, Some(child));
             app.error = None;
+            refresh_rows_from_tree(app, core, Some(child));
         }
         Err(err) => {
             app.error = Some(err.to_string());
@@ -634,7 +650,10 @@ fn submit_insert<S: Store>(app: &mut App, core: &mut Core<S>) {
 /// a `CoreError` from `set_parents` (e.g. `CircularHierarchy`), sets
 /// `app.error` and leaves `app.mode` untouched so the buffer survives for
 /// correction — matching `submit_new_title`'s/`submit_new_subtask`'s
-/// existing "failure leaves mode untouched" convention.
+/// existing "failure leaves mode untouched" convention. Any error
+/// `refresh_rows_from_tree` itself sets on the success path is preserved,
+/// not immediately cleared — the reparent already committed, so the user
+/// still needs to see that the displayed rows may now be stale.
 fn submit_reparent<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buffer: &str) {
     let trimmed = buffer.trim();
     let parse_result: Result<Vec<TaskId>, uuid::Error> = if trimmed.is_empty() {
@@ -653,9 +672,9 @@ fn submit_reparent<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buff
 
     match core.set_parents(id, new_parents) {
         Ok(_) => {
+            app.error = None;
             refresh_rows_from_tree(app, core, Some(id));
             app.mode = Mode::Normal;
-            app.error = None;
         }
         Err(err) => {
             app.error = Some(err.to_string());
@@ -683,9 +702,15 @@ fn refresh_rows_from_tree<S: Store>(app: &mut App, core: &mut Core<S>, select_id
 /// `EditableField::NewSubtaskTitle(parent_id)`: calls `Core::create_task`
 /// with `parent_ids: vec![parent_id]`. On success, refreshes `app.rows` from
 /// the full tree (so the new subtask lands nested under its parent) and
-/// selects it. If the parent has an assignee or either date set, enters
-/// `Mode::Confirm` prompting whether to inherit those onto the new subtask;
-/// otherwise returns straight to `Mode::Normal`. On failure (e.g. an empty
+/// selects it — any error `refresh_rows_from_tree` itself sets is
+/// preserved, not immediately cleared, since the task already committed. If
+/// the parent has an assignee or either date set, enters `Mode::Confirm`
+/// prompting whether to inherit those onto the new subtask; otherwise
+/// returns straight to `Mode::Normal`. A genuine backend failure on that
+/// follow-up `Core::get_task(parent_id)` fetch is surfaced via `app.error`
+/// (rather than silently treated the same as "parent has nothing to
+/// inherit"), but still falls through to `Mode::Normal` since the subtask
+/// itself was created successfully. On `create_task` failure (e.g. an empty
 /// title) sets `app.error` and stays in `Mode::Insert` with the buffer
 /// intact, matching `submit_new_title`'s failure handling.
 fn submit_new_subtask<S: Store>(
@@ -707,8 +732,8 @@ fn submit_new_subtask<S: Store>(
     match core.create_task(new_task) {
         Ok(task) => {
             let child_id = task.id;
-            refresh_rows_from_tree(app, core, Some(child_id));
             app.error = None;
+            refresh_rows_from_tree(app, core, Some(child_id));
 
             match core.get_task(parent_id) {
                 Ok(Some(parent))
@@ -727,7 +752,11 @@ fn submit_new_subtask<S: Store>(
                         },
                     };
                 }
-                _ => {
+                Ok(_) => {
+                    app.mode = Mode::Normal;
+                }
+                Err(err) => {
+                    app.error = Some(err.to_string());
                     app.mode = Mode::Normal;
                 }
             }
@@ -740,7 +769,9 @@ fn submit_new_subtask<S: Store>(
 
 /// `EditableField::NewTitle`: calls `Core::create_task` with `buffer` as the
 /// title. On success appends+selects the new row; on failure (e.g. an empty
-/// title) sets `app.error`.
+/// title) sets `app.error`. Any error `refresh_rows_from_tree` itself sets
+/// on the success path is preserved, not immediately cleared, since the
+/// task already committed.
 fn submit_new_title<S: Store>(app: &mut App, core: &mut Core<S>, buffer: String) {
     let new_task = NewTask {
         title: buffer,
@@ -754,9 +785,9 @@ fn submit_new_title<S: Store>(app: &mut App, core: &mut Core<S>, buffer: String)
 
     match core.create_task(new_task) {
         Ok(task) => {
+            app.error = None;
             refresh_rows_from_tree(app, core, Some(task.id));
             app.mode = Mode::Normal;
-            app.error = None;
         }
         Err(err) => {
             app.error = Some(err.to_string());
