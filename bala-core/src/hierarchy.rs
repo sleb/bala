@@ -1,47 +1,64 @@
 //! Hierarchy invariants over the parent-edge DAG (LLD §Algorithm 1).
 //!
-//! This checkpoint (Story 1.1) only needs a seam: `create_task` attaches a
-//! new, childless task to zero or more existing parents, which can never
-//! create a cycle (a brand-new [`TaskId`] cannot already be an ancestor of
-//! anything). [`check_new_parent`] is therefore a no-op today, but it is
-//! the single function Story 3.1's `set_parents` will extend with the real
-//! DFS/BFS cycle walk described in the LLD, so callers never need to
-//! change once that check grows teeth.
+//! [`check_new_parent`] enforces the one hierarchy invariant this library
+//! cares about: no task may be its own ancestor. Attaching `child` under
+//! `parent` is rejected with [`CoreError::CircularHierarchy`] whenever
+//! `child` is already reachable by walking upward from `parent` via
+//! [`StoreTx::list_parent_edges`] — including the trivial case
+//! `parent == child` (self-parenting). The walk is an explicit work-stack,
+//! not recursion, matching `facade::tombstone_subtree`'s deep-chain safety:
+//! `create_task` and (in a later checkpoint) `set_parents` place no limit
+//! on hierarchy depth, so a user-built chain deep enough could overflow the
+//! process stack if this recursed instead.
 
+use std::collections::HashSet;
+
+use crate::error::CoreError;
 use crate::model::TaskId;
-use crate::store::{StoreError, StoreTx};
+use crate::store::StoreTx;
 
 /// Checks that attaching `child` under `parent` would not violate the
 /// hierarchy invariant (no task may be its own ancestor).
 ///
-/// Currently always succeeds: at this checkpoint's scope, `child` is
-/// always a freshly created [`TaskId`] with no existing edges, so it can
-/// never already be an ancestor of `parent`. Story 3.1 extends this with
-/// the real ancestor-reachability walk once `set_parents` can attach an
-/// *existing* task (with its own descendants) under a new parent — at
-/// that point this will need to report `CircularHierarchy` too, likely by
-/// changing its return type; every call site already runs inside a
-/// [`crate::Store::transaction`] closure, so that change stays local to
-/// this function and its callers' error mapping.
-///
-/// Returns `Result` (rather than `()`) so callers propagate it with `?`
-/// exactly like the future fallible version, and so
-/// `create_task_should_run_hierarchy_check_for_each_given_parent` can
-/// assert it is actually invoked once per parent.
+/// Walks upward from `parent`, one edge at a time via
+/// [`StoreTx::list_parent_edges`], using an explicit work-stack seeded with
+/// `parent` itself. A node's parents are only enqueued the first time that
+/// node is visited (tracked via a `visited` set), so a shared ancestor
+/// reached through two different paths in a DAG is walked exactly once —
+/// this keeps the walk linear in the number of distinct ancestors rather
+/// than exponential in the number of paths between them, and (combined with
+/// the work-stack) lets it terminate on an arbitrarily long single chain
+/// without re-walking already-seen nodes.
 ///
 /// # Errors
 ///
-/// Returns `Err` only if the backend fails while walking ancestors (not
-/// possible yet, since no walk happens today).
-// Always `Ok` today is deliberate: this is the seam Story 3.1 extends
-// with the real ancestor walk, so it stays fallible now rather than
-// forcing every call site to change signature later.
-#[allow(clippy::unnecessary_wraps)]
+/// - [`CoreError::CircularHierarchy`] if `child` is `parent` itself, or is
+///   reachable as an ancestor of `parent` — attaching it would make `child`
+///   its own ancestor.
+/// - [`CoreError::Store`] if the backend fails while walking ancestors.
 pub fn check_new_parent(
-    _tx: &mut dyn StoreTx,
-    _parent: TaskId,
-    _child: TaskId,
-) -> Result<(), StoreError> {
+    tx: &mut dyn StoreTx,
+    parent: TaskId,
+    child: TaskId,
+) -> Result<(), CoreError> {
+    let mut visited = HashSet::new();
+    let mut pending = vec![parent];
+
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+
+        if current == child {
+            return Err(CoreError::CircularHierarchy {
+                task: child,
+                attempted_parent: parent,
+            });
+        }
+
+        pending.extend(tx.list_parent_edges(current)?);
+    }
+
     Ok(())
 }
 
@@ -52,13 +69,125 @@ mod tests {
     use crate::store::Store;
 
     #[test]
-    fn check_new_parent_always_succeeds_for_a_fresh_child() {
+    fn check_new_parent_should_allow_attaching_to_a_task_with_no_existing_ancestors() {
         let store = InMemoryStore::default();
         let parent = TaskId::new();
         let child = TaskId::new();
 
-        let result = store.transaction(|tx| check_new_parent(tx, parent, child));
+        let result = store.transaction(|tx| Ok(check_new_parent(tx, parent, child)));
+
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn check_new_parent_should_reject_self_parenting() {
+        let store = InMemoryStore::default();
+        let task = TaskId::new();
+
+        let result = store
+            .transaction(|tx| Ok(check_new_parent(tx, task, task)))
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            Err(CoreError::CircularHierarchy { task: t, attempted_parent })
+                if t == task && attempted_parent == task
+        ));
+    }
+
+    #[test]
+    fn check_new_parent_should_reject_when_child_is_an_ancestor_of_parent() {
+        // grandparent -> parent -> (attempting) child, but `child` is
+        // actually `grandparent`: attaching it under `parent` would make it
+        // its own ancestor.
+        let store = InMemoryStore::default();
+        let grandparent = TaskId::new();
+        let parent = TaskId::new();
+
+        store
+            .transaction(|tx| tx.add_parent_edge(grandparent, parent))
+            .unwrap();
+
+        let result = store
+            .transaction(|tx| Ok(check_new_parent(tx, parent, grandparent)))
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            Err(CoreError::CircularHierarchy { task, attempted_parent })
+                if task == grandparent && attempted_parent == parent
+        ));
+    }
+
+    #[test]
+    fn check_new_parent_should_allow_a_shared_ancestor_reached_via_two_paths() {
+        // grandparent G has two children P1 and P2, and `task` already has
+        // both P1 and P2 as parents (a DAG diamond). Walking upward from
+        // either P1 or P2 reaches G, but G is not `task` itself, so
+        // attaching `task` under a *new* parent that is itself a child of
+        // G must still succeed — reaching G via two paths must not be
+        // mistaken for a cycle.
+        let store = InMemoryStore::default();
+        let grandparent = TaskId::new();
+        let parent_1 = TaskId::new();
+        let parent_2 = TaskId::new();
+        let task = TaskId::new();
+        let new_parent = TaskId::new();
+
+        store
+            .transaction(|tx| {
+                tx.add_parent_edge(grandparent, parent_1)?;
+                tx.add_parent_edge(grandparent, parent_2)?;
+                tx.add_parent_edge(parent_1, task)?;
+                tx.add_parent_edge(parent_2, task)?;
+                tx.add_parent_edge(grandparent, new_parent)
+            })
+            .unwrap();
+
+        // Attaching `task` under `new_parent` walks new_parent -> grandparent,
+        // never encountering `task`, so it succeeds despite grandparent
+        // being reachable from `task` via two separate paths.
+        let result = store
+            .transaction(|tx| Ok(check_new_parent(tx, new_parent, task)))
+            .unwrap();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_new_parent_should_not_overflow_the_stack_on_a_deep_ancestor_chain() {
+        // A chain of 2000+ tasks, each parented under the previous one,
+        // built directly via `add_parent_edge` (faster than 2000 real
+        // `create_task` calls and exercises the same store contract).
+        // Attaching the far end of the chain back onto the chain's start
+        // must be rejected as circular, and must not overflow the stack —
+        // regression-testing the explicit work-stack walk.
+        let store = InMemoryStore::default();
+        let root = TaskId::new();
+        let mut current = root;
+        let mut chain_end = root;
+        store
+            .transaction(|tx| {
+                for _ in 0..3000 {
+                    let next = TaskId::new();
+                    tx.add_parent_edge(current, next)?;
+                    current = next;
+                }
+                chain_end = current;
+                Ok(())
+            })
+            .unwrap();
+
+        // Attaching `root` under `chain_end` would make `root` its own
+        // ancestor, since `root` is already an ancestor of `chain_end`.
+        let result = store
+            .transaction(|tx| Ok(check_new_parent(tx, chain_end, root)))
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            Err(CoreError::CircularHierarchy { task, attempted_parent })
+                if task == root && attempted_parent == chain_end
+        ));
     }
 }

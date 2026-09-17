@@ -26,20 +26,23 @@ locations per OS.
 bala
 ```
 
-Launches an interactive full-screen terminal UI showing your top-level
-tasks, rather than dispatching to one of the subcommands below.
+Launches an interactive full-screen terminal UI showing your tasks,
+rather than dispatching to one of the subcommands below.
 
-The task list shows each top-level task's title, type, status, and
-assignee (nested/tree rendering is planned for a later release; for now
-subtasks are simply not shown here — use `bala task ls` to see everything,
-including subtasks). An empty task list shows a "No tasks yet." message
-instead of a blank screen.
+The task list shows every task's title, type, status, and assignee,
+indented under its parent(s): a subtask is nested two spaces deeper than
+its parent, and the whole tree is always fully expanded (collapsing
+subtrees is a later release; a task with more than one parent currently
+appears once under each of them). An empty task list shows a "No tasks
+yet." message instead of a blank screen.
 
 | Key | Action |
 | --- | --- |
 | `j` / `↓` (in the list) | Move the selection down. |
 | `k` / `↑` (in the list) | Move the selection up. |
 | `O` | Create a new top-level task: opens a text-entry line for its title. `Enter` submits, `Esc` cancels. |
+| `o` (in the list) | Create a new subtask under the selected task: opens a text-entry line for its title, nested under the focused task. `Enter` submits, `Esc` cancels. If the parent has an assignee or dates, you're then asked whether to inherit them onto the new subtask (`y`/`n`). |
+| `m` (in the list) | Reparent the selected task: opens a text-entry line prefilled with its current parent ids (comma-separated). `Enter` submits, `Esc` cancels. |
 | `Enter` (in the list) | Open the Detail pane for the selected task. |
 | `j` / `↓` (in the Detail pane) | Move the field cursor down (Title → Description). |
 | `k` / `↑` (in the Detail pane) | Move the field cursor up (Description → Title). |
@@ -59,6 +62,29 @@ Type the title and press `Enter` to create it (it's appended to the list and
 selected), or `Esc` to cancel without creating anything. An empty title is
 rejected with an inline error message shown under the input line; fix the
 title and press `Enter` again, or `Esc` to give up.
+
+Pressing `o` on a selected task opens a `New subtask: ` input line at the
+bottom of the screen, scoped to that task as the new subtask's parent. Type
+the title and press `Enter` to create it — it's nested under the focused
+task in the list and selected — or `Esc` to cancel without creating
+anything. An empty title is rejected the same way as `O`'s new-task entry.
+If the parent has an assignee and/or start/due dates set, submitting the
+title then prompts: "Inherit assignee/dates from parent...? (y/n)" — `y`
+copies those fields onto the new subtask, `n` leaves it unassigned and
+undated. When the parent has none of those fields set, the new subtask is
+created directly with no prompt.
+
+Pressing `m` on a selected task opens a `Parents (comma-separated ids): `
+input line at the bottom of the screen, prefilled with the task's current
+parent ids as a comma-separated list (empty when it's already top-level).
+Edit the list and press `Enter` to submit, or `Esc` to cancel without
+changing anything. Submitting with an empty buffer promotes the task to
+top-level (no parents). An id that isn't a valid task id, or a reparent that
+would make the task its own ancestor (a circular hierarchy), shows an inline
+error under the input line and keeps you in the entry line to fix it — fix
+the list and press `Enter` again, or `Esc` to give up. `m` does not offer to
+inherit the new parent's assignee or dates; that's `o`'s behavior for newly
+created subtasks only.
 
 Pressing `Enter` on a task in the list opens its Detail pane, showing the
 task's title and description with the field cursor (highlighted) starting on
@@ -131,6 +157,12 @@ bala task add --title "Write docs" \
 | `--start` | no | Start date, `YYYY-MM-DD`. |
 | `--due` | no | Due date, `YYYY-MM-DD`. |
 | `--assignee` | no | Id of the user to assign the task to. |
+| `--inherit` | no | Copy assignee/start/due from the first `--parent` for any of those fields not explicitly given. Only meaningful alongside `--parent`; passing it without `--parent` is a usage error. |
+
+`--inherit` fills in `--assignee`/`--start`/`--due` from the new task's
+first `--parent` wherever the corresponding flag wasn't given explicitly —
+an explicit flag always wins. With multiple `--parent` values, only the
+first one is consulted.
 
 Prints the new task's id (a UUID) on success.
 
@@ -178,6 +210,26 @@ bala task edit <task-id> \
 
 Prints the edited task (and any other tasks affected by the change), one
 per line in the same format as `task ls`.
+
+### `bala task mv`
+
+Reparents a task under a new set of parents, replacing its current parents
+entirely.
+
+```sh
+bala task mv <task-id> --parents <parent-id>[,<parent-id>...]
+```
+
+| Flag | Required | Description |
+| --- | --- | --- |
+| `--parents` | no (comma-separated) | New parent ids, comma-separated. Omit to promote the task to top-level (no parents). |
+
+Prints the reparented task, in the same format as `task ls`.
+
+If the task id or any given parent id doesn't exist, or if the move would
+make the task its own ancestor (for example naming the task itself, or one
+of its own descendants, as a new parent), the command fails with a nonzero
+exit and an error message describing the problem.
 
 ### `bala task delete`
 

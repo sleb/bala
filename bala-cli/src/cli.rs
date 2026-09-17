@@ -58,6 +58,9 @@ pub enum TaskCommands {
     Complete(CompleteArgs),
     /// Reopen a previously completed task.
     Reopen(ReopenArgs),
+    /// Reparent a task under a new set of parents (or none, to promote it
+    /// to top-level).
+    Mv(MvArgs),
 }
 
 #[derive(Debug, Args)]
@@ -82,6 +85,12 @@ pub struct AddArgs {
     /// Id of the user to assign the new task to.
     #[arg(long)]
     pub assignee: Option<Uuid>,
+
+    /// Copy assignee/dates from the first `--parent` (only meaningful with
+    /// at least one `--parent`; clap enforces that via `requires =
+    /// "parent"`).
+    #[arg(long, requires = "parent")]
+    pub inherit: bool,
 }
 
 // The four `clear_*` flags below are independent boolean switches (one per
@@ -169,6 +178,17 @@ pub struct CompleteArgs {
 pub struct ReopenArgs {
     /// Id of the task to reopen.
     pub id: Uuid,
+}
+
+#[derive(Debug, Args)]
+pub struct MvArgs {
+    /// Id of the task to reparent.
+    pub id: Uuid,
+
+    /// New parent ids, comma-separated. Omit (empty) to promote the task
+    /// to top-level.
+    #[arg(long, value_delimiter = ',')]
+    pub parents: Vec<Uuid>,
 }
 
 #[derive(Debug, Args)]
@@ -264,6 +284,7 @@ pub fn run_task_command(db_path: &Path, command: TaskCommands) -> Result<(), Cli
         TaskCommands::Restore(args) => run_task_restore(db_path, &args),
         TaskCommands::Complete(args) => run_task_complete(db_path, &args),
         TaskCommands::Reopen(args) => run_task_reopen(db_path, &args),
+        TaskCommands::Mv(args) => run_task_mv(db_path, &args),
     }
 }
 
@@ -281,14 +302,28 @@ fn field_from<T>(value: Option<T>, clear: bool) -> Field<T> {
 
 fn run_task_add(db_path: &Path, args: AddArgs) -> Result<(), CliError> {
     let mut core = open_core(db_path)?;
+
+    let mut assignee_id = args.assignee.map(UserId::from);
+    let mut start_date = args.start;
+    let mut due_date = args.due;
+
+    if args.inherit
+        && let Some(&first_parent) = args.parent.first()
+        && let Some(parent) = core.get_task(TaskId::from(first_parent))?
+    {
+        assignee_id = assignee_id.or(parent.assignee_id);
+        start_date = start_date.or(parent.start_date);
+        due_date = due_date.or(parent.due_date);
+    }
+
     let new_task = NewTask {
         title: args.title,
         description: args.description,
         parent_ids: args.parent.into_iter().map(TaskId::from).collect(),
         type_key: None,
-        start_date: args.start,
-        due_date: args.due,
-        assignee_id: args.assignee.map(UserId::from),
+        start_date,
+        due_date,
+        assignee_id,
     };
     let task = core.create_task(new_task)?;
     println!("{}", Uuid::from(task.id));
@@ -441,6 +476,19 @@ fn run_task_reopen(db_path: &Path, args: &ReopenArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+fn run_task_mv(db_path: &Path, args: &MvArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let new_parents = args.parents.iter().copied().map(TaskId::from).collect();
+    let task = core.set_parents(TaskId::from(args.id), new_parents)?;
+    let names: HashMap<UserId, String> = core
+        .list_users()?
+        .into_iter()
+        .map(|user| (user.id, user.name))
+        .collect();
+    println!("{}", format_task_line(&task, &names));
+    Ok(())
+}
+
 /// Runs the given user command against the store at `db_path`, printing to
 /// stdout on success.
 ///
@@ -469,4 +517,60 @@ fn run_user_ls(db_path: &Path) -> Result<(), CliError> {
         println!("{} {}", Uuid::from(user.id), user.name);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for `task add --inherit`'s date-copying half.
+    ///
+    /// `format_task_line` (the only thing `bala task ls`/`task mv`/etc.
+    /// print to stdout) never renders `start_date`/`due_date`, so the
+    /// black-box integration tests in `tests/cli.rs` can only observe the
+    /// assignee half of inheritance via stdout. This test calls
+    /// `run_task_add` in-process instead and reads the result back through
+    /// `Core::list_children` (bypassing stdout entirely) to directly assert
+    /// the date fields were actually copied — not just the assignee.
+    #[test]
+    fn run_task_add_with_inherit_should_copy_dates_from_first_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bala.db");
+
+        let mut core = open_core(&db_path).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let due = NaiveDate::from_ymd_opt(2026, 1, 20).unwrap();
+        let parent = core
+            .create_task(NewTask {
+                title: "Parent".to_string(),
+                description: None,
+                parent_ids: Vec::new(),
+                type_key: None,
+                start_date: Some(start),
+                due_date: Some(due),
+                assignee_id: None,
+            })
+            .unwrap();
+        drop(core);
+
+        run_task_add(
+            &db_path,
+            AddArgs {
+                title: "Child".to_string(),
+                description: None,
+                parent: vec![Uuid::from(parent.id)],
+                start: None,
+                due: None,
+                assignee: None,
+                inherit: true,
+            },
+        )
+        .unwrap();
+
+        let core = open_core(&db_path).unwrap();
+        let children = core.list_children(parent.id).unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].start_date, Some(start));
+        assert_eq!(children[0].due_date, Some(due));
+    }
 }

@@ -34,10 +34,14 @@ pub enum Mode {
 ///
 /// `Delete` is Story 2.2's `dd` sequence; `CompleteCascade` is Story 2.3's
 /// confirmation for completing a task that has incomplete children.
+/// `InheritFromParent` is Story 3.1's prompt, shown after creating a new
+/// subtask (`o`) whose parent has an assignee and/or dates, asking whether
+/// to copy those onto the new `child` from `parent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingAction {
     Delete(TaskId),
     CompleteCascade(TaskId),
+    InheritFromParent { child: TaskId, parent: TaskId },
 }
 
 /// Which pane is focused in `Mode::Normal`.
@@ -68,9 +72,15 @@ pub enum DetailField {
 /// `NewTitle` is Story 2.2 checkpoint 1 (creating a top-level task).
 /// `Title(TaskId)`/`Description(TaskId)` are this checkpoint's addition:
 /// editing an existing task's title/description from the Detail pane.
+/// `NewSubtaskTitle(TaskId)` is Story 3.1's addition: creating a new
+/// subtask's title, scoped to the given parent task id. `Parents(TaskId)` is
+/// Story 3.1's other addition: reparenting an existing task (the given task
+/// id), whose buffer holds a comma-separated list of the task's parent ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditableField {
     NewTitle,
     Title(TaskId),
     Description(TaskId),
+    NewSubtaskTitle(TaskId),
+    Parents(TaskId),
 }

@@ -203,9 +203,13 @@ pub fn handle_key<S: Store>(app: &mut App, core: &mut Core<S>, key: KeyEvent) ->
 /// `DetailCursorUp` move `app.detail_field`; `StartEditTitle`/
 /// `StartEditDescription` enter `Mode::Insert` prefilled with the selected
 /// task's current title/description (empty string when there's no
-/// description). `OpenHelp` enters `Mode::Help`, remembering the current mode
-/// as `previous`; `CloseHelp` restores `previous` if `app` is currently in
-/// `Mode::Help`, otherwise it does nothing. `Noop` does nothing.
+/// description). `StartReparent` enters `Mode::Insert` scoped to
+/// `EditableField::Parents`, prefilled with the selected task's current
+/// parent ids (fetched fresh via `Core::get_task`), and `SubmitInsert` for
+/// that field calls `Core::set_parents`. `OpenHelp` enters `Mode::Help`,
+/// remembering the current mode as `previous`; `CloseHelp` restores
+/// `previous` if `app` is currently in `Mode::Help`, otherwise it does
+/// nothing. `Noop` does nothing.
 pub fn apply_action<S: Store>(
     app: &mut App,
     core: &mut Core<S>,
@@ -229,23 +233,23 @@ pub fn apply_action<S: Store>(
         }
         Action::Quit => ControlFlow::Break(()),
         Action::StartInsertNewTitle => {
-            app.mode = Mode::Insert {
-                field: EditableField::NewTitle,
-                buffer: String::new(),
-            };
-            app.error = None;
+            start_insert_new_title(app);
+            ControlFlow::Continue(())
+        }
+        Action::StartInsertNewSubtask => {
+            start_insert_new_subtask(app);
+            ControlFlow::Continue(())
+        }
+        Action::StartReparent => {
+            start_reparent(app, core);
             ControlFlow::Continue(())
         }
         Action::InsertChar(c) => {
-            if let Mode::Insert { buffer, .. } = &mut app.mode {
-                buffer.push(c);
-            }
+            insert_char(app, c);
             ControlFlow::Continue(())
         }
         Action::Backspace => {
-            if let Mode::Insert { buffer, .. } = &mut app.mode {
-                buffer.pop();
-            }
+            backspace(app);
             ControlFlow::Continue(())
         }
         Action::CancelInsert => {
@@ -258,11 +262,7 @@ pub fn apply_action<S: Store>(
             ControlFlow::Continue(())
         }
         Action::EnterDetail => {
-            if app.selected_row().is_some() {
-                app.pane = Pane::Detail;
-                app.detail_field = DetailField::Title;
-                app.error = None;
-            }
+            enter_detail(app);
             ControlFlow::Continue(())
         }
         Action::LeaveDetail => {
@@ -376,6 +376,93 @@ fn refresh_row_statuses(app: &mut App, touched: &[bala_core::Task]) {
     }
 }
 
+/// Handles `Action::StartInsertNewTitle`: enters `Mode::Insert` with an
+/// empty buffer, scoped to `EditableField::NewTitle`.
+fn start_insert_new_title(app: &mut App) {
+    app.mode = Mode::Insert {
+        field: EditableField::NewTitle,
+        buffer: String::new(),
+    };
+    app.error = None;
+}
+
+/// Handles `Action::InsertChar`: appends `c` to the current `Mode::Insert`
+/// buffer. No-op outside `Mode::Insert`.
+fn insert_char(app: &mut App, c: char) {
+    if let Mode::Insert { buffer, .. } = &mut app.mode {
+        buffer.push(c);
+    }
+}
+
+/// Handles `Action::Backspace`: removes the last character from the current
+/// `Mode::Insert` buffer. No-op outside `Mode::Insert`.
+fn backspace(app: &mut App) {
+    if let Mode::Insert { buffer, .. } = &mut app.mode {
+        buffer.pop();
+    }
+}
+
+/// Handles `Action::EnterDetail`: switches to the Detail pane, defaulting
+/// the cursor to `Title`. No-op when there's no selection.
+fn enter_detail(app: &mut App) {
+    if app.selected_row().is_some() {
+        app.pane = Pane::Detail;
+        app.detail_field = DetailField::Title;
+        app.error = None;
+    }
+}
+
+/// Handles `Action::StartInsertNewSubtask`: enters `Mode::Insert` scoped to
+/// the selected task as the new subtask's parent. No-op when there's no
+/// selection (matching `EnterDetail`'s precedent).
+fn start_insert_new_subtask(app: &mut App) {
+    if let Some(row) = app.selected_row() {
+        let parent_id = row.id;
+        app.mode = Mode::Insert {
+            field: EditableField::NewSubtaskTitle(parent_id),
+            buffer: String::new(),
+        };
+        app.error = None;
+    }
+}
+
+/// Handles `Action::StartReparent`: enters `Mode::Insert` scoped to the
+/// selected task, prefilled with its current parent ids as a
+/// comma-separated list of UUIDs (empty string when it's already
+/// top-level). No-op when there's no selection, or when a fresh
+/// `Core::get_task` fetch for the selected id comes back `Ok(None)` (the
+/// task vanished out from under the list — nothing sensible to prefill, so
+/// we leave `app` in `Mode::Normal` rather than entering Insert with stale
+/// data). A genuine backend failure (`Err`) is surfaced via `app.error`
+/// rather than silently treated the same as a missing task.
+fn start_reparent<S: Store>(app: &mut App, core: &Core<S>) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let id = row.id;
+    let task = match core.get_task(id) {
+        Ok(Some(task)) => task,
+        Ok(None) => return,
+        Err(err) => {
+            app.error = Some(err.to_string());
+            return;
+        }
+    };
+
+    let buffer = task
+        .parent_ids
+        .iter()
+        .map(|parent_id| uuid::Uuid::from(*parent_id).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    app.mode = Mode::Insert {
+        field: EditableField::Parents(id),
+        buffer,
+    };
+    app.error = None;
+}
+
 /// Handles `Action::StartEditTitle`: enters `Mode::Insert` prefilled with
 /// the selected task's current title. No-op when there's no selection.
 fn start_edit_title(app: &mut App) {
@@ -482,6 +569,50 @@ fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
                 app.error = Some(err.to_string());
             }
         },
+        PendingAction::InheritFromParent { child, parent } => {
+            inherit_from_parent(app, core, child, parent);
+            app.mode = Mode::Normal;
+        }
+    }
+}
+
+/// Handles `PendingAction::InheritFromParent`'s `ConfirmYes` path: refetches
+/// `parent` and patches `child` with its assignee/dates via
+/// `Core::update_task`. If `parent` has since vanished, there's nothing
+/// sensible to inherit, so `child` is left as created; a genuine backend
+/// failure on the refetch is surfaced via `app.error` rather than treated
+/// the same as a missing parent. On an `update_task` failure `app.error` is
+/// set; on success `app.rows` is refreshed via `refresh_rows_from_tree` so
+/// the child's row reflects any newly-set assignee immediately — any error
+/// `refresh_rows_from_tree` itself sets (e.g. the follow-up `get_tree`
+/// failing) is preserved rather than immediately overwritten, since the
+/// mutation already committed and the user still needs to know the
+/// displayed rows may now be stale.
+fn inherit_from_parent<S: Store>(app: &mut App, core: &mut Core<S>, child: TaskId, parent: TaskId) {
+    let parent_task = match core.get_task(parent) {
+        Ok(Some(parent_task)) => parent_task,
+        Ok(None) => return,
+        Err(err) => {
+            app.error = Some(err.to_string());
+            return;
+        }
+    };
+
+    let patch = TaskPatch {
+        assignee_id: parent_task.assignee_id.map_or(Field::Keep, Field::Set),
+        start_date: parent_task.start_date.map_or(Field::Keep, Field::Set),
+        due_date: parent_task.due_date.map_or(Field::Keep, Field::Set),
+        ..Default::default()
+    };
+
+    match core.update_task(child, patch) {
+        Ok(_) => {
+            app.error = None;
+            refresh_rows_from_tree(app, core, Some(child));
+        }
+        Err(err) => {
+            app.error = Some(err.to_string());
+        }
     }
 }
 
@@ -503,12 +634,144 @@ fn submit_insert<S: Store>(app: &mut App, core: &mut Core<S>) {
         EditableField::NewTitle => submit_new_title(app, core, buffer.clone()),
         EditableField::Title(id) => submit_edit_title(app, core, id, buffer.clone()),
         EditableField::Description(id) => submit_edit_description(app, core, id, buffer.clone()),
+        EditableField::NewSubtaskTitle(parent_id) => {
+            submit_new_subtask(app, core, parent_id, buffer.clone());
+        }
+        EditableField::Parents(id) => submit_reparent(app, core, id, &buffer.clone()),
+    }
+}
+
+/// `EditableField::Parents(id)`: parses `buffer` as a comma-separated list
+/// of UUIDs (an empty/whitespace-only buffer means "no parents", i.e.
+/// promote `id` to top-level) and calls `Core::set_parents`. On success,
+/// refreshes `app.rows` from the full tree via `refresh_rows_from_tree` so
+/// `id` reappears at its new nested (or top-level) position, and returns to
+/// `Mode::Normal`. On a parse failure (an entry that isn't a valid UUID) or
+/// a `CoreError` from `set_parents` (e.g. `CircularHierarchy`), sets
+/// `app.error` and leaves `app.mode` untouched so the buffer survives for
+/// correction — matching `submit_new_title`'s/`submit_new_subtask`'s
+/// existing "failure leaves mode untouched" convention. Any error
+/// `refresh_rows_from_tree` itself sets on the success path is preserved,
+/// not immediately cleared — the reparent already committed, so the user
+/// still needs to see that the displayed rows may now be stale.
+fn submit_reparent<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buffer: &str) {
+    let trimmed = buffer.trim();
+    let parse_result: Result<Vec<TaskId>, uuid::Error> = if trimmed.is_empty() {
+        Ok(Vec::new())
+    } else {
+        trimmed
+            .split(',')
+            .map(|entry| entry.trim().parse::<uuid::Uuid>().map(TaskId::from))
+            .collect()
+    };
+
+    let Ok(new_parents) = parse_result else {
+        app.error = Some("invalid task id in parent list".to_string());
+        return;
+    };
+
+    match core.set_parents(id, new_parents) {
+        Ok(_) => {
+            app.error = None;
+            refresh_rows_from_tree(app, core, Some(id));
+            app.mode = Mode::Normal;
+        }
+        Err(err) => {
+            app.error = Some(err.to_string());
+        }
+    }
+}
+
+/// Refetches the full task tree via `Core::get_tree`, rebuilds `app.rows`
+/// via `render::task_rows` (so a newly created/reparented task lands at its
+/// correct nested position), and reselects the row matching `select_id` if
+/// given (falling back to `App::select_by_id`'s "leave selection untouched"
+/// default otherwise).
+fn refresh_rows_from_tree<S: Store>(app: &mut App, core: &mut Core<S>, select_id: Option<TaskId>) {
+    match core.get_tree(bala_core::TreeFilter::default()) {
+        Ok(tasks) => {
+            app.rows = render::task_rows(&tasks, &app.type_labels, &app.user_names);
+            app.select_by_id(select_id);
+        }
+        Err(err) => {
+            app.error = Some(err.to_string());
+        }
+    }
+}
+
+/// `EditableField::NewSubtaskTitle(parent_id)`: calls `Core::create_task`
+/// with `parent_ids: vec![parent_id]`. On success, refreshes `app.rows` from
+/// the full tree (so the new subtask lands nested under its parent) and
+/// selects it — any error `refresh_rows_from_tree` itself sets is
+/// preserved, not immediately cleared, since the task already committed. If
+/// the parent has an assignee or either date set, enters `Mode::Confirm`
+/// prompting whether to inherit those onto the new subtask; otherwise
+/// returns straight to `Mode::Normal`. A genuine backend failure on that
+/// follow-up `Core::get_task(parent_id)` fetch is surfaced via `app.error`
+/// (rather than silently treated the same as "parent has nothing to
+/// inherit"), but still falls through to `Mode::Normal` since the subtask
+/// itself was created successfully. On `create_task` failure (e.g. an empty
+/// title) sets `app.error` and stays in `Mode::Insert` with the buffer
+/// intact, matching `submit_new_title`'s failure handling.
+fn submit_new_subtask<S: Store>(
+    app: &mut App,
+    core: &mut Core<S>,
+    parent_id: TaskId,
+    buffer: String,
+) {
+    let new_task = NewTask {
+        title: buffer,
+        description: None,
+        parent_ids: vec![parent_id],
+        type_key: None,
+        start_date: None,
+        due_date: None,
+        assignee_id: None,
+    };
+
+    match core.create_task(new_task) {
+        Ok(task) => {
+            let child_id = task.id;
+            app.error = None;
+            refresh_rows_from_tree(app, core, Some(child_id));
+
+            match core.get_task(parent_id) {
+                Ok(Some(parent))
+                    if parent.assignee_id.is_some()
+                        || parent.start_date.is_some()
+                        || parent.due_date.is_some() =>
+                {
+                    app.mode = Mode::Confirm {
+                        prompt: format!(
+                            "Inherit assignee/dates from parent \"{}\"? (y/n)",
+                            parent.title
+                        ),
+                        action: PendingAction::InheritFromParent {
+                            child: child_id,
+                            parent: parent_id,
+                        },
+                    };
+                }
+                Ok(_) => {
+                    app.mode = Mode::Normal;
+                }
+                Err(err) => {
+                    app.error = Some(err.to_string());
+                    app.mode = Mode::Normal;
+                }
+            }
+        }
+        Err(err) => {
+            app.error = Some(err.to_string());
+        }
     }
 }
 
 /// `EditableField::NewTitle`: calls `Core::create_task` with `buffer` as the
 /// title. On success appends+selects the new row; on failure (e.g. an empty
-/// title) sets `app.error`.
+/// title) sets `app.error`. Any error `refresh_rows_from_tree` itself sets
+/// on the success path is preserved, not immediately cleared, since the
+/// task already committed.
 fn submit_new_title<S: Store>(app: &mut App, core: &mut Core<S>, buffer: String) {
     let new_task = NewTask {
         title: buffer,
@@ -522,15 +785,9 @@ fn submit_new_title<S: Store>(app: &mut App, core: &mut Core<S>, buffer: String)
 
     match core.create_task(new_task) {
         Ok(task) => {
-            let new_rows = render::task_rows(
-                std::slice::from_ref(&task),
-                &app.type_labels,
-                &app.user_names,
-            );
-            app.rows.extend(new_rows);
-            app.selected = Some(app.rows.len() - 1);
-            app.mode = Mode::Normal;
             app.error = None;
+            refresh_rows_from_tree(app, core, Some(task.id));
+            app.mode = Mode::Normal;
         }
         Err(err) => {
             app.error = Some(err.to_string());
@@ -609,6 +866,7 @@ mod tests {
             type_label: "task".to_string(),
             status: TaskStatus::Incomplete,
             assignee_name: None,
+            depth: 0,
         }
     }
 
@@ -1254,6 +1512,7 @@ mod tests {
             type_label: "task".to_string(),
             status: task.status,
             assignee_name: None,
+            depth: 0,
         }
     }
 
@@ -1459,6 +1718,372 @@ mod tests {
         app.select_by_id(Some(TaskId::new()));
 
         assert_eq!(app.selected_row(), Some(&row_a));
+    }
+
+    #[test]
+    fn apply_action_start_insert_new_subtask_should_enter_insert_mode_scoped_to_selected_task() {
+        let task_row = row("Parent");
+        let id = task_row.id;
+        let mut app = App::new(vec![task_row]);
+        let mut core = core();
+
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewSubtask);
+
+        assert_eq!(
+            app.mode(),
+            &Mode::Insert {
+                field: EditableField::NewSubtaskTitle(id),
+                buffer: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_action_start_insert_new_subtask_with_no_selection_should_be_noop() {
+        let mut app = App::new(vec![]);
+        let mut core = core();
+
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewSubtask);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+    }
+
+    #[test]
+    fn apply_action_submit_new_subtask_with_no_inheritable_parent_fields_should_return_to_normal_directly()
+     {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent)]);
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewSubtask);
+        for c in "Subtask".chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let child = tasks
+            .iter()
+            .find(|task| task.title == "Subtask")
+            .expect("subtask should have been created");
+        assert_eq!(child.parent_ids, vec![parent.id]);
+    }
+
+    #[test]
+    fn apply_action_submit_new_subtask_with_inheritable_parent_fields_should_enter_confirm_mode() {
+        let mut core = core();
+        let user = core
+            .create_user("Alice".to_string())
+            .expect("add_user should succeed");
+        let parent = core
+            .create_task(bala_core::NewTask {
+                assignee_id: Some(user.id),
+                ..minimal_new_task("Parent")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent)]);
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewSubtask);
+        for c in "Subtask".chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let child = tasks
+            .iter()
+            .find(|task| task.title == "Subtask")
+            .expect("subtask should have been created");
+
+        match app.mode() {
+            Mode::Confirm { action, .. } => {
+                assert_eq!(
+                    *action,
+                    crate::tui::mode::PendingAction::InheritFromParent {
+                        child: child.id,
+                        parent: parent.id,
+                    }
+                );
+            }
+            other => panic!("expected Mode::Confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_action_confirm_yes_inherit_should_copy_parent_assignee_and_dates_onto_child() {
+        let mut core = core();
+        let user = core
+            .create_user("Alice".to_string())
+            .expect("add_user should succeed");
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let due = chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+        let parent = core
+            .create_task(bala_core::NewTask {
+                assignee_id: Some(user.id),
+                start_date: Some(start),
+                due_date: Some(due),
+                ..minimal_new_task("Parent")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent)]);
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewSubtask);
+        for c in "Subtask".chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+        let child_id = match app.mode() {
+            Mode::Confirm {
+                action: crate::tui::mode::PendingAction::InheritFromParent { child, .. },
+                ..
+            } => *child,
+            other => panic!("expected Mode::Confirm, got {other:?}"),
+        };
+
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        let child = core
+            .get_task(child_id)
+            .expect("get_task should succeed")
+            .expect("child should exist");
+        assert_eq!(child.assignee_id, Some(user.id));
+        assert_eq!(child.start_date, Some(start));
+        assert_eq!(child.due_date, Some(due));
+    }
+
+    #[test]
+    fn apply_action_confirm_no_inherit_should_leave_child_fields_unset() {
+        let mut core = core();
+        let user = core
+            .create_user("Alice".to_string())
+            .expect("add_user should succeed");
+        let parent = core
+            .create_task(bala_core::NewTask {
+                assignee_id: Some(user.id),
+                ..minimal_new_task("Parent")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent)]);
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewSubtask);
+        for c in "Subtask".chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+        let child_id = match app.mode() {
+            Mode::Confirm {
+                action: crate::tui::mode::PendingAction::InheritFromParent { child, .. },
+                ..
+            } => *child,
+            other => panic!("expected Mode::Confirm, got {other:?}"),
+        };
+
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmNo);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        let child = core
+            .get_task(child_id)
+            .expect("get_task should succeed")
+            .expect("child should exist");
+        assert_eq!(child.assignee_id, None);
+        assert_eq!(child.start_date, None);
+        assert_eq!(child.due_date, None);
+    }
+
+    #[test]
+    fn apply_action_submit_new_subtask_should_nest_new_row_under_parent() {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent)]);
+
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewSubtask);
+        for c in "Subtask".chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        let parent_row = app
+            .rows()
+            .iter()
+            .find(|row| row.id == parent.id)
+            .expect("parent row should still be present");
+        let parent_depth = parent_row.depth;
+        let child_row = app
+            .rows()
+            .iter()
+            .find(|row| row.title == "Subtask")
+            .expect("child row should be present");
+        assert_eq!(child_row.depth, parent_depth + 1);
+    }
+
+    #[test]
+    fn apply_action_start_reparent_should_prefill_buffer_with_current_parent_ids() {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&child)]);
+
+        let _ = apply_action(&mut app, &mut core, Action::StartReparent);
+
+        match app.mode() {
+            Mode::Insert {
+                field: EditableField::Parents(id),
+                buffer,
+            } => {
+                assert_eq!(*id, child.id);
+                assert_eq!(*buffer, uuid::Uuid::from(parent.id).to_string());
+            }
+            other => panic!("expected Mode::Insert with Parents field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_action_submit_reparent_should_call_set_parents_and_move_task_in_tree() {
+        let mut core = core();
+        let task_a = core
+            .create_task(minimal_new_task("A"))
+            .expect("create_task should succeed");
+        let task_b = core
+            .create_task(minimal_new_task("B"))
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&task_a), row_for(&task_b)]);
+        let _ = apply_action(&mut app, &mut core, Action::StartReparent);
+        for c in uuid::Uuid::from(task_b.id).to_string().chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        let b_row = app
+            .rows()
+            .iter()
+            .find(|row| row.id == task_b.id)
+            .expect("B row should still be present");
+        let a_row = app
+            .rows()
+            .iter()
+            .find(|row| row.id == task_a.id)
+            .expect("A row should still be present");
+        assert_eq!(a_row.depth, b_row.depth + 1);
+    }
+
+    #[test]
+    fn apply_action_submit_reparent_with_empty_buffer_should_promote_to_top_level() {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&parent), row_for(&child)]);
+        let _ = apply_action(&mut app, &mut core, Action::StartReparent);
+        // Selection is still on `parent` (row 0); focus the child instead by
+        // re-entering StartReparent after moving down, so the prefilled
+        // buffer (parent's own — empty, since it's top-level) isn't the one
+        // under test. Instead, directly move to the child row.
+        let _ = apply_action(&mut app, &mut core, Action::CancelInsert);
+        app.move_down();
+        let _ = apply_action(&mut app, &mut core, Action::StartReparent);
+        let buffer_len = match app.mode() {
+            Mode::Insert {
+                field: EditableField::Parents(id),
+                buffer,
+            } => {
+                assert_eq!(*id, child.id);
+                assert!(!buffer.is_empty());
+                buffer.chars().count()
+            }
+            other => panic!("expected Mode::Insert with Parents field, got {other:?}"),
+        };
+        for _ in 0..buffer_len {
+            let _ = apply_action(&mut app, &mut core, Action::Backspace);
+        }
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        let updated_child = core
+            .get_task(child.id)
+            .expect("get_task should succeed")
+            .expect("child should exist");
+        assert!(updated_child.parent_ids.is_empty());
+        let child_row = app
+            .rows()
+            .iter()
+            .find(|row| row.id == child.id)
+            .expect("child row should still be present");
+        assert_eq!(child_row.depth, 0);
+    }
+
+    #[test]
+    fn apply_action_submit_reparent_with_circular_parent_should_show_inline_error_and_stay_in_insert_mode()
+     {
+        let mut core = core();
+        let task_a = core
+            .create_task(minimal_new_task("A"))
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&task_a)]);
+        let _ = apply_action(&mut app, &mut core, Action::StartReparent);
+        for c in uuid::Uuid::from(task_a.id).to_string().chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert!(matches!(
+            app.mode(),
+            Mode::Insert {
+                field: EditableField::Parents(id),
+                ..
+            } if *id == task_a.id
+        ));
+        assert!(app.error().is_some());
+    }
+
+    #[test]
+    fn apply_action_submit_reparent_with_invalid_uuid_should_show_inline_error() {
+        let mut core = core();
+        let task_a = core
+            .create_task(minimal_new_task("A"))
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&task_a)]);
+        let _ = apply_action(&mut app, &mut core, Action::StartReparent);
+        for c in "not-a-uuid".chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert!(matches!(
+            app.mode(),
+            Mode::Insert {
+                field: EditableField::Parents(id),
+                ..
+            } if *id == task_a.id
+        ));
+        assert!(app.error().is_some());
     }
 
     #[test]

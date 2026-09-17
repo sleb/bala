@@ -19,6 +19,11 @@ pub enum Action {
     Quit,
     /// `Normal` mode, `O`: start creating a new top-level task's title.
     StartInsertNewTitle,
+    /// `Normal` mode, `List` pane, `o`: start creating a new subtask under
+    /// the focused task.
+    StartInsertNewSubtask,
+    /// `Normal` mode, `List` pane, `m`: start reparenting the focused task.
+    StartReparent,
     /// `Normal` mode, `List` pane, `Enter`: open the Detail pane on the
     /// focused task.
     EnterDetail,
@@ -108,6 +113,18 @@ pub static NORMAL_LIST_BINDINGS: &[Binding] = &[
         action: Action::StartInsertNewTitle,
         label: "O",
         description: "Create a new top-level task",
+    },
+    Binding {
+        keys: &[KeyCode::Char('o')],
+        action: Action::StartInsertNewSubtask,
+        label: "o",
+        description: "Create a new subtask under the selected task",
+    },
+    Binding {
+        keys: &[KeyCode::Char('m')],
+        action: Action::StartReparent,
+        label: "m",
+        description: "Reparent the selected task",
     },
     Binding {
         keys: &[KeyCode::Enter],
