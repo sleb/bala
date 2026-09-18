@@ -144,6 +144,7 @@ fn draw_insert_input(frame: &mut Frame, app: &App, area: Rect) {
         EditableField::Description(_) => "Description",
         EditableField::NewSubtaskTitle(_) => "New subtask",
         EditableField::Parents(_) => "Parents (comma-separated ids)",
+        EditableField::TypeKey(_) => "Type",
     };
     let [buffer_area, error_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
