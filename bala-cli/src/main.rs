@@ -29,6 +29,7 @@ fn main() -> ExitCode {
         None => tui::run(&db_path),
         Some(Commands::Task(task_args)) => cli::run_task_command(&db_path, task_args.command),
         Some(Commands::User(user_args)) => cli::run_user_command(&db_path, user_args.command),
+        Some(Commands::Type(type_args)) => cli::run_type_command(&db_path, type_args.command),
     };
 
     match result {

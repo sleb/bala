@@ -50,6 +50,8 @@ instead of a blank screen.
 | `O` | Create a new top-level task: opens a text-entry line for its title. `Enter` submits, `Esc` cancels. |
 | `o` (in the list) | Create a new subtask under the selected task: opens a text-entry line for its title, nested under the focused task. `Enter` submits, `Esc` cancels. If the parent has an assignee or dates, you're then asked whether to inherit them onto the new subtask (`y`/`n`). |
 | `m` (in the list) | Reparent the selected task: opens a text-entry line prefilled with its current parent ids (comma-separated). `Enter` submits, `Esc` cancels. |
+| `t` (in the list) | Set the selected task's type: opens a text-entry line prefilled with its current type key. `Enter` submits, `Esc` cancels. |
+| `f` (in the list) | Cycle the active type filter: no filter → the first configured type → the next → ... → back to no filter. Persists across sessions in `view.toml` (see [config.md](config.md)). |
 | `Enter` (in the list) | Open the Detail pane for the selected task. |
 | `j` / `↓` (in the Detail pane) | Move the field cursor down (Title → Description). |
 | `k` / `↑` (in the Detail pane) | Move the field cursor up (Description → Title). |
@@ -92,6 +94,13 @@ error under the input line and keeps you in the entry line to fix it — fix
 the list and press `Enter` again, or `Esc` to give up. `m` does not offer to
 inherit the new parent's assignee or dates; that's `o`'s behavior for newly
 created subtasks only.
+
+Pressing `t` on a selected task opens a `Type: ` input line at the bottom of
+the screen, prefilled with the task's current type key. Edit it and press
+`Enter` to submit, or `Esc` to cancel without changing anything. A key that
+doesn't name a configured task type (see `bala type set`/`bala type ls`)
+shows an inline error under the input line and keeps you in the entry line
+to fix it — fix the key and press `Enter` again, or `Esc` to give up.
 
 Pressing `Enter` on a task in the list opens its Detail pane, showing the
 task's title and description with the field cursor (highlighted) starting on
@@ -153,7 +162,8 @@ bala task add --title "Write docs" \
   --parent <parent-task-id> \
   --start 2026-09-15 \
   --due 2026-09-20 \
-  --assignee <user-id>
+  --assignee <user-id> \
+  --type task
 ```
 
 | Flag | Required | Description |
@@ -165,6 +175,7 @@ bala task add --title "Write docs" \
 | `--due` | no | Due date, `YYYY-MM-DD`. |
 | `--assignee` | no | Id of the user to assign the task to. |
 | `--inherit` | no | Copy assignee/start/due from the first `--parent` for any of those fields not explicitly given. Only meaningful alongside `--parent`; passing it without `--parent` is a usage error. |
+| `--type` | no | Task type key. Defaults to the seeded `task` type when omitted. Fails with a nonzero exit if the key doesn't name a configured task type. |
 
 `--inherit` fills in `--assignee`/`--start`/`--due` from the new task's
 first `--parent` wherever the corresponding flag wasn't given explicitly —
@@ -179,7 +190,12 @@ Lists all tasks.
 
 ```sh
 bala task ls
+bala task ls --type task
 ```
+
+| Flag | Required | Description |
+| --- | --- | --- |
+| `--type` | no | Only show tasks with this type key. Filtering by a key no task currently has (including one that isn't configured) simply shows no tasks — it's a plain filter, not an existence check. |
 
 Output is one task per line: `[<marker>] <id> <title>`, plus
 ` (assigned: <name>)` when the task has an assignee. `<marker>` is `x` for a
@@ -291,3 +307,43 @@ bala task reopen <task-id>
 ```
 
 Prints the reopened task, in the same format as `task ls`.
+
+## `bala type`
+
+Configures the list of task types available to `task add`/`task edit`'s
+`--type` flag. A fresh database is seeded with one default type, key
+`task`.
+
+### `bala type ls`
+
+Lists all configured task types.
+
+```sh
+bala type ls
+```
+
+Output is one type per line: `<key> <label> [color=<color>]
+sort_order=<n>`. The `color=<color>` segment is only printed when the type
+has a color set.
+
+### `bala type set`
+
+Creates a new task type, or updates an existing one by key.
+
+```sh
+bala type set <key> --label <label> [--color <color>] [--sort-order <n>]
+```
+
+| Flag | Required | Description |
+| --- | --- | --- |
+| `--label` | yes | The type's display label. |
+| `--color` | no | A color for the type (any string; interpretation is left to consumers such as the TUI). |
+| `--sort-order` | no | An integer used to order types relative to each other. |
+
+When `<key>` already names an existing type, `label` is always overwritten
+with the given value, but an omitted `--color`/`--sort-order` keeps that
+type's current value rather than clearing it. When `<key>` is new,
+an omitted `--color` leaves it unset and an omitted `--sort-order`
+defaults to `0`.
+
+Prints the resulting type, in the same one-line format as `type ls`.

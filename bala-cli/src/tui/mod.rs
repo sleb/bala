@@ -51,25 +51,8 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
     ensure_is_terminal(&std::io::stdout(), "stdout")?;
 
     let mut core = cli::open_core(db_path)?;
-    let tasks = core.get_tree(TreeFilter::default())?;
     let users = core.list_users()?;
     let types = core.list_task_types()?;
-
-    let user_names: HashMap<_, _> = users.into_iter().map(|user| (user.id, user.name)).collect();
-    let type_labels: HashMap<_, _> = types
-        .into_iter()
-        .map(|task_type| (task_type.key, task_type.label))
-        .collect();
-    let descriptions: HashMap<_, _> = tasks
-        .iter()
-        .map(|task| (task.id, task.description.clone()))
-        .collect();
-    let rows = render::task_rows(
-        &tasks,
-        &type_labels,
-        &user_names,
-        &std::collections::HashSet::new(),
-    );
 
     // Resolving the view-state path can fail only for a rare OS-level reason
     // (no config directory determinable, or it can't be created) — that's
@@ -89,11 +72,41 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
         .as_deref()
         .map(config::load_view_state)
         .unwrap_or_default();
+
+    // A restored `filter_type_key` is honored from the first frame, not just
+    // after the next `f` press — matching `refresh_rows_from_tree`'s
+    // behavior once the TUI is running.
+    let tasks = core.get_tree(TreeFilter {
+        type_key: view_state.filter_type_key.clone(),
+        ..Default::default()
+    })?;
+    let available_type_keys: Vec<String> = types
+        .iter()
+        .map(|task_type| task_type.key.clone())
+        .collect();
+
+    let user_names: HashMap<_, _> = users.into_iter().map(|user| (user.id, user.name)).collect();
+    let type_labels: HashMap<_, _> = types
+        .into_iter()
+        .map(|task_type| (task_type.key, task_type.label))
+        .collect();
+    let descriptions: HashMap<_, _> = tasks
+        .iter()
+        .map(|task| (task.id, task.description.clone()))
+        .collect();
+    let rows = render::task_rows(
+        &tasks,
+        &type_labels,
+        &user_names,
+        &std::collections::HashSet::new(),
+    );
+
     let mut app = App::new(rows)
         .with_lookup_maps(type_labels, user_names)
         .with_descriptions(descriptions)
         .with_tasks(tasks)
-        .with_collapsed(view_state.collapsed);
+        .with_collapsed(view_state.collapsed)
+        .with_type_filter_state(view_state.filter_type_key, available_type_keys);
     app.select_by_id(view_state.selected);
 
     install_panic_hook();
@@ -131,6 +144,7 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
         let new_state = ViewState {
             selected: app.selected_row().map(|row| row.id),
             collapsed: app.collapsed().clone(),
+            filter_type_key: app.type_filter().map(str::to_owned),
         };
         if let Err(err) = config::save_view_state(path, &new_state) {
             eprintln!("warning: failed to save view state: {err}");

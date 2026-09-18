@@ -24,6 +24,9 @@ pub enum Action {
     StartInsertNewSubtask,
     /// `Normal` mode, `List` pane, `m`: start reparenting the focused task.
     StartReparent,
+    /// `Normal` mode, `List` pane, `t`: start setting the focused task's
+    /// type.
+    StartSetType,
     /// `Normal` mode, `List` pane, `Enter`: open the Detail pane on the
     /// focused task.
     EnterDetail,
@@ -76,6 +79,8 @@ pub enum Action {
     /// `Normal` mode, `List` pane, `C`: collapse every task that has
     /// children.
     CollapseAll,
+    /// `Normal` mode, `List` pane, `f`: cycle the active type filter.
+    CycleTypeFilter,
     /// No mapping for this key in this mode/pane.
     Noop,
 }
@@ -184,6 +189,18 @@ pub static NORMAL_LIST_BINDINGS: &[Binding] = &[
         action: Action::CollapseAll,
         label: "C",
         description: "Collapse all tasks",
+    },
+    Binding {
+        keys: &[KeyCode::Char('t')],
+        action: Action::StartSetType,
+        label: "t",
+        description: "Set the selected task's type",
+    },
+    Binding {
+        keys: &[KeyCode::Char('f')],
+        action: Action::CycleTypeFilter,
+        label: "f",
+        description: "Cycle the active type filter",
     },
 ];
 
@@ -407,6 +424,30 @@ mod tests {
         );
 
         assert_eq!(action, Action::StartInsertNewTitle);
+    }
+
+    #[test]
+    fn key_to_action_should_map_t_in_normal_list_to_start_set_type() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::StartSetType);
+    }
+
+    #[test]
+    fn key_to_action_should_map_f_in_normal_list_to_cycle_type_filter() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::CycleTypeFilter);
     }
 
     #[test]
