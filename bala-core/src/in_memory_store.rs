@@ -63,7 +63,16 @@ impl StoreTx for State {
     }
 
     fn put_task(&mut self, task: &Task) -> Result<(), StoreError> {
-        self.tasks.insert(task.id, task.clone());
+        // `progress` is library-computed, never persisted (`bala-store`'s
+        // SQLite backend has no column for it and always reconstructs
+        // `0.0` on read) — reset it here too, so a caller driving
+        // `StoreTx` directly sees the same non-persistence behavior
+        // regardless of which `Store` backend is live. `Core` always
+        // recomputes the real value before returning a `Task` to its own
+        // callers, so this only matters to a caller bypassing `Core`.
+        let mut task = task.clone();
+        task.progress = 0.0;
+        self.tasks.insert(task.id, task);
         Ok(())
     }
 
@@ -152,11 +161,12 @@ mod tests {
             parent_ids: Vec::new(),
             type_key: type_key.to_owned(),
             status,
-            progress: if status == TaskStatus::Complete {
-                1.0
-            } else {
-                0.0
-            },
+            // `InMemoryStore::put_task` always resets `progress` to `0.0`
+            // on write, matching `bala-store`'s non-persistence — so a
+            // round-tripped `Task` never carries this value back, and
+            // building it as anything but `0.0` here would make every
+            // `fetched == Some(task)` equality assertion below fail.
+            progress: 0.0,
             start_date: None,
             due_date: None,
             assignee_id: None,

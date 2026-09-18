@@ -461,19 +461,6 @@ impl<S: Store> Core<S> {
                     let mut deleted = task;
                     deleted.deleted_at = Some(now);
                     deleted.updated_at = now;
-                    // `status` is untouched by a delete, but `progress` is
-                    // re-derived rather than trusted from the fetched row —
-                    // see `update_task`'s matching comment. Computed here,
-                    // before the loop below reparents `deleted`'s children
-                    // onto its own parents, so it reflects `deleted`'s last
-                    // live children set rather than an artificially empty
-                    // one — see this method's doc comment / the report for
-                    // why a tombstoned task's `progress` is still computed
-                    // this way rather than left at its stale pre-delete
-                    // value.
-                    deleted.progress = compute_progress(tx, id, deleted.status)?;
-                    tx.put_task(&deleted)?;
-                    touched.push(deleted);
 
                     for child in tx.list_child_edges(id)? {
                         tx.remove_parent_edge(id, child)?;
@@ -498,6 +485,20 @@ impl<S: Store> Core<S> {
                             touched.push(child_task);
                         }
                     }
+
+                    // `status` is untouched by a delete, but `progress` is
+                    // re-derived rather than trusted from the fetched row —
+                    // see `update_task`'s matching comment. Computed here,
+                    // after the loop above has already reparented every one
+                    // of `deleted`'s children away, so it reflects the
+                    // committed (now-empty) child-edge set — matching what
+                    // a later independent fetch (e.g. `get_tree` with
+                    // `include_deleted: true`) would recompute, rather than
+                    // a stale pre-delete snapshot the returned `Task` can no
+                    // longer back up.
+                    deleted.progress = compute_progress(tx, id, deleted.status)?;
+                    tx.put_task(&deleted)?;
+                    touched.push(deleted);
                 }
             }
 
@@ -875,17 +876,7 @@ fn tombstone_subtree(
             continue;
         };
         task.deleted_at = Some(now);
-        // `status` is untouched by a delete, but `progress` is re-derived
-        // rather than trusted from the fetched row — see `update_task`'s
-        // matching comment. Computed here, before the child-edge loop below
-        // removes `current`'s edges to its children, so it reflects
-        // `current`'s last live children set (the edges are about to be
-        // severed either way, as part of this same tombstone) rather than
-        // an artificially empty one.
-        task.progress = compute_progress(tx, current, task.status)?;
         task.updated_at = now;
-        tx.put_task(&task)?;
-        touched.push(task);
 
         for child in tx.list_child_edges(current)? {
             tx.remove_parent_edge(current, child)?;
@@ -904,6 +895,21 @@ fn tombstone_subtree(
                 touched.push(child_task);
             }
         }
+
+        // `status` is untouched by a delete, but `progress` is re-derived
+        // rather than trusted from the fetched row — see `update_task`'s
+        // matching comment. Computed here, after the loop above has
+        // already removed every one of `current`'s own child edges (it
+        // unconditionally calls `remove_parent_edge` for each, regardless
+        // of whether that child is reparented away or queued in `pending`
+        // for its own tombstoning), so it reflects the committed
+        // (now-empty) child-edge set — matching what a later independent
+        // fetch (e.g. `get_tree` with `include_deleted: true`) would
+        // recompute, rather than a stale pre-delete snapshot the returned
+        // `Task` can no longer back up.
+        task.progress = compute_progress(tx, current, task.status)?;
+        tx.put_task(&task)?;
+        touched.push(task);
     }
 
     Ok(())
@@ -1699,6 +1705,87 @@ mod tests {
             .unwrap();
         let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
         assert!(child_after.deleted_at.is_some());
+    }
+
+    #[test]
+    fn delete_task_subtree_should_return_progress_matching_a_later_get_tree_fetch() {
+        // Regression test: `tombstone_subtree` used to compute a
+        // tombstoned task's `progress` from its live children *before*
+        // severing its child edges, so the value in `delete_task`'s own
+        // returned `Vec<Task>` didn't match what a later independent
+        // fetch (which always recomputes live, from whatever children
+        // edges are left after the delete) would report. One Complete
+        // and one Incomplete child makes the two states unambiguously
+        // different: pre-severance progress is 0.5 (one of two direct
+        // children complete); post-severance (both children's edges to
+        // `parent` are gone) it falls back to `parent`'s own Incomplete
+        // status, 0.0 — so a stale pre-severance return value is
+        // distinguishable from the correct, post-severance one.
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let complete_child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Complete child")
+            })
+            .unwrap();
+        core.complete_task(complete_child.id, false).unwrap();
+        core.create_task(NewTask {
+            parent_ids: vec![parent.id],
+            ..minimal_new_task("Incomplete child")
+        })
+        .unwrap();
+
+        let touched = core.delete_task(parent.id, DeleteMode::Subtree).unwrap();
+        let returned_parent = touched.iter().find(|t| t.id == parent.id).unwrap();
+
+        let tree = core
+            .get_tree(TreeFilter {
+                include_deleted: true,
+                ..TreeFilter::default()
+            })
+            .unwrap();
+        let refetched_parent = tree.iter().find(|t| t.id == parent.id).unwrap();
+
+        assert!((returned_parent.progress - refetched_parent.progress).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn delete_task_promote_children_should_return_progress_matching_a_later_get_tree_fetch() {
+        // Same regression as the `Subtree` variant above, for
+        // `DeleteMode::PromoteChildren`'s `deleted.progress` computation:
+        // one Complete and one Incomplete child so pre-reparent (0.5) and
+        // post-reparent (0.0, own-status fallback once both children are
+        // reparented away) values are distinguishable.
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let complete_child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Complete child")
+            })
+            .unwrap();
+        core.complete_task(complete_child.id, false).unwrap();
+        core.create_task(NewTask {
+            parent_ids: vec![parent.id],
+            ..minimal_new_task("Incomplete child")
+        })
+        .unwrap();
+
+        let touched = core
+            .delete_task(parent.id, DeleteMode::PromoteChildren)
+            .unwrap();
+        let returned_parent = touched.iter().find(|t| t.id == parent.id).unwrap();
+
+        let tree = core
+            .get_tree(TreeFilter {
+                include_deleted: true,
+                ..TreeFilter::default()
+            })
+            .unwrap();
+        let refetched_parent = tree.iter().find(|t| t.id == parent.id).unwrap();
+
+        assert!((returned_parent.progress - refetched_parent.progress).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -460,8 +460,12 @@ each direct child's `status` (not its `progress`), there is no recursion
 and nothing to memoize: computing one task's `progress` is a single flat
 lookup of its direct children's `status`, independent of traversal order
 or of any other task's rollup. `get_tree` computes this once per result
-task, each a `list_child_edges` + `get_task`-per-child lookup — O(n) for
-the whole tree per call, not O(n) per task.
+task, each a `list_child_edges` + `get_task`-per-child lookup — O(n + e)
+for the whole tree per call (n result tasks, e parent-child edges walked
+across all of them), not O(n) per task. With multiple parents a task can
+have more than one incoming edge, so e can be as large as O(n²) in the
+worst case — this is still one lookup per edge, not a repeated per-task
+cost, but it is not O(n) outright.
 
 With multiple parents, "children" is the reverse lookup — every task
 whose `parent_ids` contains this task's id — and a task shared by two
