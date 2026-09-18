@@ -92,6 +92,10 @@ struct ViewStateShape {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TreeShape {
     selected: Option<String>,
+    /// Missing from a `view.toml` saved before this field existed — default
+    /// to empty rather than failing the whole document's deserialization
+    /// (which would also discard the file's `selected`).
+    #[serde(default)]
     collapsed: Vec<String>,
 }
 
@@ -196,6 +200,29 @@ mod tests {
         let valid_id =
             TaskId::from_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
         assert_eq!(state.collapsed, [valid_id].into_iter().collect());
+    }
+
+    #[test]
+    fn load_view_state_should_default_collapsed_when_file_predates_the_field() {
+        // Regression: a `view.toml` written before `collapsed` existed has
+        // only `selected` under `[tree]`. Without `#[serde(default)]` on
+        // `TreeShape::collapsed`, that's a missing-field deserialize error,
+        // which `load_view_state` downgrades to `ViewState::default()` —
+        // silently discarding the user's saved `selected` too.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+        fs::write(
+            &path,
+            "[tree]\nselected = \"00000000-0000-0000-0000-000000000001\"\n",
+        )
+        .expect("write pre-collapsed view.toml");
+
+        let state = load_view_state(&path);
+
+        let selected_id =
+            TaskId::from_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
+        assert_eq!(state.selected, Some(selected_id));
+        assert_eq!(state.collapsed, std::collections::HashSet::new());
     }
 
     #[test]

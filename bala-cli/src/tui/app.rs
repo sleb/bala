@@ -217,12 +217,15 @@ impl App {
     }
 
     /// Re-derives `rows` from `tasks`/`type_labels`/`user_names`/`collapsed`,
-    /// reselecting the row that was focused before the rebuild (by id, via
-    /// `select_by_id`) so a collapse/expand of the focused row itself, or of
-    /// some other row, never loses the user's place. The focused row's own
-    /// id always survives a collapse/expand — only its *descendants* can
-    /// disappear from `rows` — so `select_by_id`'s "leave selection
-    /// untouched if not found" fallback is never actually exercised here.
+    /// reselecting the row that was focused before the rebuild so a
+    /// collapse/expand never loses the user's place. `CollapseFocused`/
+    /// `ExpandFocused` only ever act on the focused row itself, so its id
+    /// always survives those two rebuilds. `CollapseAll`, however, can
+    /// collapse an *ancestor* of the focused row too, hiding the focused
+    /// row itself — in that case `select_id_or_nearest_visible_ancestor`
+    /// walks up `parent_ids` to reselect the nearest still-visible ancestor
+    /// instead of leaving `self.selected` as a stale index into the old
+    /// (differently-shaped) `rows`.
     fn rebuild_rows(&mut self) {
         let selected_id = self.selected_row().map(|row| row.id);
         self.rows = render::task_rows(
@@ -231,7 +234,39 @@ impl App {
             &self.user_names,
             &self.collapsed,
         );
-        self.select_by_id(selected_id);
+        if let Some(id) = selected_id {
+            self.select_id_or_nearest_visible_ancestor(id);
+        }
+    }
+
+    /// Selects the row for `id` if it's present in `self.rows`; otherwise
+    /// walks up `id`'s `parent_ids` (in `self.tasks`) looking for the
+    /// nearest ancestor that IS present, and selects that instead — an
+    /// ancestor only disappears from `rows` by being collapsed, and a
+    /// collapsed task's own row is always still rendered, so this walk
+    /// terminates at the latest by a top-level root, which `task_rows`
+    /// never hides. If somehow no ancestor is present either (defensive:
+    /// should be unreachable given that guarantee), clamps `self.selected`
+    /// to a valid index into the new `rows` instead of leaving it stale.
+    fn select_id_or_nearest_visible_ancestor(&mut self, mut id: TaskId) {
+        loop {
+            if let Some(index) = self.rows.iter().position(|row| row.id == id) {
+                self.selected = Some(index);
+                return;
+            }
+            let Some(task) = self.tasks.iter().find(|task| task.id == id) else {
+                break;
+            };
+            let Some(&parent_id) = task.parent_ids.first() else {
+                break;
+            };
+            id = parent_id;
+        }
+        self.selected = if self.rows.is_empty() {
+            None
+        } else {
+            Some(self.selected.unwrap_or(0).min(self.rows.len() - 1))
+        };
     }
 }
 
@@ -957,10 +992,13 @@ fn submit_edit_title<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, bu
     };
     match core.update_task(id, patch) {
         Ok(tasks) => {
-            if let Some(updated) = tasks.iter().find(|task| task.id == id)
-                && let Some(row) = app.rows.iter_mut().find(|row| row.id == id)
-            {
-                row.title.clone_from(&updated.title);
+            if let Some(updated) = tasks.iter().find(|task| task.id == id) {
+                if let Some(row) = app.rows.iter_mut().find(|row| row.id == id) {
+                    row.title.clone_from(&updated.title);
+                }
+                if let Some(cached) = app.tasks.iter_mut().find(|cached| cached.id == id) {
+                    cached.title.clone_from(&updated.title);
+                }
             }
             app.mode = Mode::Normal;
             app.error = None;
@@ -2525,5 +2563,97 @@ mod tests {
 
         assert!(!app.rows().iter().any(|row| row.id == child.id));
         assert!(app.rows().iter().any(|row| row.id == parent.id));
+    }
+
+    #[test]
+    fn rebuild_rows_after_edit_title_should_not_revert_to_the_stale_cached_title() {
+        // Regression: `submit_edit_title` used to patch only the matching
+        // `TaskRow`, leaving `app.tasks` (the cache `rebuild_rows`
+        // re-derives `rows` from) holding the old title. A later
+        // collapse/expand action would then silently revert the just-edited
+        // title back to its pre-edit value.
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let tasks = vec![parent.clone(), child.clone()];
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks);
+        app.select_by_id(Some(parent.id));
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        let _ = apply_action(&mut app, &mut core, Action::StartEditTitle);
+        for _ in 0.."Parent".chars().count() {
+            let _ = apply_action(&mut app, &mut core, Action::Backspace);
+        }
+        for c in "Renamed parent".chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+        assert_eq!(
+            app.rows()
+                .iter()
+                .find(|row| row.id == parent.id)
+                .map(|row| row.title.as_str()),
+            Some("Renamed parent")
+        );
+
+        // Trigger a rebuild_rows via collapse/expand, which re-derives
+        // `rows` from `app.tasks`.
+        let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
+        let _ = apply_action(&mut app, &mut core, Action::ExpandFocused);
+
+        assert_eq!(
+            app.rows()
+                .iter()
+                .find(|row| row.id == parent.id)
+                .map(|row| row.title.as_str()),
+            Some("Renamed parent")
+        );
+    }
+
+    #[test]
+    fn collapse_all_should_reselect_nearest_visible_ancestor_when_focused_row_becomes_hidden() {
+        // Regression: `CollapseAll` can hide the currently-focused row (when
+        // some ancestor above it also has children and gets collapsed too),
+        // unlike `CollapseFocused`/`ExpandFocused`, which only ever act on
+        // the focused row itself. `rebuild_rows` used to leave `app.selected`
+        // as a stale numeric index into the old `rows` in that case, which
+        // could highlight (and let a later action target) an unrelated task.
+        let mut core = core();
+        let root = core
+            .create_task(minimal_new_task("Root"))
+            .expect("create_task should succeed");
+        let parent = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![root.id],
+                ..minimal_new_task("Parent")
+            })
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let tasks = vec![root.clone(), parent.clone(), child.clone()];
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks);
+        app.select_by_id(Some(child.id));
+
+        let _ = apply_action(&mut app, &mut core, Action::CollapseAll);
+
+        // Only `root` remains visible (its own subtree, including `parent`,
+        // is hidden since `root` itself is collapsed).
+        assert_eq!(app.rows().len(), 1);
+        assert_eq!(app.rows()[0].id, root.id);
+        assert_eq!(app.selected_row().map(|row| row.id), Some(root.id));
     }
 }
