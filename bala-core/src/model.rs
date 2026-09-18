@@ -100,8 +100,8 @@ pub enum TaskStatus {
 /// A task as stored and returned by the core library.
 ///
 /// Deliberately narrower than the full LLD shape for this story: fields
-/// belonging to later stories/epics (`depends_on`, `out_of_sync`,
-/// `progress`) are omitted until the stories that need them land.
+/// belonging to later stories/epics (`depends_on`, `out_of_sync`) are
+/// omitted until the stories that need them land.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: TaskId,
@@ -112,6 +112,14 @@ pub struct Task {
     /// FK into `TaskType::key`; defaults to `"task"`.
     pub type_key: String,
     pub status: TaskStatus,
+    /// Fraction complete in `0.0..=1.0`, computed by the library (never
+    /// set by callers, never persisted). For a leaf task (no children),
+    /// this mirrors the task's own `status` (`0.0` for
+    /// [`TaskStatus::Incomplete`], `1.0` for [`TaskStatus::Complete`]).
+    /// For a task with direct children, it's the average of each direct
+    /// child's own `status` flag — grandchildren never factor in (Story
+    /// 3.3 AC1/AC2; see `rollup::direct_children_progress`).
+    pub progress: f32,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
     /// `None` means unassigned. `Core::create_task` validates a `Some`
@@ -287,6 +295,7 @@ mod tests {
             parent_ids: Vec::new(),
             type_key: "task".to_owned(),
             status: TaskStatus::Incomplete,
+            progress: 0.0,
             start_date: None,
             due_date: None,
             assignee_id: None,
@@ -299,6 +308,7 @@ mod tests {
         assert_eq!(task.title, "Write tests");
         assert_eq!(task.status, TaskStatus::Incomplete);
         assert!(task.parent_ids.is_empty());
+        assert!((task.progress - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -311,6 +321,7 @@ mod tests {
             parent_ids: vec![TaskId::new()],
             type_key: "task".to_owned(),
             status: TaskStatus::Complete,
+            progress: 1.0,
             start_date: None,
             due_date: None,
             assignee_id: None,

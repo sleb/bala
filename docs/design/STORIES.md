@@ -162,14 +162,15 @@ TOML shape (`[tree]` table) that extends without a format break.
 6. Completed tasks are visually distinguished in the tree view, matching the indication used in the list view (Story 1.4).
 
 ### Story 3.3 — Roll Up Progress from Subtasks [![Issue #39](https://img.shields.io/github/issues/detail/state/sleb/bala/39)](https://github.com/sleb/bala/issues/39)
-**Description:** As a user, I want a parent task's progress to reflect its subtasks' completion, so that I can see overall status at a glance.
+**Description:** As a user, I want a parent task's progress to reflect its direct subtasks' completion, so that I can see status at each level of the hierarchy without it being skewed by how deep the tree goes underneath.
 
 **Acceptance Criteria:**
-1. Parent task displays a progress indicator (e.g., percentage or fraction) computed from its subtree.
-2. Progress rolls up recursively through arbitrary nesting depth.
-3. Progress updates immediately when any descendant task's status changes.
+1. Parent task displays a completion progress indicator (e.g., "N/M complete") computed only from its direct children — a child counts as done or not done based solely on its own completion flag, not on the state of its own descendants.
+2. Progress does NOT roll up recursively for completion: an epic with 2 stories (each with 10 subtasks) shows 0–2 complete, reflecting only the stories' own completion, never the 20 subtasks underneath.
+3. Progress updates immediately when any direct child's completion status changes.
 4. Parent's own completion is independent of the rollup number unless explicitly configured otherwise.
 5. Empty parent (no subtasks) shows no rollup or defaults to its own status.
+6. Other rollup metrics (e.g., effort/estimate totals, once modeled) are out of scope for this story and should aggregate recursively across the full subtree rather than direct children only — see future effort-rollup story.
 
 ### Story 3.4 — Label a Task's Type/Level [![Issue #40](https://img.shields.io/github/issues/detail/state/sleb/bala/40)](https://github.com/sleb/bala/issues/40)
 **Description:** As a user, I want to tag a task with a level such as Initiative, Goal, Project, Story, or Task, so that I can tell at a glance what kind of work a node in the hierarchy represents.
