@@ -65,6 +65,17 @@ pub enum Action {
     OpenHelp,
     /// `Help` mode, `Esc`: close the overlay, restoring the previous mode.
     CloseHelp,
+    /// `Normal` mode, `List` pane, `h`/`←`: collapse the focused task, hiding
+    /// its descendants.
+    CollapseFocused,
+    /// `Normal` mode, `List` pane, `l`/`→`: expand the focused task,
+    /// revealing its previously hidden descendants.
+    ExpandFocused,
+    /// `Normal` mode, `List` pane, `E`: expand every collapsed task.
+    ExpandAll,
+    /// `Normal` mode, `List` pane, `C`: collapse every task that has
+    /// children.
+    CollapseAll,
     /// No mapping for this key in this mode/pane.
     Noop,
 }
@@ -149,6 +160,30 @@ pub static NORMAL_LIST_BINDINGS: &[Binding] = &[
         action: Action::OpenHelp,
         label: "?",
         description: "Show the keybinding help overlay",
+    },
+    Binding {
+        keys: &[KeyCode::Char('h'), KeyCode::Left],
+        action: Action::CollapseFocused,
+        label: "h/←",
+        description: "Collapse the focused task",
+    },
+    Binding {
+        keys: &[KeyCode::Char('l'), KeyCode::Right],
+        action: Action::ExpandFocused,
+        label: "l/→",
+        description: "Expand the focused task",
+    },
+    Binding {
+        keys: &[KeyCode::Char('E')],
+        action: Action::ExpandAll,
+        label: "E",
+        description: "Expand all tasks",
+    },
+    Binding {
+        keys: &[KeyCode::Char('C')],
+        action: Action::CollapseAll,
+        label: "C",
+        description: "Collapse all tasks",
     },
 ];
 
@@ -697,6 +732,94 @@ mod tests {
         );
 
         assert_eq!(action, Action::CloseHelp);
+    }
+
+    #[test]
+    fn key_to_action_should_map_h_and_left_to_collapse_focused() {
+        let via_h = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        );
+        let via_left = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        );
+
+        assert_eq!(via_h, Action::CollapseFocused);
+        assert_eq!(via_left, Action::CollapseFocused);
+    }
+
+    #[test]
+    fn key_to_action_should_map_l_and_right_to_expand_focused() {
+        let via_l = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
+        let via_right = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+
+        assert_eq!(via_l, Action::ExpandFocused);
+        assert_eq!(via_right, Action::ExpandFocused);
+    }
+
+    #[test]
+    fn key_to_action_should_map_uppercase_e_to_expand_all() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(action, Action::ExpandAll);
+    }
+
+    #[test]
+    fn key_to_action_should_map_uppercase_c_to_collapse_all() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(action, Action::CollapseAll);
+    }
+
+    #[test]
+    fn help_entries_for_normal_list_should_include_collapse_expand_bindings() {
+        let entries = help_entries(&Mode::Normal, Pane::List, DetailField::Title);
+
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "h/←" && e.description == "Collapse the focused task")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "l/→" && e.description == "Expand the focused task")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "E" && e.description == "Expand all tasks")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "C" && e.description == "Collapse all tasks")
+        );
     }
 
     #[test]

@@ -20,6 +20,15 @@ pub struct TaskRow {
     pub status: TaskStatus,
     pub assignee_name: Option<String>,
     pub depth: usize,
+    /// Whether this task has at least one direct child in the input.
+    pub has_children: bool,
+    /// Whether this task is currently collapsed (its children, if any, are
+    /// hidden from the rendered rows).
+    pub collapsed: bool,
+    /// `Some((complete_count, total_count))` counting this task's *direct*
+    /// children only (not recursive descendants), present only when the row
+    /// is both collapsed and has children; `None` otherwise.
+    pub direct_summary: Option<(usize, usize)>,
 }
 
 /// Projects every task in `tasks` into a display-ready `TaskRow`, nested
@@ -44,11 +53,17 @@ pub struct TaskRow {
 /// missing from the map falls back to the raw key rather than panicking.
 /// `user_names` maps `UserId` to display name; an unassigned task, or one
 /// assigned to an id missing from the map, gets `assignee_name: None`.
+///
+/// `collapsed` names tasks whose children should be hidden from the
+/// rendered rows: a collapsed task still gets its own row (with
+/// `has_children`/`direct_summary` computed from its direct children), but
+/// none of its descendants are visited, so they don't appear as rows at all.
 #[must_use]
 pub fn task_rows(
     tasks: &[Task],
     type_labels: &HashMap<String, String>,
     user_names: &HashMap<UserId, String>,
+    collapsed: &HashSet<TaskId>,
 ) -> Vec<TaskRow> {
     let known_ids: HashSet<TaskId> = tasks.iter().map(|task| task.id).collect();
 
@@ -67,6 +82,12 @@ pub fn task_rows(
                 .all(|parent_id| !known_ids.contains(parent_id))
     };
 
+    // Descendants hidden by a collapsed ancestor are deliberately not
+    // rendered, but they must not be mistaken by the fallback loop below for
+    // tasks that were never reached at all — `visit` records every id it
+    // chose not to descend into here so the fallback loop can skip them too.
+    let mut hidden_by_collapse: HashSet<TaskId> = HashSet::new();
+
     let mut rows = Vec::new();
     for task in tasks {
         if is_root(task) {
@@ -75,7 +96,9 @@ pub fn task_rows(
                 &children_by_parent,
                 type_labels,
                 user_names,
+                collapsed,
                 &mut rows,
+                &mut hidden_by_collapse,
             );
         }
     }
@@ -91,8 +114,11 @@ pub fn task_rows(
     // walk is rendered as its own root instead of vanishing. `rendered_ids`
     // is updated as we go (not just computed once) so a cyclic component
     // rendered by an earlier iteration's `visit` call isn't rendered a
-    // second time when this loop reaches its other members.
+    // second time when this loop reaches its other members. Ids hidden by a
+    // collapsed ancestor are seeded in up front so they aren't re-rendered
+    // as spurious roots.
     let mut rendered_ids: HashSet<TaskId> = rows.iter().map(|row| row.id).collect();
+    rendered_ids.extend(hidden_by_collapse.iter().copied());
     for task in tasks {
         if rendered_ids.contains(&task.id) {
             continue;
@@ -103,9 +129,12 @@ pub fn task_rows(
             &children_by_parent,
             type_labels,
             user_names,
+            collapsed,
             &mut rows,
+            &mut hidden_by_collapse,
         );
         rendered_ids.extend(rows[before..].iter().map(|row| row.id));
+        rendered_ids.extend(hidden_by_collapse.iter().copied());
     }
 
     rows
@@ -130,7 +159,9 @@ fn visit(
     children_by_parent: &HashMap<TaskId, Vec<&Task>>,
     type_labels: &HashMap<String, String>,
     user_names: &HashMap<UserId, String>,
+    collapsed: &HashSet<TaskId>,
     rows: &mut Vec<TaskRow>,
+    hidden_by_collapse: &mut HashSet<TaskId>,
 ) {
     let mut ancestors_on_path: Vec<TaskId> = Vec::new();
     let mut pending = vec![(root, 0usize, 0usize)];
@@ -140,6 +171,18 @@ fn visit(
         if ancestors_on_path.contains(&task.id) {
             continue;
         }
+
+        let children = children_by_parent.get(&task.id);
+        let has_children = children.is_some_and(|children| !children.is_empty());
+        let is_collapsed = collapsed.contains(&task.id);
+        let direct_summary = (has_children && is_collapsed).then(|| {
+            let children = children.expect("has_children implies children is Some");
+            let complete = children
+                .iter()
+                .filter(|child| child.status == TaskStatus::Complete)
+                .count();
+            (complete, children.len())
+        });
 
         rows.push(TaskRow {
             id: task.id,
@@ -151,14 +194,48 @@ fn visit(
             status: task.status,
             assignee_name: task.assignee_id.and_then(|id| user_names.get(&id).cloned()),
             depth,
+            has_children,
+            collapsed: is_collapsed,
+            direct_summary,
         });
+
+        if is_collapsed {
+            if let Some(children) = children {
+                mark_hidden(children, children_by_parent, hidden_by_collapse);
+            }
+            continue;
+        }
 
         ancestors_on_path.push(task.id);
         let new_path_len = ancestors_on_path.len();
-        if let Some(children) = children_by_parent.get(&task.id) {
+        if let Some(children) = children {
             for child in children.iter().rev() {
                 pending.push((child, depth + 1, new_path_len));
             }
+        }
+    }
+}
+
+/// Records every id reachable from `children` (its own ids, plus all of
+/// their descendants) into `hidden_by_collapse`, so `task_rows`'s defensive
+/// fallback loop doesn't mistake a task hidden under a collapsed ancestor
+/// for one that was never reached at all.
+///
+/// Iterative, matching `visit`'s own convention, with a `visited` guard so a
+/// cycle (which should never occur — see `visit`'s doc comment) can't loop
+/// forever.
+fn mark_hidden(
+    children: &[&Task],
+    children_by_parent: &HashMap<TaskId, Vec<&Task>>,
+    hidden_by_collapse: &mut HashSet<TaskId>,
+) {
+    let mut pending: Vec<&Task> = children.to_vec();
+    while let Some(task) = pending.pop() {
+        if !hidden_by_collapse.insert(task.id) {
+            continue;
+        }
+        if let Some(grandchildren) = children_by_parent.get(&task.id) {
+            pending.extend(grandchildren.iter().copied());
         }
     }
 }
@@ -194,7 +271,7 @@ mod tests {
         let top_level = task(TaskId::new(), "Top level", vec![]);
         let tasks = vec![top_level.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new());
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, top_level.id);
@@ -208,7 +285,7 @@ mod tests {
         let child = task(TaskId::new(), "Child", vec![parent.id]);
         let tasks = vec![parent.clone(), child.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new());
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, parent.id);
@@ -224,7 +301,7 @@ mod tests {
         let child = task(TaskId::new(), "Child", vec![parent.id]);
         let tasks = vec![grandparent.clone(), parent.clone(), child.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new());
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
 
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].id, grandparent.id);
@@ -252,7 +329,7 @@ mod tests {
             parent_id = Some(id);
         }
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new());
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
 
         assert_eq!(rows.len(), 5000);
         for (i, row) in rows.iter().enumerate() {
@@ -271,7 +348,7 @@ mod tests {
         );
         let tasks = vec![parent_a.clone(), parent_b.clone(), child.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new());
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
 
         // Roots visited in input order (Parent A, then Parent B); each
         // root's subtree is fully walked (pre-order) before moving to the
@@ -294,7 +371,7 @@ mod tests {
         let child_b = task(TaskId::new(), "Child B", vec![parent_id]);
         let tasks = vec![child_a.clone(), child_b.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new());
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, child_a.id);
@@ -317,7 +394,7 @@ mod tests {
         let task_b = task(id_b, "B", vec![id_a]);
         let tasks = vec![task_a, task_b];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new());
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
 
         assert_eq!(
             rows.len(),
@@ -339,7 +416,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let rows = task_rows(&[input], &type_labels, &HashMap::new());
+        let rows = task_rows(&[input], &type_labels, &HashMap::new(), &HashSet::new());
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "Ship the thing");
@@ -356,7 +433,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let rows = task_rows(&[input], &HashMap::new(), &user_names);
+        let rows = task_rows(&[input], &HashMap::new(), &user_names, &HashSet::new());
 
         assert_eq!(rows[0].assignee_name, Some("Ada Lovelace".to_string()));
     }
@@ -365,8 +442,126 @@ mod tests {
     fn task_rows_should_show_unassigned_when_no_assignee() {
         let input = task(TaskId::new(), "Unassigned task", vec![]);
 
-        let rows = task_rows(&[input], &HashMap::new(), &HashMap::new());
+        let rows = task_rows(&[input], &HashMap::new(), &HashMap::new(), &HashSet::new());
 
         assert_eq!(rows[0].assignee_name, None);
+    }
+
+    #[test]
+    fn task_rows_should_mark_task_with_children_as_has_children() {
+        let parent = task(TaskId::new(), "Parent", vec![]);
+        let child = task(TaskId::new(), "Child", vec![parent.id]);
+        let tasks = vec![parent.clone(), child.clone()];
+
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].has_children);
+        assert!(!rows[1].has_children);
+    }
+
+    #[test]
+    fn task_rows_should_hide_descendants_of_a_collapsed_task() {
+        let parent = task(TaskId::new(), "Parent", vec![]);
+        let child = task(TaskId::new(), "Child", vec![parent.id]);
+        let grandchild = task(TaskId::new(), "Grandchild", vec![child.id]);
+        let tasks = vec![parent.clone(), child.clone(), grandchild.clone()];
+        let collapsed: HashSet<TaskId> = [parent.id].into_iter().collect();
+
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &collapsed);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, parent.id);
+        assert!(rows[0].has_children);
+        assert!(rows[0].collapsed);
+    }
+
+    #[test]
+    fn task_rows_should_compute_direct_child_summary_for_collapsed_parent() {
+        let parent = task(TaskId::new(), "Parent", vec![]);
+        let mut child_a = task(TaskId::new(), "Child A", vec![parent.id]);
+        child_a.status = TaskStatus::Complete;
+        let mut child_b = task(TaskId::new(), "Child B", vec![parent.id]);
+        child_b.status = TaskStatus::Complete;
+        let child_c = task(TaskId::new(), "Child C", vec![parent.id]);
+        let tasks = vec![
+            parent.clone(),
+            child_a.clone(),
+            child_b.clone(),
+            child_c.clone(),
+        ];
+        let collapsed: HashSet<TaskId> = [parent.id].into_iter().collect();
+
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &collapsed);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].direct_summary, Some((2, 3)));
+    }
+
+    #[test]
+    fn task_rows_should_leave_expanded_parent_with_no_summary() {
+        let parent = task(TaskId::new(), "Parent", vec![]);
+        let mut child_a = task(TaskId::new(), "Child A", vec![parent.id]);
+        child_a.status = TaskStatus::Complete;
+        let mut child_b = task(TaskId::new(), "Child B", vec![parent.id]);
+        child_b.status = TaskStatus::Complete;
+        let child_c = task(TaskId::new(), "Child C", vec![parent.id]);
+        let tasks = vec![
+            parent.clone(),
+            child_a.clone(),
+            child_b.clone(),
+            child_c.clone(),
+        ];
+
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].direct_summary, None);
+    }
+
+    #[test]
+    fn task_rows_should_leave_leaf_task_with_no_summary() {
+        let leaf = task(TaskId::new(), "Leaf", vec![]);
+        let collapsed: HashSet<TaskId> = [leaf.id].into_iter().collect();
+
+        let rows = task_rows(
+            std::slice::from_ref(&leaf),
+            &HashMap::new(),
+            &HashMap::new(),
+            &collapsed,
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].has_children);
+        assert_eq!(rows[0].direct_summary, None);
+    }
+
+    #[test]
+    fn task_rows_should_render_only_root_when_collapsing_root_of_a_deep_chain() {
+        // Depth-regression extension of the 5000-node chain test above: even
+        // when collapsing the root of a very deep chain, the summary must be
+        // computed directly from `children_by_parent` (not by recursing into
+        // descendants), so this must not overflow the stack either.
+        let mut tasks = Vec::new();
+        let mut parent_id = None;
+        for i in 0..5000 {
+            let id = TaskId::new();
+            tasks.push(task(
+                id,
+                &format!("Task {i}"),
+                parent_id.into_iter().collect(),
+            ));
+            parent_id = Some(id);
+        }
+        let root_id = tasks[0].id;
+        let collapsed: HashSet<TaskId> = [root_id].into_iter().collect();
+
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &collapsed);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, root_id);
+        assert!(rows[0].collapsed);
+        assert!(rows[0].has_children);
+        assert_eq!(rows[0].direct_summary, Some((0, 1)));
     }
 }

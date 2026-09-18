@@ -64,10 +64,12 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
         .iter()
         .map(|task| (task.id, task.description.clone()))
         .collect();
-    let rows = render::task_rows(&tasks, &type_labels, &user_names);
-    let mut app = App::new(rows)
-        .with_lookup_maps(type_labels, user_names)
-        .with_descriptions(descriptions);
+    let rows = render::task_rows(
+        &tasks,
+        &type_labels,
+        &user_names,
+        &std::collections::HashSet::new(),
+    );
 
     // Resolving the view-state path can fail only for a rare OS-level reason
     // (no config directory determinable, or it can't be created) — that's
@@ -87,6 +89,11 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
         .as_deref()
         .map(config::load_view_state)
         .unwrap_or_default();
+    let mut app = App::new(rows)
+        .with_lookup_maps(type_labels, user_names)
+        .with_descriptions(descriptions)
+        .with_tasks(tasks)
+        .with_collapsed(view_state.collapsed);
     app.select_by_id(view_state.selected);
 
     install_panic_hook();
@@ -123,6 +130,7 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
     if let Some(path) = view_state_path.as_deref() {
         let new_state = ViewState {
             selected: app.selected_row().map(|row| row.id),
+            collapsed: app.collapsed().clone(),
         };
         if let Err(err) = config::save_view_state(path, &new_state) {
             eprintln!("warning: failed to save view state: {err}");
