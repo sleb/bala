@@ -31,15 +31,22 @@ rather than dispatching to one of the subcommands below.
 
 The task list shows every task's title, type, status, and assignee,
 indented under its parent(s): a subtask is nested two spaces deeper than
-its parent, and the whole tree is always fully expanded (collapsing
-subtrees is a later release; a task with more than one parent currently
-appears once under each of them). An empty task list shows a "No tasks
-yet." message instead of a blank screen.
+its parent (a task with more than one parent currently appears once under
+each of them). A task with subtasks shows a `▾` (expanded) or `▸`
+(collapsed) glyph before its checkbox; a collapsed task's row also shows a
+`(complete/total)` summary counting its direct children only. Collapse/
+expand state persists across sessions in `view.toml` (see
+[config.md](config.md)). An empty task list shows a "No tasks yet." message
+instead of a blank screen.
 
 | Key | Action |
 | --- | --- |
 | `j` / `↓` (in the list) | Move the selection down. |
 | `k` / `↑` (in the list) | Move the selection up. |
+| `h` / `←` (in the list) | Collapse the focused task, hiding its subtasks. No-op if it has none, or is already collapsed. |
+| `l` / `→` (in the list) | Expand the focused task, revealing its subtasks again. No-op if it isn't collapsed. |
+| `E` (in the list) | Expand every task. |
+| `C` (in the list) | Collapse every task that has subtasks. |
 | `O` | Create a new top-level task: opens a text-entry line for its title. `Enter` submits, `Esc` cancels. |
 | `o` (in the list) | Create a new subtask under the selected task: opens a text-entry line for its title, nested under the focused task. `Enter` submits, `Esc` cancels. If the parent has an assignee or dates, you're then asked whether to inherit them onto the new subtask (`y`/`n`). |
 | `m` (in the list) | Reparent the selected task: opens a text-entry line prefilled with its current parent ids (comma-separated). `Enter` submits, `Esc` cancels. |

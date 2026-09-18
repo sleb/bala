@@ -7,11 +7,11 @@
 //! thin wrapper around `keymap::key_to_action` + `apply_action` for the
 //! real crossterm-backed event loop in `tui::mod::run`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use bala_core::{
-    Core, CoreError, DeleteMode, Field, NewTask, Store, TaskId, TaskPatch, TaskStatus, UserId,
+    Core, CoreError, DeleteMode, Field, NewTask, Store, Task, TaskId, TaskPatch, TaskStatus, UserId,
 };
 use crossterm::event::KeyEvent;
 
@@ -34,6 +34,13 @@ pub struct App {
     type_labels: HashMap<String, String>,
     user_names: HashMap<UserId, String>,
     descriptions: HashMap<TaskId, Option<String>>,
+    /// The full cached fetch of every task (from the most recent
+    /// `Core::get_tree` call), independent of collapse state. `rebuild_rows`
+    /// re-derives `rows` from this plus `collapsed` whenever collapse state
+    /// changes, without needing to re-fetch from `Core`.
+    tasks: Vec<Task>,
+    /// Ids of tasks whose children are currently hidden from `rows`.
+    collapsed: HashSet<TaskId>,
     /// Whether a single `d` key press is pending a second consecutive `d` to
     /// complete the `dd` delete-confirm sequence. Reset to `false` by every
     /// action other than `DKeyPressed` itself, so `d`, some unrelated
@@ -61,8 +68,33 @@ impl App {
             type_labels: HashMap::new(),
             user_names: HashMap::new(),
             descriptions: HashMap::new(),
+            tasks: Vec::new(),
+            collapsed: HashSet::new(),
             pending_d: false,
         }
+    }
+
+    /// Attaches the cached full task fetch used by [`App::rebuild_rows`] to
+    /// re-derive `rows` after a collapse/expand action, without needing to
+    /// re-fetch from `Core`. Builder-style for the same reason as
+    /// [`App::with_lookup_maps`].
+    #[must_use]
+    pub fn with_tasks(mut self, tasks: Vec<Task>) -> Self {
+        self.tasks = tasks;
+        self
+    }
+
+    /// Sets the initial collapse state and re-derives `rows` from it,
+    /// letting `tui::mod::run` restore a persisted `ViewState.collapsed` at
+    /// startup. Must be called after [`App::with_tasks`] in the builder
+    /// chain — `rebuild_rows` reads `self.tasks`, so calling this first would
+    /// rebuild against an empty task list. Builder-style for the same reason
+    /// as [`App::with_lookup_maps`].
+    #[must_use]
+    pub fn with_collapsed(mut self, collapsed: HashSet<TaskId>) -> Self {
+        self.collapsed = collapsed;
+        self.rebuild_rows();
+        self
     }
 
     /// Attaches the type-label/user-name lookup maps used to project a
@@ -140,6 +172,13 @@ impl App {
         self.error.as_deref()
     }
 
+    /// Returns the set of task ids currently collapsed, for
+    /// `tui::mod::run` to persist into `ViewState` on quit.
+    #[must_use]
+    pub fn collapsed(&self) -> &HashSet<TaskId> {
+        &self.collapsed
+    }
+
     /// Returns the currently focused pane.
     #[must_use]
     pub fn pane(&self) -> Pane {
@@ -176,6 +215,24 @@ impl App {
             self.selected = Some(index);
         }
     }
+
+    /// Re-derives `rows` from `tasks`/`type_labels`/`user_names`/`collapsed`,
+    /// reselecting the row that was focused before the rebuild (by id, via
+    /// `select_by_id`) so a collapse/expand of the focused row itself, or of
+    /// some other row, never loses the user's place. The focused row's own
+    /// id always survives a collapse/expand — only its *descendants* can
+    /// disappear from `rows` — so `select_by_id`'s "leave selection
+    /// untouched if not found" fallback is never actually exercised here.
+    fn rebuild_rows(&mut self) {
+        let selected_id = self.selected_row().map(|row| row.id);
+        self.rows = render::task_rows(
+            &self.tasks,
+            &self.type_labels,
+            &self.user_names,
+            &self.collapsed,
+        );
+        self.select_by_id(selected_id);
+    }
 }
 
 /// Dispatches one key event against `app`, delegating to `key_to_action`
@@ -210,6 +267,7 @@ pub fn handle_key<S: Store>(app: &mut App, core: &mut Core<S>, key: KeyEvent) ->
 /// remembering the current mode as `previous`; `CloseHelp` restores
 /// `previous` if `app` is currently in `Mode::Help`, otherwise it does
 /// nothing. `Noop` does nothing.
+#[allow(clippy::too_many_lines)] // one big dispatch table by design; see doc comment above
 pub fn apply_action<S: Store>(
     app: &mut App,
     core: &mut Core<S>,
@@ -314,8 +372,78 @@ pub fn apply_action<S: Store>(
             }
             ControlFlow::Continue(())
         }
+        Action::CollapseFocused => {
+            collapse_focused(app);
+            ControlFlow::Continue(())
+        }
+        Action::ExpandFocused => {
+            expand_focused(app);
+            ControlFlow::Continue(())
+        }
+        Action::ExpandAll => {
+            expand_all(app);
+            ControlFlow::Continue(())
+        }
+        Action::CollapseAll => {
+            collapse_all(app);
+            ControlFlow::Continue(())
+        }
         Action::Noop => ControlFlow::Continue(()),
     }
+}
+
+/// Handles `Action::CollapseFocused`: no-op with no selection, no-op when
+/// the focused row has no children, no-op (idempotent) when it's already
+/// collapsed. Otherwise inserts its id into `app.collapsed` and rebuilds
+/// `app.rows`.
+fn collapse_focused(app: &mut App) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    if !row.has_children {
+        return;
+    }
+    let id = row.id;
+    if !app.collapsed.insert(id) {
+        return;
+    }
+    app.rebuild_rows();
+}
+
+/// Handles `Action::ExpandFocused`: no-op with no selection, no-op when the
+/// focused row isn't currently collapsed. Otherwise removes its id from
+/// `app.collapsed` and rebuilds `app.rows`.
+fn expand_focused(app: &mut App) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let id = row.id;
+    if !app.collapsed.remove(&id) {
+        return;
+    }
+    app.rebuild_rows();
+}
+
+/// Handles `Action::ExpandAll`: clears `app.collapsed` entirely and rebuilds
+/// `app.rows`. Called unconditionally, even when `app.collapsed` is already
+/// empty — clearing an empty set is itself a correct no-op, and
+/// `rebuild_rows` on unchanged state just reselects the same row.
+fn expand_all(app: &mut App) {
+    app.collapsed.clear();
+    app.rebuild_rows();
+}
+
+/// Handles `Action::CollapseAll`: sets `app.collapsed` to every `TaskId` in
+/// `app.tasks` that has at least one child (i.e. is named in some other
+/// task's `parent_ids`), then rebuilds `app.rows`.
+fn collapse_all(app: &mut App) {
+    let parents_with_children: HashSet<TaskId> = app
+        .tasks
+        .iter()
+        .flat_map(|task| task.parent_ids.iter().copied())
+        .collect();
+    app.collapsed = parents_with_children;
+    app.rebuild_rows();
 }
 
 /// Handles `Action::ToggleComplete`: no-op with no selection. For an
@@ -368,10 +496,21 @@ fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
 /// by id. Shared by [`handle_toggle_complete`] and [`confirm_yes`]'s
 /// `CompleteCascade` arm so both "refresh every row a `Core` call actually
 /// touched" call sites use the same lookup-by-id loop.
+///
+/// Also updates the matching entries in `app.tasks`, not just `app.rows`:
+/// `app.tasks` is the cache `rebuild_rows` (collapse/expand/expand-all/
+/// collapse-all) re-derives `app.rows` from, so leaving it stale here would
+/// mean a later collapse/expand silently reverts the status change just
+/// applied to `app.rows`, and would also corrupt `direct_summary`'s
+/// complete/total counts (computed from `app.tasks`' child statuses) on a
+/// collapsed parent.
 fn refresh_row_statuses(app: &mut App, touched: &[bala_core::Task]) {
     for task in touched {
         if let Some(row) = app.rows.iter_mut().find(|row| row.id == task.id) {
             row.status = task.status;
+        }
+        if let Some(cached) = app.tasks.iter_mut().find(|cached| cached.id == task.id) {
+            cached.status = task.status;
         }
     }
 }
@@ -544,6 +683,12 @@ fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
                 let deleted_ids: std::collections::HashSet<TaskId> =
                     deleted.iter().map(|task| task.id).collect();
                 app.rows.retain(|row| !deleted_ids.contains(&row.id));
+                // Also drop the deleted tasks from `app.tasks`: it's the
+                // cache `rebuild_rows` re-derives `app.rows` from on the
+                // next collapse/expand action, so leaving deleted tasks in
+                // it would resurrect them into `app.rows` as soon as the
+                // user collapsed or expanded anything.
+                app.tasks.retain(|task| !deleted_ids.contains(&task.id));
                 app.selected = if app.rows.is_empty() {
                     None
                 } else {
@@ -682,15 +827,22 @@ fn submit_reparent<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buff
     }
 }
 
-/// Refetches the full task tree via `Core::get_tree`, rebuilds `app.rows`
-/// via `render::task_rows` (so a newly created/reparented task lands at its
-/// correct nested position), and reselects the row matching `select_id` if
-/// given (falling back to `App::select_by_id`'s "leave selection untouched"
+/// Refetches the full task tree via `Core::get_tree`, caches it as
+/// `app.tasks`, rebuilds `app.rows` via `render::task_rows` (so a newly
+/// created/reparented task lands at its correct nested position, honoring
+/// `app.collapsed`), and reselects the row matching `select_id` if given
+/// (falling back to `App::select_by_id`'s "leave selection untouched"
 /// default otherwise).
 fn refresh_rows_from_tree<S: Store>(app: &mut App, core: &mut Core<S>, select_id: Option<TaskId>) {
     match core.get_tree(bala_core::TreeFilter::default()) {
         Ok(tasks) => {
-            app.rows = render::task_rows(&tasks, &app.type_labels, &app.user_names);
+            app.tasks = tasks;
+            app.rows = render::task_rows(
+                &app.tasks,
+                &app.type_labels,
+                &app.user_names,
+                &app.collapsed,
+            );
             app.select_by_id(select_id);
         }
         Err(err) => {
@@ -849,6 +1001,7 @@ fn submit_edit_description<S: Store>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::ops::ControlFlow;
 
     use bala_core::{Core, InMemoryStore, TaskId, TaskStatus};
@@ -867,6 +1020,9 @@ mod tests {
             status: TaskStatus::Incomplete,
             assignee_name: None,
             depth: 0,
+            has_children: false,
+            collapsed: false,
+            direct_summary: None,
         }
     }
 
@@ -1513,6 +1669,9 @@ mod tests {
             status: task.status,
             assignee_name: None,
             depth: 0,
+            has_children: false,
+            collapsed: false,
+            direct_summary: None,
         }
     }
 
@@ -2095,5 +2254,276 @@ mod tests {
         app.select_by_id(None);
 
         assert_eq!(app.selected_row(), Some(&row_a));
+    }
+
+    #[test]
+    fn collapse_focused_should_hide_children_and_keep_selection_on_parent() {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let tasks = vec![parent.clone(), child.clone()];
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks);
+
+        let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
+
+        assert_eq!(app.rows().len(), 1);
+        assert_eq!(app.selected_row().map(|row| row.id), Some(parent.id));
+        assert!(app.rows()[0].collapsed);
+    }
+
+    #[test]
+    fn collapse_focused_on_leaf_task_should_be_noop() {
+        let mut core = core();
+        let leaf = core
+            .create_task(minimal_new_task("Leaf"))
+            .expect("create_task should succeed");
+        let tasks = vec![leaf.clone()];
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks);
+
+        let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
+
+        assert_eq!(app.rows().len(), 1);
+        assert!(!app.rows()[0].collapsed);
+    }
+
+    #[test]
+    fn expand_focused_should_reveal_previously_hidden_children() {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let tasks = vec![parent.clone(), child.clone()];
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks);
+        let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
+
+        let _ = apply_action(&mut app, &mut core, Action::ExpandFocused);
+
+        assert_eq!(app.rows().len(), 2);
+        assert!(!app.rows()[0].collapsed);
+    }
+
+    #[test]
+    fn expand_all_should_clear_all_collapsed_state() {
+        let mut core = core();
+        let parent_a = core
+            .create_task(minimal_new_task("Parent A"))
+            .expect("create_task should succeed");
+        let _child_a = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent_a.id],
+                ..minimal_new_task("Child A")
+            })
+            .expect("create_task should succeed");
+        let parent_b = core
+            .create_task(minimal_new_task("Parent B"))
+            .expect("create_task should succeed");
+        let _child_b = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent_b.id],
+                ..minimal_new_task("Child B")
+            })
+            .expect("create_task should succeed");
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks.clone());
+        let _ = apply_action(&mut app, &mut core, Action::CollapseAll);
+
+        let _ = apply_action(&mut app, &mut core, Action::ExpandAll);
+
+        assert_eq!(app.rows().len(), tasks.len());
+        for row in app.rows() {
+            if row.has_children {
+                assert!(!row.collapsed);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)] // parent_a_row/parent_b_row read clearly paired with parent_a/parent_b above
+    fn collapse_all_should_hide_every_subtree() {
+        let mut core = core();
+        let parent_a = core
+            .create_task(minimal_new_task("Parent A"))
+            .expect("create_task should succeed");
+        let _child_a = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent_a.id],
+                ..minimal_new_task("Child A")
+            })
+            .expect("create_task should succeed");
+        let parent_b = core
+            .create_task(minimal_new_task("Parent B"))
+            .expect("create_task should succeed");
+        let _child_b = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent_b.id],
+                ..minimal_new_task("Child B")
+            })
+            .expect("create_task should succeed");
+        let leaf = core
+            .create_task(minimal_new_task("Leaf"))
+            .expect("create_task should succeed");
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks);
+
+        let _ = apply_action(&mut app, &mut core, Action::CollapseAll);
+
+        assert_eq!(app.rows().len(), 3);
+        let parent_a_row = app
+            .rows()
+            .iter()
+            .find(|row| row.id == parent_a.id)
+            .expect("parent A row should still be present");
+        assert!(parent_a_row.collapsed);
+        let parent_b_row = app
+            .rows()
+            .iter()
+            .find(|row| row.id == parent_b.id)
+            .expect("parent B row should still be present");
+        assert!(parent_b_row.collapsed);
+        let leaf_row = app
+            .rows()
+            .iter()
+            .find(|row| row.id == leaf.id)
+            .expect("leaf row should still be present");
+        assert!(!leaf_row.collapsed);
+    }
+
+    #[test]
+    fn collapse_focused_should_be_idempotent_when_already_collapsed() {
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let tasks = vec![parent.clone(), child.clone()];
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks);
+        let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
+        let rows_len_after_first_collapse = app.rows().len();
+
+        let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
+
+        assert_eq!(app.rows().len(), rows_len_after_first_collapse);
+        assert_eq!(app.selected_row().map(|row| row.id), Some(parent.id));
+    }
+
+    #[test]
+    fn rebuild_rows_after_toggle_complete_should_not_revert_status_or_summary() {
+        // Regression: `refresh_row_statuses` used to patch only `app.rows`,
+        // leaving `app.tasks` (the cache `rebuild_rows` re-derives `rows`
+        // from) stale. A later collapse/expand action would then silently
+        // revert the just-applied status change and miscompute
+        // `direct_summary`'s complete/total counts.
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let tasks = vec![parent.clone(), child.clone()];
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks);
+        app.select_by_id(Some(child.id));
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+        assert_eq!(
+            app.rows()
+                .iter()
+                .find(|row| row.id == child.id)
+                .map(|row| row.status),
+            Some(TaskStatus::Complete)
+        );
+
+        // Trigger a rebuild_rows via collapse/expand of the parent, which
+        // re-derives `rows` from `app.tasks`.
+        app.select_by_id(Some(parent.id));
+        let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
+
+        let parent_row = app
+            .rows()
+            .iter()
+            .find(|row| row.id == parent.id)
+            .expect("parent row should still be present");
+        assert_eq!(parent_row.direct_summary, Some((1, 1)));
+
+        let _ = apply_action(&mut app, &mut core, Action::ExpandFocused);
+        assert_eq!(
+            app.rows()
+                .iter()
+                .find(|row| row.id == child.id)
+                .map(|row| row.status),
+            Some(TaskStatus::Complete)
+        );
+    }
+
+    #[test]
+    fn rebuild_rows_after_delete_should_not_resurrect_deleted_task() {
+        // Regression: `confirm_yes`'s `Delete` arm used to filter only
+        // `app.rows`, leaving the deleted task(s) in `app.tasks`. A later
+        // collapse/expand action would then re-derive `rows` from the stale
+        // `app.tasks` and resurrect the deleted row(s).
+        let mut core = core();
+        let parent = core
+            .create_task(minimal_new_task("Parent"))
+            .expect("create_task should succeed");
+        let child = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .expect("create_task should succeed");
+        let tasks = vec![parent.clone(), child.clone()];
+        let rows =
+            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let mut app = App::new(rows).with_tasks(tasks);
+        app.select_by_id(Some(child.id));
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
+        assert!(!app.rows().iter().any(|row| row.id == child.id));
+
+        // Trigger a rebuild_rows via expand-all, which re-derives `rows`
+        // from `app.tasks`.
+        let _ = apply_action(&mut app, &mut core, Action::ExpandAll);
+
+        assert!(!app.rows().iter().any(|row| row.id == child.id));
+        assert!(app.rows().iter().any(|row| row.id == parent.id));
     }
 }

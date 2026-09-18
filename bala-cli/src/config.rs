@@ -1,6 +1,7 @@
 //! Configuration: resolving the default SQLite database path, and
 //! loading/saving the persisted TUI `ViewState` (`view.toml`).
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -66,16 +67,17 @@ pub fn view_state_path() -> Result<PathBuf, ConfigError> {
 }
 
 /// Persisted TUI view state: which task (if any) is currently selected in
-/// the tree.
+/// the tree, and which tasks are collapsed.
 ///
-/// Other fields (`collapsed`, `gantt_scale`, `gantt_anchor`, `filter`,
-/// `blocked_only`, ...) described in the design doc are deliberately out of
-/// scope for this story and may join later without a format break, since
-/// they'd live alongside `selected` inside the same `[tree]` table (or a
+/// Other fields (`gantt_scale`, `gantt_anchor`, `filter`, `blocked_only`,
+/// ...) described in the design doc are deliberately out of scope for this
+/// story and may join later without a format break, since they'd live
+/// alongside `selected` and `collapsed` inside the same `[tree]` table (or a
 /// sibling table).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ViewState {
     pub selected: Option<TaskId>,
+    pub collapsed: HashSet<TaskId>,
 }
 
 /// On-disk shape of `view.toml`. Kept private and separate from
@@ -90,6 +92,7 @@ struct ViewStateShape {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TreeShape {
     selected: Option<String>,
+    collapsed: Vec<String>,
 }
 
 impl From<&ViewState> for ViewStateShape {
@@ -97,6 +100,7 @@ impl From<&ViewState> for ViewStateShape {
         Self {
             tree: TreeShape {
                 selected: state.selected.map(|id| id.to_string()),
+                collapsed: state.collapsed.iter().map(ToString::to_string).collect(),
             },
         }
     }
@@ -106,6 +110,12 @@ impl From<ViewStateShape> for ViewState {
     fn from(shape: ViewStateShape) -> Self {
         Self {
             selected: shape.tree.selected.and_then(|s| s.parse().ok()),
+            collapsed: shape
+                .tree
+                .collapsed
+                .into_iter()
+                .filter_map(|s| s.parse().ok())
+                .collect(),
         }
     }
 }
@@ -154,7 +164,14 @@ mod tests {
     #[test]
     fn view_state_should_round_trip_through_toml() {
         let id = TaskId::from_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
-        let state = ViewState { selected: Some(id) };
+        let collapsed_a =
+            TaskId::from_str("00000000-0000-0000-0000-000000000002").expect("valid uuid");
+        let collapsed_b =
+            TaskId::from_str("00000000-0000-0000-0000-000000000003").expect("valid uuid");
+        let state = ViewState {
+            selected: Some(id),
+            collapsed: [collapsed_a, collapsed_b].into_iter().collect(),
+        };
 
         let shape = ViewStateShape::from(&state);
         let toml_text = toml::to_string_pretty(&shape).expect("serialize");
@@ -162,6 +179,57 @@ mod tests {
         let round_tripped: ViewState = parsed.into();
 
         assert_eq!(round_tripped, state);
+    }
+
+    #[test]
+    fn load_view_state_should_skip_unparseable_collapsed_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+        fs::write(
+            &path,
+            "[tree]\ncollapsed = [\"00000000-0000-0000-0000-000000000001\", \"not-a-uuid\"]\n",
+        )
+        .expect("write view.toml");
+
+        let state = load_view_state(&path);
+
+        let valid_id =
+            TaskId::from_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
+        assert_eq!(state.collapsed, [valid_id].into_iter().collect());
+    }
+
+    #[test]
+    fn save_view_state_should_overwrite_existing_collapsed_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+        let old_id = TaskId::from_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
+        save_view_state(
+            &path,
+            &ViewState {
+                selected: None,
+                collapsed: [old_id].into_iter().collect(),
+            },
+        )
+        .expect("save old state");
+
+        let new_id = TaskId::from_str("00000000-0000-0000-0000-000000000002").expect("valid uuid");
+        save_view_state(
+            &path,
+            &ViewState {
+                selected: None,
+                collapsed: [new_id].into_iter().collect(),
+            },
+        )
+        .expect("save new state");
+
+        let loaded = load_view_state(&path);
+        assert_eq!(
+            loaded,
+            ViewState {
+                selected: None,
+                collapsed: [new_id].into_iter().collect(),
+            }
+        );
     }
 
     #[test]
@@ -194,6 +262,7 @@ mod tests {
             &path,
             &ViewState {
                 selected: Some(old_id),
+                collapsed: HashSet::new(),
             },
         )
         .expect("save old state");
@@ -203,6 +272,7 @@ mod tests {
             &path,
             &ViewState {
                 selected: Some(new_id),
+                collapsed: HashSet::new(),
             },
         )
         .expect("save new state");
@@ -211,7 +281,8 @@ mod tests {
         assert_eq!(
             loaded,
             ViewState {
-                selected: Some(new_id)
+                selected: Some(new_id),
+                collapsed: HashSet::new(),
             }
         );
     }

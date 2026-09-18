@@ -92,8 +92,20 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 ' '
             };
+            let glyph = if row.collapsed {
+                '▸'
+            } else if row.has_children {
+                '▾'
+            } else {
+                ' '
+            };
+            let summary = row
+                .direct_summary
+                .map_or(String::new(), |(complete, total)| {
+                    format!(" ({complete}/{total})")
+                });
             let line = format!(
-                "{}[{marker}] {}  [{}]  {}",
+                "{}{glyph}[{marker}] {}{summary}  [{}]  {}",
                 "  ".repeat(row.depth.min(MAX_INDENT_DEPTH)),
                 row.title,
                 row.type_label,
@@ -252,6 +264,9 @@ mod tests {
             status,
             assignee_name: None,
             depth: 0,
+            has_children: false,
+            collapsed: false,
+            direct_summary: None,
         }
     }
 
@@ -513,6 +528,91 @@ mod tests {
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("Esc — close help"));
+    }
+
+    #[test]
+    fn draw_list_should_show_collapse_glyph_and_hide_children_when_collapsed() {
+        let mut parent = row("Parent", TaskStatus::Incomplete);
+        parent.has_children = true;
+        parent.collapsed = true;
+        parent.direct_summary = Some((0, 1));
+        let app = App::new(vec![parent]);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains('▸'));
+        assert!(!text.contains("Child"));
+    }
+
+    #[test]
+    fn draw_list_should_show_expand_glyph_when_expanded_with_children() {
+        let mut parent = row("Parent", TaskStatus::Incomplete);
+        parent.has_children = true;
+        parent.collapsed = false;
+        let mut child = row("Child", TaskStatus::Incomplete);
+        child.depth = 1;
+        let app = App::new(vec![parent, child]);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains('▾'));
+    }
+
+    #[test]
+    fn draw_list_should_show_no_glyph_for_leaf_task() {
+        let leaf = row("Leaf task", TaskStatus::Incomplete);
+        let app = App::new(vec![leaf]);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(!text.contains('▸'));
+        assert!(!text.contains('▾'));
+        assert!(text.contains("[ ] Leaf task"));
+    }
+
+    #[test]
+    fn draw_list_should_show_direct_child_summary_on_collapsed_parent() {
+        let mut parent = row("Parent", TaskStatus::Incomplete);
+        parent.has_children = true;
+        parent.collapsed = true;
+        parent.direct_summary = Some((1, 2));
+        let app = App::new(vec![parent]);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("(1/2)"));
+    }
+
+    #[test]
+    fn draw_list_should_still_dim_and_check_completed_row_when_collapsed() {
+        let mut parent = row("Parent", TaskStatus::Complete);
+        parent.has_children = true;
+        parent.collapsed = true;
+        parent.direct_summary = Some((1, 1));
+        let app = App::new(vec![parent]);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("[x] Parent"));
+
+        let buffer = terminal.backend().buffer();
+        let completed_row_style = buffer.cell((0, 0)).unwrap().style();
+        assert!(completed_row_style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
