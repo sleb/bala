@@ -152,6 +152,11 @@ mod tests {
             parent_ids: Vec::new(),
             type_key: type_key.to_owned(),
             status,
+            progress: if status == TaskStatus::Complete {
+                1.0
+            } else {
+                0.0
+            },
             start_date: None,
             due_date: None,
             assignee_id: None,

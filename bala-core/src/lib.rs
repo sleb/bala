@@ -6,6 +6,7 @@ mod facade;
 mod hierarchy;
 mod in_memory_store;
 mod model;
+mod rollup;
 mod store;
 
 pub use error::CoreError;

@@ -160,6 +160,13 @@ mod tests {
             parent_ids: Vec::new(),
             type_key: type_key.to_owned(),
             status,
+            // `bala-store` never persists `progress` (`task_from_row`
+            // always returns `0.0` — see its doc comment), so a
+            // round-tripped task read back via `get_task`/`list_tasks`
+            // never carries this fixture's value regardless of `status`.
+            // Match that here so equality assertions against the
+            // round-tripped result hold without special-casing `progress`.
+            progress: 0.0,
             start_date: None,
             due_date: None,
             assignee_id: None,

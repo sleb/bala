@@ -256,6 +256,7 @@ mod tests {
             parent_ids,
             type_key: "task".to_string(),
             status: TaskStatus::Incomplete,
+            progress: 0.0,
             start_date: None,
             due_date: None,
             assignee_id: None,
@@ -563,5 +564,57 @@ mod tests {
         assert!(rows[0].collapsed);
         assert!(rows[0].has_children);
         assert_eq!(rows[0].direct_summary, Some((0, 1)));
+    }
+
+    #[test]
+    fn render_task_rows_direct_summary_should_agree_with_core_progress_field() {
+        // Regression test tying this module's own `direct_summary`
+        // `(complete, total)` counting to `bala_core`'s independently
+        // implemented `Task::progress` rollup (`rollup::direct_children_progress`,
+        // driven through `Core`), so the two "how many direct children are
+        // complete" computations can't silently drift apart.
+        use bala_core::{Core, InMemoryStore, NewTask, TreeFilter};
+
+        fn new_task(title: &str, parent_ids: Vec<TaskId>) -> NewTask {
+            NewTask {
+                title: title.to_owned(),
+                description: None,
+                parent_ids,
+                type_key: None,
+                start_date: None,
+                due_date: None,
+                assignee_id: None,
+            }
+        }
+
+        let mut core = Core::new(InMemoryStore::default()).unwrap();
+        let parent = core.create_task(new_task("Parent", vec![])).unwrap();
+        let child_a = core
+            .create_task(new_task("Child A", vec![parent.id]))
+            .unwrap();
+        core.complete_task(child_a.id, false).unwrap();
+        core.create_task(new_task("Child B", vec![parent.id]))
+            .unwrap();
+        core.create_task(new_task("Child C", vec![parent.id]))
+            .unwrap();
+
+        let core_progress = core.get_task(parent.id).unwrap().unwrap().progress;
+
+        let tasks = core.get_tree(TreeFilter::default()).unwrap();
+        let collapsed: HashSet<TaskId> = [parent.id].into_iter().collect();
+        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &collapsed);
+        let parent_row = rows.iter().find(|row| row.id == parent.id).unwrap();
+        let (complete, total) = parent_row
+            .direct_summary
+            .expect("collapsed parent with children has a summary");
+
+        #[allow(clippy::cast_precision_loss)]
+        let cli_progress = complete as f32 / total as f32;
+
+        assert!(
+            (cli_progress - core_progress).abs() < f32::EPSILON,
+            "CLI direct_summary ({complete}/{total} = {cli_progress}) disagreed with \
+             Core::Task::progress ({core_progress})"
+        );
     }
 }

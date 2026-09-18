@@ -429,31 +429,48 @@ view without re-querying (HLD §Interfaces guarantee).
 ### 4. Progress rollup (Story 3.3 AC1–5)
 
 Computed on read inside `get_tree`, never stored, never computed by a
-caller (HLD guarantee). Single post-order traversal per call:
+caller (HLD guarantee). A task's `progress` is derived from its **direct**
+children's own `status` flag only — never from a child's own (separately
+computed) `progress`, and never by looking past direct children to
+grandchildren:
 
 ```
-fn rollup(task, children) -> f32 {
+fn direct_children_progress(children, own_status) -> f32 {
     if children.is_empty() {
-        return match task.status { Complete => 1.0, Incomplete => 0.0 };  // AC5
+        return match own_status { Complete => 1.0, Incomplete => 0.0 };  // AC5
     }
-    children.iter().map(|c| c.progress).sum::<f32>() / children.len() as f32
+    children.iter()
+        .map(|c| match c.status { Complete => 1.0, Incomplete => 0.0 })
+        .sum::<f32>() / children.len() as f32
 }
 ```
 
+This is the corrected formula: averaging children's own `progress`
+(rather than their `status`) would leak grandchildren's completion two
+levels up, contradicting AC2. For example, a task with two direct
+children, each itself `Complete` but each carrying ten incomplete
+grandchildren of its own, rolls up to `1.0` (2 of 2 direct children
+complete) — the grandchildren never factor in, because only the direct
+children's own `status` is consulted, not their `progress`.
+
 A task's own `status` is independent of its rollup number once it has
 children (AC4) — `progress` and `status` are reported as two separate
-fields on `Task`, never conflated. O(n) for the whole tree per
-`get_tree` call, not O(n) per task.
+fields on `Task`, never conflated. Because the formula only ever reads
+each direct child's `status` (not its `progress`), there is no recursion
+and nothing to memoize: computing one task's `progress` is a single flat
+lookup of its direct children's `status`, independent of traversal order
+or of any other task's rollup. `get_tree` computes this once per result
+task, each a `list_child_edges` + `get_task`-per-child lookup — O(n) for
+the whole tree per call, not O(n) per task.
 
 With multiple parents, "children" is the reverse lookup — every task
 whose `parent_ids` contains this task's id — and a task shared by two
-parents contributes its `progress` **in full to each parent
-independently**; there's no splitting or normalization across parents
-(a task at 50% counts as 50% toward both Goal A's and Goal B's rollup).
-That also means the hierarchy is walked as a DAG here too: the
-post-order traversal memoizes each task's computed `progress` by id, so
-a task reachable under two parents is computed once and reused, not
-recomputed once per path to it.
+parents contributes its `status` **independently to each parent's own
+average**; there's no splitting, normalization, or memoization concern
+across parents, since this is a per-parent lookup of `list_child_edges`
+and each direct child's `status`, not a graph traversal (a Complete
+shared child counts as a full `1.0` toward both Goal A's and Goal B's
+rollup, computed separately for each).
 
 ### 5. `complete_task` (Story 1.4 AC2, resolved per §Context)
 
@@ -567,9 +584,12 @@ flagged at the HLD level, not solved by adding locking here.
   of dependency types), assert the post-cascade graph satisfies each
   edge's own type-specific constraint and that `preview_cascade` and
   `update_task` agree on the touched set before the latter commits.
-- Multi-parent rollup: a task shared by two parents contributes its full
-  `progress` to both independently; assert the rollup traversal computes
-  it once (not once per parent) via a call-count/memoization check.
+- Multi-parent rollup: a task shared by two parents contributes its own
+  `status` to each parent's average independently, computed per-parent
+  from that parent's own `list_child_edges`; since this is a flat
+  per-parent lookup rather than a graph traversal, there's no
+  memoization concern to test — each parent's `get_tree` result should
+  simply reflect only its own direct children.
 
 ## Deferred to Other LLDs
 

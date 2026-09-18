@@ -14,6 +14,7 @@ use crate::model::{
     DeleteMode, Field, NewTask, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User,
     UserId,
 };
+use crate::rollup;
 use crate::store::{Store, StoreError, StoreTx};
 
 /// The stable key of the default task type every `Core` seeds on
@@ -148,13 +149,14 @@ impl<S: Store> Core<S> {
         }
 
         let now = Utc::now();
-        let task = Task {
+        let mut task = Task {
             id: TaskId::new(),
             title: new.title,
             description: new.description,
             parent_ids: new.parent_ids,
             type_key,
             status: TaskStatus::Incomplete,
+            progress: 0.0,
             start_date: new.start_date,
             due_date: new.due_date,
             assignee_id: new.assignee_id,
@@ -164,7 +166,7 @@ impl<S: Store> Core<S> {
             completed_at: None,
         };
 
-        self.store.transaction(|tx| {
+        let progress = self.store.transaction(|tx| {
             // Every hierarchy check runs before any write (`put_task` or
             // `add_parent_edge`) — matching `set_parents`'s "validate every
             // candidate before mutating anything" discipline. A rejected
@@ -181,8 +183,16 @@ impl<S: Store> Core<S> {
             for &parent_id in &task.parent_ids {
                 tx.add_parent_edge(parent_id, task.id)?;
             }
-            Ok(Ok(()))
+            // A just-created task has no children of its own yet (nothing
+            // can point at `task.id` before this call), so this always
+            // degenerates to the same `0.0` a leaf-only placeholder would
+            // give — but it's computed via the shared helper, after
+            // `put_task`, for consistency with every other `Task`-returning
+            // method rather than assumed.
+            let progress = compute_progress(tx, task.id, task.status)?;
+            Ok(Ok(progress))
         })??;
+        task.progress = progress;
 
         Ok(task)
     }
@@ -199,7 +209,13 @@ impl<S: Store> Core<S> {
     ///
     /// Returns `Err` if the backend fails.
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>, CoreError> {
-        Ok(self.store.transaction(|tx| tx.get_task(id))?)
+        Ok(self.store.transaction(|tx| {
+            let Some(mut task) = tx.get_task(id)? else {
+                return Ok(None);
+            };
+            task.progress = compute_progress(tx, id, task.status)?;
+            Ok(Some(task))
+        })?)
     }
 
     /// Lists `id`'s direct children only — not grandchildren or any deeper
@@ -218,18 +234,32 @@ impl<S: Store> Core<S> {
     /// Returns `Err` if the backend fails.
     pub fn list_children(&self, id: TaskId) -> Result<Vec<Task>, CoreError> {
         Ok(self.store.transaction(|tx| {
-            tx.list_child_edges(id)?
+            let mut children = tx
+                .list_child_edges(id)?
                 .into_iter()
                 .filter_map(|child_id| tx.get_task(child_id).transpose())
-                .collect::<Result<Vec<Task>, StoreError>>()
+                .collect::<Result<Vec<Task>, StoreError>>()?;
+            for child in &mut children {
+                child.progress = compute_progress(tx, child.id, child.status)?;
+            }
+            Ok(children)
         })?)
     }
 
-    /// Lists tasks matching `filter`.
+    /// Lists tasks matching `filter`, with each result's `progress`
+    /// overwritten by a direct-children rollup (LLD §Algorithm 4, Story
+    /// 3.3 AC1/AC2/AC5): for each task `Store::list_tasks` returns, its
+    /// direct children are fetched (`StoreTx::list_child_edges` +
+    /// `StoreTx::get_task`, the same pattern `list_children` uses) and
+    /// [`rollup::direct_children_progress`] averages their `status` flags —
+    /// a leaf task's `progress` falls back to its own `status` (AC5).
+    /// Hierarchy assembly beyond what `Task::parent_ids` already carries is
+    /// still out of scope.
     ///
-    /// Scoped to this checkpoint: a thin pass-through to
-    /// `Store::list_tasks`, with no progress rollup (Story 3.3) or
-    /// hierarchy assembly beyond what `Task::parent_ids` already carries.
+    /// The base list and every per-task child lookup run inside the same
+    /// `Store::transaction` closure, so the whole read is one atomic
+    /// snapshot rather than separate transactions that could observe a
+    /// concurrent write differently between the list and a child fetch.
     ///
     /// # Errors
     ///
@@ -239,7 +269,18 @@ impl<S: Store> Core<S> {
     // build fresh per call rather than reuse.
     #[allow(clippy::needless_pass_by_value)]
     pub fn get_tree(&self, filter: TreeFilter) -> Result<Vec<Task>, CoreError> {
-        Ok(self.store.transaction(|tx| tx.list_tasks(&filter))?)
+        Ok(self.store.transaction(|tx| {
+            let mut tasks = tx.list_tasks(&filter)?;
+            for task in &mut tasks {
+                let children = tx
+                    .list_child_edges(task.id)?
+                    .into_iter()
+                    .filter_map(|child_id| tx.get_task(child_id).transpose())
+                    .collect::<Result<Vec<Task>, StoreError>>()?;
+                task.progress = rollup::direct_children_progress(&children, task.status);
+            }
+            Ok(tasks)
+        })?)
     }
 
     /// Lists every configured task type.
@@ -341,6 +382,13 @@ impl<S: Store> Core<S> {
                 Field::Clear => task.assignee_id = None,
             }
 
+            // `patch` never touches `status`, but `progress` is
+            // library-computed and not reliably round-tripped by every
+            // `Store` impl (`bala-store`'s row conversion always returns
+            // `0.0`), so it's re-derived via the shared `compute_progress`
+            // rollup on every write rather than trusted from the fetched
+            // `task`.
+            task.progress = compute_progress(tx, id, task.status)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -413,6 +461,17 @@ impl<S: Store> Core<S> {
                     let mut deleted = task;
                     deleted.deleted_at = Some(now);
                     deleted.updated_at = now;
+                    // `status` is untouched by a delete, but `progress` is
+                    // re-derived rather than trusted from the fetched row —
+                    // see `update_task`'s matching comment. Computed here,
+                    // before the loop below reparents `deleted`'s children
+                    // onto its own parents, so it reflects `deleted`'s last
+                    // live children set rather than an artificially empty
+                    // one — see this method's doc comment / the report for
+                    // why a tombstoned task's `progress` is still computed
+                    // this way rather than left at its stale pre-delete
+                    // value.
+                    deleted.progress = compute_progress(tx, id, deleted.status)?;
                     tx.put_task(&deleted)?;
                     touched.push(deleted);
 
@@ -429,6 +488,11 @@ impl<S: Store> Core<S> {
                                     child_task.parent_ids.push(grandparent);
                                 }
                             }
+                            // `child`'s own children are untouched by this
+                            // reparent (only its *parent* edges change), so
+                            // this is safe to compute at any point in the
+                            // loop.
+                            child_task.progress = compute_progress(tx, child, child_task.status)?;
                             child_task.updated_at = now;
                             tx.put_task(&child_task)?;
                             touched.push(child_task);
@@ -470,6 +534,7 @@ impl<S: Store> Core<S> {
             };
 
             task.status = TaskStatus::Incomplete;
+            task.progress = compute_progress(tx, id, task.status)?;
             task.completed_at = None;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
@@ -505,6 +570,10 @@ impl<S: Store> Core<S> {
             };
 
             task.deleted_at = None;
+            // `status` is untouched by a restore, but `progress` is
+            // re-derived rather than trusted from the fetched row — see
+            // `update_task`'s matching comment.
+            task.progress = compute_progress(tx, id, task.status)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -565,6 +634,12 @@ impl<S: Store> Core<S> {
             } else if task.status != TaskStatus::Complete {
                 let mut task = task;
                 task.status = TaskStatus::Complete;
+                // `incomplete_descendants` above already confirmed every
+                // descendant of `id` is Complete (that's exactly why we're
+                // in this non-cascade branch at all), so `id`'s direct
+                // children are already at their final status — no ordering
+                // hazard like `mark_complete_subtree`'s below.
+                task.progress = compute_progress(tx, id, task.status)?;
                 task.completed_at = Some(now);
                 task.updated_at = now;
                 tx.put_task(&task)?;
@@ -633,6 +708,12 @@ impl<S: Store> Core<S> {
             }
 
             task.parent_ids = new_parents;
+            // `status` is untouched by a reparent, and neither is `id`'s
+            // own children set (only `id`'s *parent* edges change here), so
+            // recomputing via `compute_progress` is safe and leaves every
+            // sibling under the old/new parent(s) untouched — this call
+            // never writes any row but `id`'s own.
+            task.progress = compute_progress(tx, id, task.status)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -641,6 +722,30 @@ impl<S: Store> Core<S> {
 
         Ok(task)
     }
+}
+
+/// Computes `id`'s current progress from its direct children (LLD
+/// §Algorithm 4), the single shared entry point every `Task`-returning
+/// facade method uses instead of re-deriving a leaf-only placeholder from
+/// `status` alone.
+///
+/// Fetches `id`'s direct children the same way `get_tree`/`list_children`
+/// already do (`StoreTx::list_child_edges` + `StoreTx::get_task`, skipping
+/// any child id that no longer resolves) and hands them to
+/// [`rollup::direct_children_progress`] along with `status` — `id`'s own
+/// current status, passed in rather than re-fetched, since every call site
+/// already has it in hand from the row it just read or is about to write.
+fn compute_progress(
+    tx: &mut dyn StoreTx,
+    id: TaskId,
+    status: TaskStatus,
+) -> Result<f32, StoreError> {
+    let children = tx
+        .list_child_edges(id)?
+        .into_iter()
+        .filter_map(|child_id| tx.get_task(child_id).transpose())
+        .collect::<Result<Vec<Task>, StoreError>>()?;
+    Ok(rollup::direct_children_progress(&children, status))
 }
 
 /// Collects the ids of every descendant of `id`, at any depth, whose
@@ -689,6 +794,18 @@ fn incomplete_descendants(tx: &mut dyn StoreTx, id: TaskId) -> Result<Vec<TaskId
 /// [`TaskStatus::Complete`] is walked through (to reach further
 /// descendants) but not re-written or added to `touched`, so its
 /// `completed_at` isn't clobbered and it isn't double-counted.
+///
+/// Two passes, deliberately: the first flips every not-yet-complete
+/// descendant's `status`/`completed_at`/`updated_at` and commits it, without
+/// touching `progress` at all; only once every status in the subtree has
+/// reached its final value does a second pass compute each touched task's
+/// `progress` via [`compute_progress`]. A single combined pass would read a
+/// wrong, stale `progress` for any task processed before its own children —
+/// the work-stack order here visits `id` itself before descending into its
+/// children, so `compute_progress(tx, id, ...)` at that point would see
+/// children whose `status` hadn't been flipped to `Complete` yet, silently
+/// under-reporting `id`'s rolled-up progress even though the whole subtree
+/// ends up `Complete` by the time this function returns.
 fn mark_complete_subtree(
     tx: &mut dyn StoreTx,
     id: TaskId,
@@ -697,6 +814,7 @@ fn mark_complete_subtree(
 ) -> Result<(), StoreError> {
     let mut visited = std::collections::HashSet::new();
     let mut pending = vec![id];
+    let mut touched_ids = Vec::new();
 
     while let Some(current) = pending.pop() {
         if !visited.insert(current) {
@@ -712,10 +830,19 @@ fn mark_complete_subtree(
             task.completed_at = Some(now);
             task.updated_at = now;
             tx.put_task(&task)?;
-            touched.push(task);
+            touched_ids.push(current);
         }
 
         pending.extend(tx.list_child_edges(current)?);
+    }
+
+    for touched_id in touched_ids {
+        let Some(mut task) = tx.get_task(touched_id)? else {
+            continue;
+        };
+        task.progress = compute_progress(tx, touched_id, task.status)?;
+        tx.put_task(&task)?;
+        touched.push(task);
     }
 
     Ok(())
@@ -748,6 +875,14 @@ fn tombstone_subtree(
             continue;
         };
         task.deleted_at = Some(now);
+        // `status` is untouched by a delete, but `progress` is re-derived
+        // rather than trusted from the fetched row — see `update_task`'s
+        // matching comment. Computed here, before the child-edge loop below
+        // removes `current`'s edges to its children, so it reflects
+        // `current`'s last live children set (the edges are about to be
+        // severed either way, as part of this same tombstone) rather than
+        // an artificially empty one.
+        task.progress = compute_progress(tx, current, task.status)?;
         task.updated_at = now;
         tx.put_task(&task)?;
         touched.push(task);
@@ -760,6 +895,10 @@ fn tombstone_subtree(
                 pending.push(child);
             } else if let Some(mut child_task) = tx.get_task(child)? {
                 child_task.parent_ids.retain(|&p| p != current);
+                // `child`'s own children are untouched by this edge removal
+                // (only its *parent* edges change), so this is safe to
+                // compute regardless of loop order.
+                child_task.progress = compute_progress(tx, child, child_task.status)?;
                 child_task.updated_at = now;
                 tx.put_task(&child_task)?;
                 touched.push(child_task);
@@ -943,6 +1082,69 @@ mod tests {
     }
 
     #[test]
+    fn get_tree_should_reflect_updated_child_completion_immediately() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child_a = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child A")
+            })
+            .unwrap();
+        let _child_b = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child B")
+            })
+            .unwrap();
+
+        let tree_before = core.get_tree(TreeFilter::default()).unwrap();
+        let parent_before = tree_before.iter().find(|t| t.id == parent.id).unwrap();
+        assert!((parent_before.progress - 0.0).abs() < f32::EPSILON);
+
+        core.complete_task(child_a.id, false).unwrap();
+
+        let tree_after = core.get_tree(TreeFilter::default()).unwrap();
+        let parent_after = tree_after.iter().find(|t| t.id == parent.id).unwrap();
+        assert!((parent_after.progress - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn get_tree_should_compute_each_parents_progress_from_its_own_direct_children_when_task_has_multiple_parents()
+     {
+        let mut core = new_core();
+        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
+        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
+
+        // Shared child, Complete, under both parents.
+        let shared = core
+            .create_task(NewTask {
+                parent_ids: vec![parent_a.id, parent_b.id],
+                ..minimal_new_task("Shared child")
+            })
+            .unwrap();
+        core.complete_task(shared.id, false).unwrap();
+
+        // Parent A's other child stays Incomplete -> Parent A averages
+        // 1 of 2 complete = 0.5.
+        core.create_task(NewTask {
+            parent_ids: vec![parent_a.id],
+            ..minimal_new_task("Parent A's other child")
+        })
+        .unwrap();
+
+        // Parent B has no other children -> Parent B averages 1 of 1
+        // complete = 1.0.
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        let goal_after = tree.iter().find(|t| t.id == parent_a.id).unwrap();
+        let project_after = tree.iter().find(|t| t.id == parent_b.id).unwrap();
+
+        assert!((goal_after.progress - 0.5).abs() < f32::EPSILON);
+        assert!((project_after.progress - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn get_tree_should_include_a_just_created_task() {
         let mut core = new_core();
 
@@ -1019,6 +1221,15 @@ mod tests {
         let task = core.create_task(minimal_new_task("New")).unwrap();
 
         assert_eq!(task.status, TaskStatus::Incomplete);
+    }
+
+    #[test]
+    fn create_task_should_set_progress_zero_for_new_incomplete_task() {
+        let mut core = new_core();
+
+        let task = core.create_task(minimal_new_task("New")).unwrap();
+
+        assert!((task.progress - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -1854,6 +2065,17 @@ mod tests {
     }
 
     #[test]
+    fn complete_task_should_set_progress_one_for_completed_leaf_task() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Leaf")).unwrap();
+
+        let touched = core.complete_task(task.id, false).unwrap();
+
+        assert_eq!(touched.len(), 1);
+        assert!((touched[0].progress - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn complete_task_should_block_when_children_incomplete_and_cascade_false() {
         let mut core = new_core();
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
@@ -2274,5 +2496,136 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated.parent_ids, vec![parent_a.id, parent_b.id]);
+    }
+
+    #[test]
+    fn get_task_should_return_current_progress_reflecting_direct_children() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child_a = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child A")
+            })
+            .unwrap();
+        core.complete_task(child_a.id, false).unwrap();
+        core.create_task(NewTask {
+            parent_ids: vec![parent.id],
+            ..minimal_new_task("Child B")
+        })
+        .unwrap();
+
+        let fetched = core.get_task(parent.id).unwrap().unwrap();
+
+        assert!((fetched.progress - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn list_children_should_return_each_childs_own_computed_progress() {
+        let mut core = new_core();
+        let root = core.create_task(minimal_new_task("Root")).unwrap();
+        let mid = core
+            .create_task(NewTask {
+                parent_ids: vec![root.id],
+                ..minimal_new_task("Mid")
+            })
+            .unwrap();
+        let grandchild = core
+            .create_task(NewTask {
+                parent_ids: vec![mid.id],
+                ..minimal_new_task("Grandchild")
+            })
+            .unwrap();
+        core.complete_task(grandchild.id, false).unwrap();
+
+        let children = core.list_children(root.id).unwrap();
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, mid.id);
+        // `mid`'s own progress is a rollup of ITS direct child
+        // (`grandchild`, now Complete) — not `root`'s placeholder and not
+        // `grandchild`'s own progress.
+        assert!((children[0].progress - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn update_task_should_return_current_progress_not_stale_placeholder() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+        core.complete_task(child.id, false).unwrap();
+
+        let updated = core
+            .update_task(
+                parent.id,
+                TaskPatch {
+                    title: Field::Set("Parent renamed".to_owned()),
+                    ..TaskPatch::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.len(), 1);
+        assert!((updated[0].progress - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn complete_task_cascade_should_return_progress_one_for_every_completed_leaf() {
+        let mut core = new_core();
+        let root = core.create_task(minimal_new_task("Root")).unwrap();
+        let mid = core
+            .create_task(NewTask {
+                parent_ids: vec![root.id],
+                ..minimal_new_task("Mid")
+            })
+            .unwrap();
+        let leaf = core
+            .create_task(NewTask {
+                parent_ids: vec![mid.id],
+                ..minimal_new_task("Leaf")
+            })
+            .unwrap();
+
+        let touched = core.complete_task(root.id, true).unwrap();
+
+        for id in [root.id, mid.id, leaf.id] {
+            let task = touched.iter().find(|t| t.id == id).unwrap();
+            assert!(
+                (task.progress - 1.0).abs() < f32::EPSILON,
+                "expected progress 1.0 for {id:?}, got {}",
+                task.progress
+            );
+        }
+    }
+
+    #[test]
+    fn set_parents_should_leave_siblings_progress_unaffected_by_reparenting() {
+        let mut core = new_core();
+        let old_parent = core.create_task(minimal_new_task("Old parent")).unwrap();
+        let new_parent = core.create_task(minimal_new_task("New parent")).unwrap();
+        let task = core
+            .create_task(NewTask {
+                parent_ids: vec![old_parent.id],
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+        let sibling = core
+            .create_task(NewTask {
+                parent_ids: vec![old_parent.id],
+                ..minimal_new_task("Sibling")
+            })
+            .unwrap();
+        core.complete_task(sibling.id, false).unwrap();
+        let sibling_progress_before = core.get_task(sibling.id).unwrap().unwrap().progress;
+
+        core.set_parents(task.id, vec![new_parent.id]).unwrap();
+
+        let sibling_progress_after = core.get_task(sibling.id).unwrap().unwrap().progress;
+        assert!((sibling_progress_after - sibling_progress_before).abs() < f32::EPSILON);
     }
 }

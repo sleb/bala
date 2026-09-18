@@ -43,6 +43,9 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
             parent_ids: Vec::new(),
             type_key,
             status: status_from_text(&status_text)?,
+            // Not a stored column — `Core` always overwrites this on every
+            // write path (never persisted, never meaningfully read back).
+            progress: 0.0,
             start_date: start_date.map(|s| date_from_text(&s)).transpose()?,
             due_date: due_date.map(|s| date_from_text(&s)).transpose()?,
             assignee_id: assignee_id.map(|b| blob_to_user_id(&b)).transpose()?,
