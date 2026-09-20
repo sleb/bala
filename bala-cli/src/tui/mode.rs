@@ -76,6 +76,9 @@ pub enum DetailField {
 /// subtask's title, scoped to the given parent task id. `Parents(TaskId)` is
 /// Story 3.1's other addition: reparenting an existing task (the given task
 /// id), whose buffer holds a comma-separated list of the task's parent ids.
+/// `TypeKey(TaskId)` is Story 3.4's addition: editing an existing task's
+/// (the given task id) `type_key` from the list, whose buffer holds the raw
+/// type key string being typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditableField {
     NewTitle,
@@ -83,4 +86,5 @@ pub enum EditableField {
     Description(TaskId),
     NewSubtaskTitle(TaskId),
     Parents(TaskId),
+    TypeKey(TaskId),
 }

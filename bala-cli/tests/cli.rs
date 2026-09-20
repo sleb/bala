@@ -885,3 +885,140 @@ fn task_mv_with_circular_parent_should_fail_with_nonzero_exit() {
         .assert()
         .failure();
 }
+
+#[test]
+fn task_add_with_unknown_type_should_fail_with_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    bala_cmd(&db_path)
+        .args([
+            "task",
+            "add",
+            "--title",
+            "Ship it",
+            "--type",
+            "bogus-nonexistent-type",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn task_ls_with_type_filter_should_show_only_tasks_of_that_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    add_task(&db_path, &["--title", "Typed task"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "ls", "--type", "task"])
+        .assert()
+        .success()
+        .stdout(contains("Typed task"));
+}
+
+#[test]
+fn task_ls_with_type_filter_for_unused_type_should_show_no_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    add_task(&db_path, &["--title", "Some task"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "ls", "--type", "nonexistent"])
+        .assert()
+        .success()
+        .stdout(contains("Some task").not());
+}
+
+#[test]
+fn task_ls_should_show_each_task_s_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    bala_cmd(&db_path)
+        .args(["type", "set", "milestone", "--label", "Milestone"])
+        .assert()
+        .success();
+    add_task(&db_path, &["--title", "Ship v1", "--type", "milestone"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("milestone"));
+}
+
+#[test]
+fn type_ls_should_include_the_seeded_default_task_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    // `Core::new` seeds a default `"task"` type on first open; force that
+    // open by running any command before `type ls`.
+    add_task(&db_path, &["--title", "Trigger seeding"]);
+
+    bala_cmd(&db_path)
+        .args(["type", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("task"));
+}
+
+#[test]
+fn type_set_should_create_a_new_type_and_type_ls_should_include_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    bala_cmd(&db_path)
+        .args(["type", "set", "goal", "--label", "Goal"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["type", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("goal"))
+        .stdout(contains("Goal"));
+}
+
+#[test]
+fn type_set_should_update_label_without_losing_previously_set_color() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    bala_cmd(&db_path)
+        .args(["type", "set", "goal", "--label", "Goal", "--color", "blue"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["type", "set", "goal", "--label", "Goal Updated"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["type", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("Goal Updated"))
+        .stdout(contains("blue"));
+}
+
+#[test]
+fn task_add_with_type_set_by_type_set_should_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    bala_cmd(&db_path)
+        .args(["type", "set", "goal", "--label", "Goal"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "add", "--title", "x", "--type", "goal"])
+        .assert()
+        .success();
+}

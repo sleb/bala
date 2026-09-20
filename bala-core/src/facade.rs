@@ -1571,6 +1571,73 @@ mod tests {
     }
 
     #[test]
+    fn update_task_should_leave_dates_unchanged_when_only_type_key_changes() {
+        let mut core = new_core();
+        let goal = TaskType {
+            key: "goal".to_owned(),
+            label: "Goal".to_owned(),
+            color: None,
+            sort_order: 1,
+        };
+        core.upsert_task_type(goal).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        let due = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let task = core
+            .create_task(NewTask {
+                start_date: Some(start),
+                due_date: Some(due),
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    type_key: Field::Set("goal".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated[0].type_key, "goal");
+        assert_eq!(updated[0].start_date, Some(start));
+        assert_eq!(updated[0].due_date, Some(due));
+    }
+
+    #[test]
+    fn update_task_should_leave_parent_ids_unchanged_when_only_type_key_changes() {
+        let mut core = new_core();
+        let goal = TaskType {
+            key: "goal".to_owned(),
+            label: "Goal".to_owned(),
+            color: None,
+            sort_order: 1,
+        };
+        core.upsert_task_type(goal).unwrap();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        let updated = core
+            .update_task(
+                child.id,
+                TaskPatch {
+                    type_key: Field::Set("goal".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated[0].type_key, "goal");
+        assert_eq!(updated[0].parent_ids, vec![parent.id]);
+    }
+
+    #[test]
     fn update_task_should_reject_unknown_type_key() {
         let mut core = new_core();
         let task = core.create_task(minimal_new_task("Task")).unwrap();
@@ -2489,6 +2556,31 @@ mod tests {
         assert!(updated.parent_ids.is_empty());
         let parent_children = core.list_children(parent.id).unwrap();
         assert!(!parent_children.iter().any(|t| t.id == task.id));
+    }
+
+    #[test]
+    fn set_parents_should_allow_parent_and_child_of_different_task_types() {
+        let mut core = new_core();
+        let goal = TaskType {
+            key: "goal".to_owned(),
+            label: "Goal".to_owned(),
+            color: None,
+            sort_order: 1,
+        };
+        core.upsert_task_type(goal).unwrap();
+        let parent = core
+            .create_task(NewTask {
+                type_key: Some("goal".to_owned()),
+                ..minimal_new_task("Parent")
+            })
+            .unwrap();
+        let child = core.create_task(minimal_new_task("Child")).unwrap();
+        assert_ne!(parent.type_key, child.type_key);
+
+        let result = core.set_parents(child.id, vec![parent.id]);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().parent_ids, vec![parent.id]);
     }
 
     #[test]

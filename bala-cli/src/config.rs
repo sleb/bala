@@ -78,6 +78,9 @@ pub fn view_state_path() -> Result<PathBuf, ConfigError> {
 pub struct ViewState {
     pub selected: Option<TaskId>,
     pub collapsed: HashSet<TaskId>,
+    /// The active TUI type filter (`Action::CycleTypeFilter`, bound to `f`),
+    /// or `None` when no filter is applied.
+    pub filter_type_key: Option<String>,
 }
 
 /// On-disk shape of `view.toml`. Kept private and separate from
@@ -97,6 +100,11 @@ struct TreeShape {
     /// (which would also discard the file's `selected`).
     #[serde(default)]
     collapsed: Vec<String>,
+    /// Missing from a `view.toml` saved before this field existed — default
+    /// to `None` rather than failing the whole document's deserialization,
+    /// the same tolerance `collapsed` already has.
+    #[serde(default)]
+    filter_type_key: Option<String>,
 }
 
 impl From<&ViewState> for ViewStateShape {
@@ -105,6 +113,7 @@ impl From<&ViewState> for ViewStateShape {
             tree: TreeShape {
                 selected: state.selected.map(|id| id.to_string()),
                 collapsed: state.collapsed.iter().map(ToString::to_string).collect(),
+                filter_type_key: state.filter_type_key.clone(),
             },
         }
     }
@@ -120,6 +129,7 @@ impl From<ViewStateShape> for ViewState {
                 .into_iter()
                 .filter_map(|s| s.parse().ok())
                 .collect(),
+            filter_type_key: shape.tree.filter_type_key,
         }
     }
 }
@@ -175,6 +185,7 @@ mod tests {
         let state = ViewState {
             selected: Some(id),
             collapsed: [collapsed_a, collapsed_b].into_iter().collect(),
+            filter_type_key: Some("goal".to_string()),
         };
 
         let shape = ViewStateShape::from(&state);
@@ -235,6 +246,7 @@ mod tests {
             &ViewState {
                 selected: None,
                 collapsed: [old_id].into_iter().collect(),
+                filter_type_key: None,
             },
         )
         .expect("save old state");
@@ -245,6 +257,7 @@ mod tests {
             &ViewState {
                 selected: None,
                 collapsed: [new_id].into_iter().collect(),
+                filter_type_key: None,
             },
         )
         .expect("save new state");
@@ -255,8 +268,34 @@ mod tests {
             ViewState {
                 selected: None,
                 collapsed: [new_id].into_iter().collect(),
+                filter_type_key: None,
             }
         );
+    }
+
+    #[test]
+    fn load_view_state_should_default_filter_type_key_when_file_predates_the_field() {
+        // Regression, same shape as `collapsed`'s predates-the-field test:
+        // a `view.toml` written before `filter_type_key` existed has only
+        // `selected` under `[tree]`. Without `#[serde(default)]` on
+        // `TreeShape::filter_type_key`, that's a missing-field deserialize
+        // error, which `load_view_state` downgrades to
+        // `ViewState::default()` — silently discarding the user's saved
+        // `selected` too.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+        fs::write(
+            &path,
+            "[tree]\nselected = \"00000000-0000-0000-0000-000000000001\"\n",
+        )
+        .expect("write pre-filter_type_key view.toml");
+
+        let state = load_view_state(&path);
+
+        let selected_id =
+            TaskId::from_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
+        assert_eq!(state.selected, Some(selected_id));
+        assert_eq!(state.filter_type_key, None);
     }
 
     #[test]
@@ -290,6 +329,7 @@ mod tests {
             &ViewState {
                 selected: Some(old_id),
                 collapsed: HashSet::new(),
+                filter_type_key: None,
             },
         )
         .expect("save old state");
@@ -300,6 +340,7 @@ mod tests {
             &ViewState {
                 selected: Some(new_id),
                 collapsed: HashSet::new(),
+                filter_type_key: None,
             },
         )
         .expect("save new state");
@@ -310,6 +351,7 @@ mod tests {
             ViewState {
                 selected: Some(new_id),
                 collapsed: HashSet::new(),
+                filter_type_key: None,
             }
         );
     }

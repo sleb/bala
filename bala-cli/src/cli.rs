@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use bala_core::{
     Core, CoreError, DeleteMode, Field, NewTask, StoreError, Task, TaskId, TaskPatch, TaskStatus,
-    TreeFilter, UserId,
+    TaskType, TreeFilter, UserId,
 };
 use bala_store::SqliteStore;
 use chrono::NaiveDate;
@@ -34,6 +34,8 @@ pub enum Commands {
     Task(TaskArgs),
     /// User operations: `add`, `ls`.
     User(UserArgs),
+    /// Task type operations: `ls`, `set`.
+    Type(TypeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -47,7 +49,7 @@ pub enum TaskCommands {
     /// Create a new task.
     Add(AddArgs),
     /// List all tasks.
-    Ls,
+    Ls(LsArgs),
     /// Edit an existing task.
     Edit(EditArgs),
     /// Delete a task, optionally along with (or promoting) its subtasks.
@@ -91,6 +93,17 @@ pub struct AddArgs {
     /// "parent"`).
     #[arg(long, requires = "parent")]
     pub inherit: bool,
+
+    /// Task type key. Defaults to the seeded `"task"` type when omitted.
+    #[arg(long = "type")]
+    pub type_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LsArgs {
+    /// Only show tasks with this type key.
+    #[arg(long = "type")]
+    pub type_key: Option<String>,
 }
 
 // The four `clear_*` flags below are independent boolean switches (one per
@@ -211,6 +224,35 @@ pub struct UserAddArgs {
     pub name: String,
 }
 
+#[derive(Debug, Args)]
+pub struct TypeArgs {
+    #[command(subcommand)]
+    pub command: TypeCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TypeCommands {
+    /// List all configured task types.
+    Ls,
+    /// Create or update a task type.
+    Set(TypeSetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TypeSetArgs {
+    /// The type's key.
+    pub key: String,
+
+    #[arg(long)]
+    pub label: String,
+
+    #[arg(long)]
+    pub color: Option<String>,
+
+    #[arg(long, value_name = "N")]
+    pub sort_order: Option<i32>,
+}
+
 /// Errors that can surface while dispatching a command, distinct from
 /// `CoreError` only in that it also covers opening the store itself.
 #[derive(Debug, thiserror::Error)]
@@ -278,7 +320,7 @@ pub(crate) fn open_core(db_path: &Path) -> Result<Core<SqliteStore>, CliError> {
 pub fn run_task_command(db_path: &Path, command: TaskCommands) -> Result<(), CliError> {
     match command {
         TaskCommands::Add(args) => run_task_add(db_path, args),
-        TaskCommands::Ls => run_task_ls(db_path),
+        TaskCommands::Ls(args) => run_task_ls(db_path, &args),
         TaskCommands::Edit(args) => run_task_edit(db_path, args),
         TaskCommands::Delete(args) => run_task_delete(db_path, &args),
         TaskCommands::Restore(args) => run_task_restore(db_path, &args),
@@ -320,7 +362,7 @@ fn run_task_add(db_path: &Path, args: AddArgs) -> Result<(), CliError> {
         title: args.title,
         description: args.description,
         parent_ids: args.parent.into_iter().map(TaskId::from).collect(),
-        type_key: None,
+        type_key: args.type_key,
         start_date,
         due_date,
         assignee_id,
@@ -330,9 +372,13 @@ fn run_task_add(db_path: &Path, args: AddArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_task_ls(db_path: &Path) -> Result<(), CliError> {
+fn run_task_ls(db_path: &Path, args: &LsArgs) -> Result<(), CliError> {
     let core = open_core(db_path)?;
-    let tasks = core.get_tree(TreeFilter::default())?;
+    let filter = TreeFilter {
+        type_key: args.type_key.clone(),
+        ..TreeFilter::default()
+    };
+    let tasks = core.get_tree(filter)?;
     let names: HashMap<UserId, String> = core
         .list_users()?
         .into_iter()
@@ -365,9 +411,10 @@ fn format_task_line(task: &Task, names: &HashMap<UserId, String>) -> String {
         ' '
     };
     format!(
-        "{indent}[{marker}] {} {}{assignee}",
+        "{indent}[{marker}] {} {} (type: {}){assignee}",
         Uuid::from(task.id),
-        task.title
+        task.title,
+        task.type_key
     )
 }
 
@@ -519,6 +566,73 @@ fn run_user_ls(db_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Runs the given task-type command against the store at `db_path`,
+/// printing to stdout on success.
+///
+/// # Errors
+///
+/// Returns `Err` if the store can't be opened or the underlying `Core`
+/// call fails.
+pub fn run_type_command(db_path: &Path, command: TypeCommands) -> Result<(), CliError> {
+    match command {
+        TypeCommands::Ls => run_type_ls(db_path),
+        TypeCommands::Set(args) => run_type_set(db_path, args),
+    }
+}
+
+fn run_type_ls(db_path: &Path) -> Result<(), CliError> {
+    let core = open_core(db_path)?;
+    let types = core.list_task_types()?;
+    for t in &types {
+        println!("{}", format_type_line(t));
+    }
+    Ok(())
+}
+
+/// Renders the one-line summary `type ls`/`type set` print:
+/// `"<key> <label> [color=<color>] sort_order=<n>"`. `color` is omitted
+/// entirely when unset, rather than printed as some placeholder, since an
+/// absent color isn't a value worth confusing with a real one.
+fn format_type_line(t: &TaskType) -> String {
+    let color = t
+        .color
+        .as_deref()
+        .map(|c| format!(" color={c}"))
+        .unwrap_or_default();
+    format!("{} {}{color} sort_order={}", t.key, t.label, t.sort_order)
+}
+
+/// Merges `args` onto any existing type with the same key (label always
+/// overwrites; an omitted `--color`/`--sort-order` keeps the existing
+/// type's current value, or defaults to `None`/`0` for a brand-new key)
+/// before upserting.
+fn run_type_set(db_path: &Path, args: TypeSetArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let existing = core
+        .list_task_types()?
+        .into_iter()
+        .find(|t| t.key == args.key);
+
+    let merged = match existing {
+        Some(existing) => TaskType {
+            key: args.key,
+            label: args.label,
+            color: args.color.or(existing.color),
+            sort_order: args.sort_order.unwrap_or(existing.sort_order),
+        },
+        None => TaskType {
+            key: args.key,
+            label: args.label,
+            color: args.color,
+            sort_order: args.sort_order.unwrap_or(0),
+        },
+    };
+
+    let upserted = core.upsert_task_type(merged)?;
+    println!("{}", format_type_line(&upserted));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +677,7 @@ mod tests {
                 due: None,
                 assignee: None,
                 inherit: true,
+                type_key: None,
             },
         )
         .unwrap();

@@ -66,14 +66,16 @@ exist, the same as for `bala.db`.
 
 ### What's persisted
 
-Today, the selected task (stored as `selected = "<uuid>"`) and the set of
-collapsed tasks (stored as `collapsed = ["<uuid>", ...]`), both under a
-`[tree]` table. Other view state described in the design (Gantt
-scale/anchor, filters, "blocked only") isn't persisted yet — those are
-expected to join later as additional keys in `[tree]`, or in sibling tables,
-without breaking this file's format. An unparseable entry in `collapsed` is
-skipped rather than failing the whole file, the same tolerance `selected`
-already has.
+Today, the selected task (stored as `selected = "<uuid>"`), the set of
+collapsed tasks (stored as `collapsed = ["<uuid>", ...]`), and the active
+type filter (stored as `filter_type_key = "<type-key>"`, cycled with `f` in
+the TUI; absent from the file entirely when no filter is applied), all under
+a `[tree]` table. Other view state described in the design (Gantt
+scale/anchor, "blocked only") isn't persisted yet — those are expected to
+join later as additional keys in `[tree]`, or in sibling tables, without
+breaking this file's format. An unparseable entry in `collapsed` is skipped
+rather than failing the whole file, the same tolerance `selected` already
+has.
 
 ### Missing or corrupt file
 
