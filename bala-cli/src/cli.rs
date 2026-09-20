@@ -411,9 +411,10 @@ fn format_task_line(task: &Task, names: &HashMap<UserId, String>) -> String {
         ' '
     };
     format!(
-        "{indent}[{marker}] {} {}{assignee}",
+        "{indent}[{marker}] {} {} (type: {}){assignee}",
         Uuid::from(task.id),
-        task.title
+        task.title,
+        task.type_key
     )
 }
 

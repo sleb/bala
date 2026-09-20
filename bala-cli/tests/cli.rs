@@ -933,6 +933,24 @@ fn task_ls_with_type_filter_for_unused_type_should_show_no_tasks() {
 }
 
 #[test]
+fn task_ls_should_show_each_task_s_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    bala_cmd(&db_path)
+        .args(["type", "set", "milestone", "--label", "Milestone"])
+        .assert()
+        .success();
+    add_task(&db_path, &["--title", "Ship v1", "--type", "milestone"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("milestone"));
+}
+
+#[test]
 fn type_ls_should_include_the_seeded_default_task_type() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("bala.db");

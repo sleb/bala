@@ -1006,15 +1006,29 @@ fn submit_set_type<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buff
 /// `app.type_filter` (`None` filters nothing), caches it as `app.tasks`,
 /// rebuilds `app.rows` via `render::task_rows` (so a newly created/
 /// reparented task lands at its correct nested position, honoring
-/// `app.collapsed`), and reselects the row matching `select_id` if given
-/// (falling back to `App::select_by_id`'s "leave selection untouched"
-/// default otherwise).
+/// `app.collapsed`), and merges every fetched task's description into
+/// `app.descriptions` — a task that a filter previously excluded may have
+/// never been cached, and re-fetching it via a filter change (e.g. `f`)
+/// must not leave a stale `None` behind for `description_of` to hand
+/// `start_edit_description` as if the task genuinely had no description.
+///
+/// Selection: `select_id`, when given, is selected if it's present in the
+/// new `app.rows`. Otherwise — including when `select_id` is `None`, or
+/// names a task the new filter excludes — the selection resets to the
+/// first remaining row, or `None` if the new result set is empty; unlike
+/// `App::select_by_id`'s own "leave selection untouched" default (correct
+/// for restoring a persisted startup selection), silently keeping a stale
+/// numeric index here would leave it dangling past the end of a shrunk row
+/// list, or pointing at an unrelated row of the same length.
 fn refresh_rows_from_tree<S: Store>(app: &mut App, core: &mut Core<S>, select_id: Option<TaskId>) {
     match core.get_tree(bala_core::TreeFilter {
         type_key: app.type_filter.clone(),
         ..Default::default()
     }) {
         Ok(tasks) => {
+            for task in &tasks {
+                app.descriptions.insert(task.id, task.description.clone());
+            }
             app.tasks = tasks;
             app.rows = render::task_rows(
                 &app.tasks,
@@ -1022,7 +1036,9 @@ fn refresh_rows_from_tree<S: Store>(app: &mut App, core: &mut Core<S>, select_id
                 &app.user_names,
                 &app.collapsed,
             );
-            app.select_by_id(select_id);
+            app.selected = select_id
+                .and_then(|id| app.rows.iter().position(|row| row.id == id))
+                .or(if app.rows.is_empty() { None } else { Some(0) });
         }
         Err(err) => {
             app.error = Some(err.to_string());
@@ -2943,5 +2959,99 @@ mod tests {
 
         assert_eq!(app.rows().len(), 1);
         assert_eq!(app.rows()[0].id, goal_task.id);
+    }
+
+    #[test]
+    fn refresh_rows_from_tree_should_populate_descriptions_for_newly_visible_tasks() {
+        let mut core = core();
+        core.upsert_task_type(bala_core::TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .expect("upsert_task_type should succeed");
+        let goal_task = core
+            .create_task(bala_core::NewTask {
+                description: Some("important note".to_string()),
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("A goal")
+            })
+            .expect("create_task should succeed");
+        // Start filtered to exclude the goal task, so it's never made it into
+        // `app.descriptions` — mirrors a real session where the TUI launched
+        // with a persisted `filter_type_key` narrower than "everything".
+        let mut app = App::new(vec![])
+            .with_type_filter_state(Some("task".to_string()), vec!["task".to_string()]);
+        super::refresh_rows_from_tree(&mut app, &mut core, None);
+        assert!(app.description_of(goal_task.id).is_none());
+
+        // Cycling (or otherwise clearing) the filter reveals the goal task —
+        // its description must come along, not silently read back as "none"
+        // the next time it's edited.
+        app.type_filter = None;
+        super::refresh_rows_from_tree(&mut app, &mut core, None);
+
+        assert_eq!(app.description_of(goal_task.id), Some("important note"));
+    }
+
+    #[test]
+    fn refresh_rows_from_tree_should_select_first_row_when_selected_task_is_filtered_out() {
+        let mut core = core();
+        core.upsert_task_type(bala_core::TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .expect("upsert_task_type should succeed");
+        let goal_task = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal task")
+            })
+            .expect("create_task should succeed");
+        let plain_task = core
+            .create_task(minimal_new_task("Plain task"))
+            .expect("create_task should succeed");
+        // `goal_task` sits at index 1 so a stale, un-reset `selected` (left
+        // over from a longer row list) would point past the end of the
+        // single-row result below, not merely at the wrong-but-in-bounds row.
+        let mut app = App::new(vec![row_for(&plain_task), row_for(&goal_task)]);
+        app.selected = Some(1);
+
+        // Simulate cycling the filter to "task": the previously selected
+        // task (goal_task, at stale index 1) is no longer in the result set.
+        app.type_filter = Some("task".to_string());
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(goal_task.id));
+
+        assert_eq!(app.rows().len(), 1);
+        assert_eq!(app.selected_index(), Some(0));
+        assert_eq!(app.selected_row().unwrap().id, plain_task.id);
+    }
+
+    #[test]
+    fn refresh_rows_from_tree_should_clear_selection_when_filter_leaves_no_rows() {
+        let mut core = core();
+        core.upsert_task_type(bala_core::TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .expect("upsert_task_type should succeed");
+        let goal_task = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal task")
+            })
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&goal_task)]);
+
+        app.type_filter = Some("nonexistent".to_string());
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(goal_task.id));
+
+        assert!(app.rows().is_empty());
+        assert_eq!(app.selected_index(), None);
     }
 }

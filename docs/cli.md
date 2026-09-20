@@ -197,11 +197,11 @@ bala task ls --type task
 | --- | --- | --- |
 | `--type` | no | Only show tasks with this type key. Filtering by a key no task currently has (including one that isn't configured) simply shows no tasks — it's a plain filter, not an existence check. |
 
-Output is one task per line: `[<marker>] <id> <title>`, plus
-` (assigned: <name>)` when the task has an assignee. `<marker>` is `x` for a
-completed task and a space otherwise. A task with at least one parent is
-indented one level; this is a minimal visual cue, not a full recursive tree
-layout (that's planned for the TUI).
+Output is one task per line: `[<marker>] <id> <title> (type: <type-key>)`,
+plus ` (assigned: <name>)` when the task has an assignee. `<marker>` is `x`
+for a completed task and a space otherwise. A task with at least one parent
+is indented one level; this is a minimal visual cue, not a full recursive
+tree layout (that's planned for the TUI).
 
 ### `bala task edit`
 
