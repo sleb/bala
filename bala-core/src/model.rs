@@ -2,6 +2,7 @@
 //! input, and task-type configuration.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Identifies a [`Task`]. Wraps a [`Uuid`] so a `TaskId` can never be passed
@@ -222,6 +223,83 @@ pub struct TaskPatch {
     /// `Clear` unassigns the task.
     pub assignee_id: Field<UserId>,
     pub type_key: Field<String>,
+}
+
+/// The complete set of parents a task sits under, as written by
+/// [`StoreTx::replace_parent_edges`](crate::StoreTx::replace_parent_edges).
+///
+/// `Under` holds at least one id; use [`Parents::from_ids`] to build one from
+/// a possibly-empty list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parents {
+    /// No parent: the task is at the top level.
+    TopLevel,
+    /// One or more parents (never empty).
+    Under(Vec<TaskId>),
+}
+
+impl Parents {
+    /// Builds `TopLevel` from an empty list and `Under` otherwise.
+    #[must_use]
+    pub fn from_ids(ids: Vec<TaskId>) -> Self {
+        if ids.is_empty() {
+            Self::TopLevel
+        } else {
+            Self::Under(ids)
+        }
+    }
+
+    /// The parent ids: empty for `TopLevel`.
+    #[must_use]
+    pub fn ids(&self) -> &[TaskId] {
+        match self {
+            Self::TopLevel => &[],
+            Self::Under(ids) => ids,
+        }
+    }
+}
+
+/// Where a re-parented task lands among its new siblings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// After all existing siblings.
+    End,
+    /// Immediately after the given sibling, in each newly added parent's
+    /// children that contains it. For a parent whose children do not include
+    /// the sibling (or when the sibling is the child itself) this falls back
+    /// to [`Placement::End`]. Parents the child already has keep their
+    /// position.
+    After(TaskId),
+}
+
+/// Which way [`Core::move_sibling`](crate::Core::move_sibling) moves a task
+/// among its siblings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Toward the front of the sibling list (earlier).
+    Up,
+    /// Toward the back of the sibling list (later).
+    Down,
+}
+
+/// The sibling order of every live task, keyed by parent (`None` = the
+/// top-level list). Built by `Core::sibling_order`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SiblingOrder(HashMap<Option<TaskId>, Vec<TaskId>>);
+
+impl SiblingOrder {
+    /// The children of `parent` in order; `None` is the top level. Empty when
+    /// `parent` has no live children.
+    #[must_use]
+    pub fn children_of(&self, parent: Option<TaskId>) -> &[TaskId] {
+        self.0.get(&parent).map_or(&[], Vec::as_slice)
+    }
+}
+
+impl From<HashMap<Option<TaskId>, Vec<TaskId>>> for SiblingOrder {
+    fn from(map: HashMap<Option<TaskId>, Vec<TaskId>>) -> Self {
+        Self(map)
+    }
 }
 
 #[cfg(test)]

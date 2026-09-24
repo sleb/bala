@@ -81,6 +81,18 @@ pub enum Action {
     CollapseAll,
     /// `Normal` mode, `List` pane, `f`: cycle the active type filter.
     CycleTypeFilter,
+    /// `Normal` mode, `List` pane, `J`: move the focused task down among its
+    /// siblings (under the parent it is rendered beneath).
+    MoveTaskDown,
+    /// `Normal` mode, `List` pane, `K`: move the focused task up among its
+    /// siblings (under the parent it is rendered beneath).
+    MoveTaskUp,
+    /// `Normal` mode, `List` pane, `L`: indent the focused task under its
+    /// previous sibling (it becomes that sibling's last child).
+    IndentTask,
+    /// `Normal` mode, `List` pane, `H`: outdent the focused task to its
+    /// parent's level, right after that parent.
+    OutdentTask,
     /// No mapping for this key in this mode/pane.
     Noop,
 }
@@ -189,6 +201,30 @@ pub static NORMAL_LIST_BINDINGS: &[Binding] = &[
         action: Action::CollapseAll,
         label: "C",
         description: "Collapse all tasks",
+    },
+    Binding {
+        keys: &[KeyCode::Char('J')],
+        action: Action::MoveTaskDown,
+        label: "J",
+        description: "Move task down among siblings",
+    },
+    Binding {
+        keys: &[KeyCode::Char('K')],
+        action: Action::MoveTaskUp,
+        label: "K",
+        description: "Move task up among siblings",
+    },
+    Binding {
+        keys: &[KeyCode::Char('L')],
+        action: Action::IndentTask,
+        label: "L",
+        description: "Indent task under previous sibling",
+    },
+    Binding {
+        keys: &[KeyCode::Char('H')],
+        action: Action::OutdentTask,
+        label: "H",
+        description: "Outdent task to parent's level",
     },
     Binding {
         keys: &[KeyCode::Char('t')],
@@ -424,6 +460,80 @@ mod tests {
         );
 
         assert_eq!(action, Action::StartInsertNewTitle);
+    }
+
+    #[test]
+    fn key_to_action_should_map_uppercase_j_and_k_to_move_task() {
+        let map = |c| {
+            key_to_action(
+                &Mode::Normal,
+                Pane::List,
+                DetailField::Title,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT),
+            )
+        };
+
+        assert_eq!(map('J'), Action::MoveTaskDown);
+        assert_eq!(map('K'), Action::MoveTaskUp);
+    }
+
+    #[test]
+    fn key_to_action_should_map_uppercase_h_and_l_to_outdent_and_indent() {
+        let map = |c| {
+            key_to_action(
+                &Mode::Normal,
+                Pane::List,
+                DetailField::Title,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT),
+            )
+        };
+
+        assert_eq!(map('L'), Action::IndentTask);
+        assert_eq!(map('H'), Action::OutdentTask);
+    }
+
+    #[test]
+    fn help_overlay_should_list_indent_outdent_keys() {
+        let entries = help_entries(&Mode::Normal, Pane::List, DetailField::Title);
+
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "L" && e.description == "Indent task under previous sibling")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "H" && e.description == "Outdent task to parent's level")
+        );
+    }
+
+    #[test]
+    fn key_to_action_should_not_map_uppercase_j_in_detail_pane() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::Detail,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(action, Action::Noop);
+    }
+
+    #[test]
+    fn help_overlay_should_list_move_keys() {
+        let entries = help_entries(&Mode::Normal, Pane::List, DetailField::Title);
+
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "J" && e.description == "Move task down among siblings")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "K" && e.description == "Move task up among siblings")
+        );
     }
 
     #[test]

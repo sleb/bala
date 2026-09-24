@@ -49,6 +49,17 @@ pub enum CoreError {
         task: TaskId,
         attempted_parent: TaskId,
     },
+
+    #[error("{task:?} is not a child of {}", fmt_parent(*parent))]
+    NotUnderParent {
+        task: TaskId,
+        parent: Option<TaskId>,
+    },
+}
+
+/// Renders a sibling-list key: the parent id, or "the top level" for `None`.
+fn fmt_parent(parent: Option<TaskId>) -> String {
+    parent.map_or_else(|| "the top level".to_owned(), |p| format!("{p:?}"))
 }
 
 #[cfg(test)]
@@ -140,6 +151,30 @@ mod tests {
             format!(
                 "{task:?} has incomplete children: {incomplete:?}; pass cascade=true or complete them first"
             )
+        );
+    }
+
+    #[test]
+    fn not_under_parent_display_names_the_parent() {
+        let task = TaskId::new();
+        let parent = TaskId::new();
+        let err = CoreError::NotUnderParent {
+            task,
+            parent: Some(parent),
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("{task:?} is not a child of {parent:?}")
+        );
+    }
+
+    #[test]
+    fn not_under_parent_display_names_top_level_for_none() {
+        let task = TaskId::new();
+        let err = CoreError::NotUnderParent { task, parent: None };
+        assert_eq!(
+            err.to_string(),
+            format!("{task:?} is not a child of the top level")
         );
     }
 }

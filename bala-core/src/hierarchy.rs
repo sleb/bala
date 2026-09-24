@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use crate::error::CoreError;
-use crate::model::TaskId;
+use crate::model::{Parents, Placement, TaskId};
 use crate::store::StoreTx;
 
 /// Checks that attaching `child` under `parent` would not violate the
@@ -62,11 +62,50 @@ pub fn check_new_parent(
     Ok(())
 }
 
+/// Sets `child`'s complete parent set to `parents`, after checking that no
+/// new parent would make `child` its own ancestor.
+///
+/// This is the only place Core writes parent edges. Every newly added
+/// parent is checked with [`check_new_parent`] before anything is written, so a
+/// rejected call leaves the edges untouched.
+///
+/// # Errors
+///
+/// - [`CoreError::CircularHierarchy`] if any parent in `parents` is `child`
+///   or a descendant of it.
+/// - [`CoreError::Store`] if the backend fails.
+pub fn replace_parents(
+    tx: &mut dyn StoreTx,
+    child: TaskId,
+    parents: &Parents,
+    placement: Placement,
+) -> Result<(), CoreError> {
+    // Only parents `child` doesn't already have can introduce a cycle, so a
+    // pure removal (e.g. deleting a task in a deep chain) skips the
+    // upward walk entirely.
+    let current = tx.list_parent_edges(child)?;
+    for &parent in parents.ids() {
+        if !current.contains(&parent) {
+            check_new_parent(tx, parent, child)?;
+        }
+    }
+    tx.replace_parent_edges(child, parents, placement)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::in_memory_store::InMemoryStore;
-    use crate::store::Store;
+    use crate::model::{Parents, Placement};
+    use crate::store::{Store, StoreError};
+
+    /// Adds `parent` to `child`'s existing parents (test-only graph builder).
+    fn attach(tx: &mut dyn StoreTx, parent: TaskId, child: TaskId) -> Result<(), StoreError> {
+        let mut parents = tx.list_parent_edges(child)?;
+        parents.push(parent);
+        tx.replace_parent_edges(child, &Parents::Under(parents), Placement::End)
+    }
 
     #[test]
     fn check_new_parent_should_allow_attaching_to_a_task_with_no_existing_ancestors() {
@@ -105,7 +144,7 @@ mod tests {
         let parent = TaskId::new();
 
         store
-            .transaction(|tx| tx.add_parent_edge(grandparent, parent))
+            .transaction(|tx| attach(tx, grandparent, parent))
             .unwrap();
 
         let result = store
@@ -136,11 +175,11 @@ mod tests {
 
         store
             .transaction(|tx| {
-                tx.add_parent_edge(grandparent, parent_1)?;
-                tx.add_parent_edge(grandparent, parent_2)?;
-                tx.add_parent_edge(parent_1, task)?;
-                tx.add_parent_edge(parent_2, task)?;
-                tx.add_parent_edge(grandparent, new_parent)
+                attach(tx, grandparent, parent_1)?;
+                attach(tx, grandparent, parent_2)?;
+                attach(tx, parent_1, task)?;
+                attach(tx, parent_2, task)?;
+                attach(tx, grandparent, new_parent)
             })
             .unwrap();
 
@@ -157,7 +196,7 @@ mod tests {
     #[test]
     fn check_new_parent_should_not_overflow_the_stack_on_a_deep_ancestor_chain() {
         // A chain of 2000+ tasks, each parented under the previous one,
-        // built directly via `add_parent_edge` (faster than 2000 real
+        // built directly via the store (faster than 2000 real
         // `create_task` calls and exercises the same store contract).
         // Attaching the far end of the chain back onto the chain's start
         // must be rejected as circular, and must not overflow the stack —
@@ -170,7 +209,7 @@ mod tests {
             .transaction(|tx| {
                 for _ in 0..3000 {
                     let next = TaskId::new();
-                    tx.add_parent_edge(current, next)?;
+                    attach(tx, current, next)?;
                     current = next;
                 }
                 chain_end = current;
@@ -189,5 +228,75 @@ mod tests {
             Err(CoreError::CircularHierarchy { task, attempted_parent })
                 if task == root && attempted_parent == chain_end
         ));
+    }
+}
+
+#[cfg(test)]
+mod replace_parents_tests {
+    use super::*;
+    use crate::in_memory_store::InMemoryStore;
+    use crate::store::Store;
+
+    #[test]
+    fn replace_parents_should_write_edges_when_no_cycle() {
+        let store = InMemoryStore::default();
+        let (parent, child) = (TaskId::new(), TaskId::new());
+
+        store
+            .transaction(|tx| {
+                Ok(replace_parents(
+                    tx,
+                    child,
+                    &Parents::Under(vec![parent]),
+                    Placement::End,
+                ))
+            })
+            .unwrap()
+            .unwrap();
+
+        let edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();
+        assert_eq!(edges, vec![parent]);
+    }
+
+    #[test]
+    fn replace_parents_should_skip_cycle_walk_for_pure_removal() {
+        // Removing a parent is written without an ancestor walk.
+        let store = InMemoryStore::default();
+        let (a, b) = (TaskId::new(), TaskId::new());
+        store
+            .transaction(|tx| tx.replace_parent_edges(b, &Parents::Under(vec![a]), Placement::End))
+            .unwrap();
+
+        store
+            .transaction(|tx| Ok(replace_parents(tx, b, &Parents::TopLevel, Placement::End)))
+            .unwrap()
+            .unwrap();
+
+        let edges = store.transaction(|tx| tx.list_parent_edges(b)).unwrap();
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn replace_parents_should_reject_cycle_without_writing() {
+        let store = InMemoryStore::default();
+        let (a, b) = (TaskId::new(), TaskId::new());
+        store
+            .transaction(|tx| tx.replace_parent_edges(b, &Parents::Under(vec![a]), Placement::End))
+            .unwrap();
+
+        let result = store
+            .transaction(|tx| {
+                Ok(replace_parents(
+                    tx,
+                    a,
+                    &Parents::Under(vec![b]),
+                    Placement::End,
+                ))
+            })
+            .unwrap();
+
+        assert!(matches!(result, Err(CoreError::CircularHierarchy { .. })));
+        let edges = store.transaction(|tx| tx.list_parent_edges(a)).unwrap();
+        assert!(edges.is_empty());
     }
 }

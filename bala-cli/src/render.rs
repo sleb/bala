@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bala_core::{Task, TaskId, TaskStatus, UserId};
+use bala_core::{SiblingOrder, Task, TaskId, TaskStatus, UserId};
 
 /// One row of the task list view: a task's display-ready fields, plus its
 /// nesting depth under whichever root it's being rendered under.
@@ -29,6 +29,11 @@ pub struct TaskRow {
     /// children only (not recursive descendants), present only when the row
     /// is both collapsed and has children; `None` otherwise.
     pub direct_summary: Option<(usize, usize)>,
+    /// The parent this row is rendered under (`None` for a root row).
+    pub parent_id: Option<TaskId>,
+    /// `parent_id`'s own parent on the rendered path (`None` when the row is
+    /// a root or its parent is top-level).
+    pub grandparent_id: Option<TaskId>,
 }
 
 /// Projects every task in `tasks` into a display-ready `TaskRow`, nested
@@ -37,9 +42,9 @@ pub struct TaskRow {
 /// Rows are produced by a pre-order depth-first walk starting from every
 /// "root" task, where a root is a task with no `parent_ids`, or whose
 /// listed parents are all absent from `tasks` (defensive against a partial
-/// input — see below). Roots are visited in `tasks`' input order, and each
-/// task's children (from its `parent_ids`) are visited in `tasks`' input
-/// order too. A task with more than one parent present in `tasks` is
+/// input — see below). Roots are visited in `sibling_order.children_of(None)`
+/// order, and each task's children in `children_of(Some(parent))` order
+/// (input order is only the fallback for tasks it doesn't list). A task with more than one parent present in `tasks` is
 /// visited — and so emitted as a row — once per present parent, each time
 /// at the depth appropriate to that parent's subtree; the tree is always
 /// fully expanded (no collapse/expand yet).
@@ -61,6 +66,7 @@ pub struct TaskRow {
 #[must_use]
 pub fn task_rows(
     tasks: &[Task],
+    sibling_order: &SiblingOrder,
     type_labels: &HashMap<String, String>,
     user_names: &HashMap<UserId, String>,
     collapsed: &HashSet<TaskId>,
@@ -73,6 +79,14 @@ pub fn task_rows(
             children_by_parent.entry(*parent_id).or_default().push(task);
         }
     }
+
+    // Order each parent's children by the stored sibling order; a child the
+    // order doesn't list (defensive) sorts last, keeping input order.
+    for (parent_id, children) in &mut children_by_parent {
+        let position = positions(sibling_order.children_of(Some(*parent_id)));
+        children.sort_by_key(|child| position.get(&child.id).copied().unwrap_or(usize::MAX));
+    }
+    let root_position = positions(sibling_order.children_of(None));
 
     let is_root = |task: &Task| {
         task.parent_ids.is_empty()
@@ -88,19 +102,20 @@ pub fn task_rows(
     // chose not to descend into here so the fallback loop can skip them too.
     let mut hidden_by_collapse: HashSet<TaskId> = HashSet::new();
 
+    let mut roots: Vec<&Task> = tasks.iter().filter(|task| is_root(task)).collect();
+    roots.sort_by_key(|task| root_position.get(&task.id).copied().unwrap_or(usize::MAX));
+
     let mut rows = Vec::new();
-    for task in tasks {
-        if is_root(task) {
-            visit(
-                task,
-                &children_by_parent,
-                type_labels,
-                user_names,
-                collapsed,
-                &mut rows,
-                &mut hidden_by_collapse,
-            );
-        }
+    for task in roots {
+        visit(
+            task,
+            &children_by_parent,
+            type_labels,
+            user_names,
+            collapsed,
+            &mut rows,
+            &mut hidden_by_collapse,
+        );
     }
 
     // Defensive fallback: if every task in `tasks` forms a cycle among
@@ -138,6 +153,11 @@ pub fn task_rows(
     }
 
     rows
+}
+
+/// Maps each id in `ids` to its index.
+fn positions(ids: &[TaskId]) -> HashMap<TaskId, usize> {
+    ids.iter().enumerate().map(|(i, id)| (*id, i)).collect()
 }
 
 /// Emits a `TaskRow` for `root` and every descendant reachable from it, in
@@ -197,6 +217,11 @@ fn visit(
             has_children,
             collapsed: is_collapsed,
             direct_summary,
+            parent_id: ancestors_on_path.last().copied(),
+            grandparent_id: ancestors_on_path
+                .len()
+                .checked_sub(2)
+                .map(|index| ancestors_on_path[index]),
         });
 
         if is_collapsed {
@@ -240,6 +265,22 @@ fn mark_hidden(
     }
 }
 
+/// Test helper: a `SiblingOrder` following `tasks`' input order (roots under
+/// `None`, each parent's children in input order).
+#[cfg(test)]
+pub(crate) fn order_of(tasks: &[Task]) -> SiblingOrder {
+    let mut map: HashMap<Option<TaskId>, Vec<TaskId>> = HashMap::new();
+    for task in tasks {
+        if task.parent_ids.is_empty() {
+            map.entry(None).or_default().push(task.id);
+        }
+        for parent in &task.parent_ids {
+            map.entry(Some(*parent)).or_default().push(task.id);
+        }
+    }
+    SiblingOrder::from(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,12 +308,101 @@ mod tests {
         }
     }
 
+    fn order(entries: &[(Option<TaskId>, &[TaskId])]) -> SiblingOrder {
+        SiblingOrder::from(
+            entries
+                .iter()
+                .map(|(k, v)| (*k, v.to_vec()))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+
+    fn rows_of(tasks: &[Task], order: &SiblingOrder) -> Vec<TaskRow> {
+        task_rows(
+            tasks,
+            order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+    }
+
+    #[test]
+    fn task_rows_should_order_children_by_sibling_order() {
+        let p = task(TaskId::new(), "P", vec![]);
+        let a = task(TaskId::new(), "A", vec![p.id]);
+        let b = task(TaskId::new(), "B", vec![p.id]);
+        let tasks = vec![p.clone(), a.clone(), b.clone()];
+        let o = order(&[(None, &[p.id]), (Some(p.id), &[b.id, a.id])]);
+
+        let ids: Vec<_> = rows_of(&tasks, &o).iter().map(|r| r.id).collect();
+
+        assert_eq!(ids, [p.id, b.id, a.id]);
+    }
+
+    #[test]
+    fn task_rows_should_order_roots_by_none_key() {
+        let a = task(TaskId::new(), "A", vec![]);
+        let b = task(TaskId::new(), "B", vec![]);
+        let tasks = vec![a.clone(), b.clone()];
+        let o = order(&[(None, &[b.id, a.id])]);
+
+        let ids: Vec<_> = rows_of(&tasks, &o).iter().map(|r| r.id).collect();
+
+        assert_eq!(ids, [b.id, a.id]);
+    }
+
+    #[test]
+    fn task_rows_should_render_shared_task_at_each_parents_position() {
+        let p1 = task(TaskId::new(), "P1", vec![]);
+        let p2 = task(TaskId::new(), "P2", vec![]);
+        let x = task(TaskId::new(), "X", vec![p1.id, p2.id]);
+        let y = task(TaskId::new(), "Y", vec![p1.id]);
+        let z = task(TaskId::new(), "Z", vec![p2.id]);
+        let tasks = vec![p1.clone(), p2.clone(), x.clone(), y.clone(), z.clone()];
+        let o = order(&[
+            (None, &[p1.id, p2.id]),
+            (Some(p1.id), &[x.id, y.id]),
+            (Some(p2.id), &[z.id, x.id]),
+        ]);
+
+        let ids: Vec<_> = rows_of(&tasks, &o).iter().map(|r| r.id).collect();
+
+        assert_eq!(ids, [p1.id, x.id, y.id, p2.id, z.id, x.id]);
+    }
+
+    #[test]
+    fn task_rows_should_expose_parent_and_grandparent_ids() {
+        let r = task(TaskId::new(), "R", vec![]);
+        let m = task(TaskId::new(), "M", vec![r.id]);
+        let l = task(TaskId::new(), "L", vec![m.id]);
+        let tasks = vec![r.clone(), m.clone(), l.clone()];
+
+        let rows = rows_of(&tasks, &order_of(&tasks));
+
+        assert_eq!((rows[0].parent_id, rows[0].grandparent_id), (None, None));
+        assert_eq!(
+            (rows[1].parent_id, rows[1].grandparent_id),
+            (Some(r.id), None)
+        );
+        assert_eq!(
+            (rows[2].parent_id, rows[2].grandparent_id),
+            (Some(m.id), Some(r.id))
+        );
+    }
+
     #[test]
     fn task_rows_should_set_depth_zero_for_top_level_tasks() {
         let top_level = task(TaskId::new(), "Top level", vec![]);
         let tasks = vec![top_level.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, top_level.id);
@@ -286,7 +416,13 @@ mod tests {
         let child = task(TaskId::new(), "Child", vec![parent.id]);
         let tasks = vec![parent.clone(), child.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, parent.id);
@@ -302,7 +438,13 @@ mod tests {
         let child = task(TaskId::new(), "Child", vec![parent.id]);
         let tasks = vec![grandparent.clone(), parent.clone(), child.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].id, grandparent.id);
@@ -330,7 +472,13 @@ mod tests {
             parent_id = Some(id);
         }
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(rows.len(), 5000);
         for (i, row) in rows.iter().enumerate() {
@@ -349,7 +497,13 @@ mod tests {
         );
         let tasks = vec![parent_a.clone(), parent_b.clone(), child.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         // Roots visited in input order (Parent A, then Parent B); each
         // root's subtree is fully walked (pre-order) before moving to the
@@ -372,7 +526,13 @@ mod tests {
         let child_b = task(TaskId::new(), "Child B", vec![parent_id]);
         let tasks = vec![child_a.clone(), child_b.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, child_a.id);
@@ -395,7 +555,13 @@ mod tests {
         let task_b = task(id_b, "B", vec![id_a]);
         let tasks = vec![task_a, task_b];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(
             rows.len(),
@@ -417,7 +583,14 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let rows = task_rows(&[input], &type_labels, &HashMap::new(), &HashSet::new());
+        let order = order_of(std::slice::from_ref(&input));
+        let rows = task_rows(
+            std::slice::from_ref(&input),
+            &order,
+            &type_labels,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "Ship the thing");
@@ -434,7 +607,14 @@ mod tests {
             .into_iter()
             .collect();
 
-        let rows = task_rows(&[input], &HashMap::new(), &user_names, &HashSet::new());
+        let order = order_of(std::slice::from_ref(&input));
+        let rows = task_rows(
+            std::slice::from_ref(&input),
+            &order,
+            &HashMap::new(),
+            &user_names,
+            &HashSet::new(),
+        );
 
         assert_eq!(rows[0].assignee_name, Some("Ada Lovelace".to_string()));
     }
@@ -443,7 +623,14 @@ mod tests {
     fn task_rows_should_show_unassigned_when_no_assignee() {
         let input = task(TaskId::new(), "Unassigned task", vec![]);
 
-        let rows = task_rows(&[input], &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let order = order_of(std::slice::from_ref(&input));
+        let rows = task_rows(
+            std::slice::from_ref(&input),
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(rows[0].assignee_name, None);
     }
@@ -454,7 +641,13 @@ mod tests {
         let child = task(TaskId::new(), "Child", vec![parent.id]);
         let tasks = vec![parent.clone(), child.clone()];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(rows.len(), 2);
         assert!(rows[0].has_children);
@@ -469,7 +662,13 @@ mod tests {
         let tasks = vec![parent.clone(), child.clone(), grandchild.clone()];
         let collapsed: HashSet<TaskId> = [parent.id].into_iter().collect();
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &collapsed);
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &collapsed,
+        );
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, parent.id);
@@ -493,7 +692,13 @@ mod tests {
         ];
         let collapsed: HashSet<TaskId> = [parent.id].into_iter().collect();
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &collapsed);
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &collapsed,
+        );
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].direct_summary, Some((2, 3)));
@@ -514,7 +719,13 @@ mod tests {
             child_c.clone(),
         ];
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].direct_summary, None);
@@ -527,6 +738,7 @@ mod tests {
 
         let rows = task_rows(
             std::slice::from_ref(&leaf),
+            &order_of(std::slice::from_ref(&leaf)),
             &HashMap::new(),
             &HashMap::new(),
             &collapsed,
@@ -557,7 +769,13 @@ mod tests {
         let root_id = tasks[0].id;
         let collapsed: HashSet<TaskId> = [root_id].into_iter().collect();
 
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &collapsed);
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &collapsed,
+        );
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, root_id);
@@ -602,7 +820,13 @@ mod tests {
 
         let tasks = core.get_tree(TreeFilter::default()).unwrap();
         let collapsed: HashSet<TaskId> = [parent.id].into_iter().collect();
-        let rows = task_rows(&tasks, &HashMap::new(), &HashMap::new(), &collapsed);
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &collapsed,
+        );
         let parent_row = rows.iter().find(|row| row.id == parent.id).unwrap();
         let (complete, total) = parent_row
             .direct_summary

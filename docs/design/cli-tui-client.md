@@ -178,6 +178,8 @@ Gantt):
 | `h`/`l`, `←`/`→`     | collapse/expand focused task (Story 3.2 AC1)                                                                                                      |
 | `gg` / `G`           | jump to first/last visible task                                                                                                                   |
 | `E` / `C`            | expand all / collapse all (Story 3.2 AC3)                                                                                                         |
+| `J` / `K`            | move focused task down/up among siblings via `Core::move_sibling` under the row's rendered parent (`TaskRow.parent_id`); selection follows the task (Story 3.5). Swaps use the full sibling order, so with a type filter a press may look like a no-op when the neighbor is hidden (known caveat) |
+| `L` / `H`            | indent / outdent the focused task via `Core::indent_task` / `Core::outdent_task` using the row's rendered path (`parent_id`, `grandparent_id`); indent expands the new parent (previous live sibling, from `SiblingOrder`) and selection follows the task to its new row; no-op is silent, errors (e.g. `CircularHierarchy`) show inline (Story 3.5) |
 | `o` / `O`            | new subtask under focused task / new top-level task → `Insert{title}` (Stories 1.1, 3.1)                                                          |
 | `Enter`              | open Detail pane on focused task                                                                                                                  |
 | `i` (in Detail pane) | edit a field → `Insert` (Story 1.2)                                                                                                               |

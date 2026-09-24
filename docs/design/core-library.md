@@ -221,6 +221,9 @@ pub enum CoreError {
     #[error("moving {task:?} under {attempted_parent:?} would make it its own ancestor")]
     CircularHierarchy { task: TaskId, attempted_parent: TaskId },
 
+    #[error("{task:?} is not a child of {parent}")] // parent: id, or "the top level" for None
+    NotUnderParent { task: TaskId, parent: Option<TaskId> },
+
     #[error("{task:?} cannot depend on {other:?}: it is an ancestor/descendant of it")]
     DependsOnRelative { task: TaskId, other: TaskId },
 
@@ -259,6 +262,9 @@ impl<S: Store> Core<S> {
     pub fn delete_task(&mut self, id: TaskId, mode: DeleteMode) -> Result<Vec<Task>, CoreError>;
     pub fn restore_task(&mut self, id: TaskId) -> Result<Task, CoreError>;
     pub fn set_parents(&mut self, id: TaskId, new_parents: Vec<TaskId>) -> Result<Task, CoreError>;
+    pub fn move_sibling(&mut self, parent: Option<TaskId>, id: TaskId, direction: Direction) -> Result<bool, CoreError>;
+    pub fn indent_task(&mut self, parent: Option<TaskId>, id: TaskId) -> Result<bool, CoreError>;
+    pub fn outdent_task(&mut self, parent: Option<TaskId>, grandparent: Option<TaskId>, id: TaskId) -> Result<bool, CoreError>;
     pub fn add_dependency(&mut self, id: TaskId, predecessor: TaskId, dep_type: DependencyType) -> Result<Task, CoreError>;
     pub fn remove_dependency(&mut self, id: TaskId, predecessor: TaskId) -> Result<Task, CoreError>;
     pub fn complete_task(&mut self, id: TaskId, cascade: bool) -> Result<Vec<Task>, CoreError>;
@@ -267,6 +273,12 @@ impl<S: Store> Core<S> {
     pub fn get_tree(&self, filter: TreeFilter) -> Result<Vec<Task>, CoreError>;
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>, CoreError>;
     pub fn list_children(&self, id: TaskId) -> Result<Vec<Task>, CoreError>;
+    /// Sibling order of every live task, keyed by parent (`None` = top level);
+    /// one transaction. `list_children` and `get_tree` follow it: children in
+    /// stored position order (creation order by default), `get_tree` results
+    /// in depth-first sibling order (a task under several parents takes its
+    /// first position; unreached tasks sort last).
+    pub fn sibling_order(&self) -> Result<SiblingOrder, CoreError>;
     pub fn list_task_types(&self) -> Result<Vec<TaskType>, CoreError>;
     pub fn upsert_task_type(&mut self, t: TaskType) -> Result<TaskType, CoreError>;
 }
@@ -291,6 +303,37 @@ edge on each child is replaced with an edge to A's own parents (or
 dropped, making the child top-level, if A had none) — for a child with
 other parents besides A, that's one more edge added alongside the ones
 it already keeps.
+
+`move_sibling(parent, id, Direction::{Up,Down})` reorders `id` by one
+place within `parent`'s children (`None` = top level) in a single
+transaction. It swaps with the nearest *live* sibling in that direction
+(tombstoned siblings are skipped) via `StoreTx::swap_child_positions`, so
+only `parent`'s list changes: `id`'s position under any other parent, its
+parents, depth and `updated_at` are untouched. It returns `true` if the task
+moved and `false` at the end of the list (a true no-op: no write, no error).
+It fails with `NotFound` for a missing/deleted `id` and `NotUnderParent {
+task, parent }` when `id` is not a child of `parent`.
+
+`indent_task(parent, id)` / `outdent_task(parent, grandparent, id)` take
+the *rendered path* (the parent the row is shown under, plus that parent's
+parent for outdent), so in a multi-parent DAG they change only that one
+path. Each runs in one transaction, composes the new parent set (current
+minus `parent`, plus the target) and writes it through
+`hierarchy::replace_parents`, so the cycle guard is shared with
+`set_parents` (`CircularHierarchy`); other parents keep their edges and
+positions. Both return `true` on a change and `false` on a no-op (no write,
+no `updated_at` bump); a change bumps `updated_at` and refreshes
+`parent_ids`.
+
+- Indent: the target is the nearest *live* previous sibling under `parent`
+  (tombstoned ones skipped); `id` becomes its last child. No previous
+  sibling: no-op. Only `id`'s own edges change, so its subtree follows.
+- Outdent: `id` joins `grandparent`'s children immediately after `parent`
+  (`Placement::After(parent)`). `parent == None` (already top level) is a
+  no-op. `NotUnderParent` if `id` is not under `parent`, or `parent` not
+  under `grandparent`. With `grandparent == None` the task becomes top level
+  only if `parent` was its sole parent; if other real parents remain it
+  just drops `parent`, since a task is never both top level and nested.
 
 `set_parents` replaces the old single-parent `reparent_task(id,
 Option<TaskId>)`. It takes the *whole* new parent list and applies it
@@ -534,9 +577,20 @@ pub trait StoreTx {
     fn list_tasks(&mut self, filter: &TreeFilter) -> Result<Vec<Task>, StoreError>;
 
     fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
-    fn list_child_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
-    fn add_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
-    fn remove_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
+    /// `None` = the top-level tasks (children of the NULL parent), in position order.
+    fn list_child_edges(&mut self, parent: Option<TaskId>) -> Result<Vec<TaskId>, StoreError>;
+    /// Every (parent, child) edge grouped by parent, position order within each
+    /// (`None` = top level), tombstones included. One call, so whole-hierarchy
+    /// reads (`Core::sibling_order`) avoid a `list_child_edges` per parent.
+    fn list_all_child_edges(&mut self) -> Result<Vec<(Option<TaskId>, TaskId)>, StoreError>;
+    /// `Placement::End` appends; `Placement::After(sibling)` inserts right after
+    /// `sibling` in each newly added parent's children, falling back to `End` for
+    /// a parent that does not contain `sibling` (or if `sibling == child`).
+    /// Retained parents keep their position.
+    fn replace_parent_edges(&mut self, child: TaskId, parents: &Parents, placement: Placement) -> Result<(), StoreError>;
+    /// Swaps the positions of `a` and `b` among `parent`'s children only (other
+    /// parents' positions untouched); no-op if either is not a child of `parent`.
+    fn swap_child_positions(&mut self, parent: Option<TaskId>, a: TaskId, b: TaskId) -> Result<(), StoreError>;
 
     fn list_dependency_edges(&mut self, id: TaskId) -> Result<Vec<Dependency>, StoreError>;
     fn list_successor_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;

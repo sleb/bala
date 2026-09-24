@@ -137,15 +137,21 @@ CREATE INDEX idx_tasks_type_live     ON tasks(type_key)     WHERE deleted_at IS 
 CREATE INDEX idx_tasks_status_live   ON tasks(status)       WHERE deleted_at IS NULL;
 CREATE INDEX idx_tasks_assignee_live ON tasks(assignee_id)  WHERE deleted_at IS NULL;
 
-CREATE TABLE parent_edges (
-    parent_id BLOB NOT NULL REFERENCES tasks(id),
+CREATE TABLE parent_edges (          -- as of V3 (Story 3.5)
+    parent_id BLOB REFERENCES tasks(id),           -- NULL = top level
     child_id  BLOB NOT NULL REFERENCES tasks(id),
-    PRIMARY KEY (parent_id, child_id)
+    position  INTEGER NOT NULL                     -- 0-based order among the parent's children
 );
--- PK's leading column (parent_id) already indexes "children of X"
--- (rollup, subtree delete). Reverse direction needs its own index:
-CREATE INDEX idx_parent_edges_child ON parent_edges(child_id); -- "parents of X"
-                                                                -- (hierarchy upward walk, §1)
+-- A top-level task has exactly one edge with parent_id IS NULL; the NULL
+-- "parent" is its own sibling list (the roots). No duplicate real edge:
+CREATE UNIQUE INDEX idx_parent_edges_real_pair ON parent_edges(parent_id, child_id)
+    WHERE parent_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_parent_edges_one_null  ON parent_edges(child_id)
+    WHERE parent_id IS NULL;
+CREATE INDEX idx_parent_edges_child ON parent_edges(child_id);                 -- "parents of X"
+                                                                                -- (hierarchy upward walk, §1)
+CREATE INDEX idx_parent_edges_parent_pos ON parent_edges(parent_id, position); -- ordered "children of X"
+                                                                                -- (rollup, subtree delete; roots when NULL)
 
 CREATE TABLE dependency_edges (
     predecessor_id BLOB NOT NULL REFERENCES tasks(id),
@@ -188,6 +194,17 @@ table, since `DROP TABLE` takes its indexes with it. No existing row can
 violate the new FK (V1 never populated `assignee_id`), so the copy step
 needs no data migration beyond the straight copy.
 
+**`migrations/V3__parent_edge_positions.sql` (Story 3.5).** Table rebuild
+like V2 (nothing references `parent_edges`, so create-copy-drop-rename):
+`parent_id` becomes nullable, `position` is added, and the primary key is
+replaced by the two partial unique indexes above. Backfill numbers each
+parent's children 0.. by the child's `created_at`, tie-broken by `id`, and
+gives every task with no edge (live or tombstoned) a NULL edge, numbered the
+same way among the roots. The invariant "exactly one NULL edge XOR one or
+more real edges per task" is **not** a DB constraint (no triggers): it holds
+because `Parents` cannot express a mix and `replace_parent_edges` is the only
+writer; the schema only forbids a second NULL edge or a duplicate real edge.
+
 Deletion is soft-delete only (Core LLD §Context, resolved there): `DELETE
 FROM tasks` is never issued by this crate outside of the (unused today)
 possibility of a future hard-purge job; `delete_task` maps to `UPDATE
@@ -195,7 +212,12 @@ tasks SET deleted_at = ?`. Edge rows for a tombstoned task are **not**
 cascade-deleted — Core LLD's delete algorithm (§Method Contract) already
 computes which specific parent/child edges to drop before the tombstone
 ever gets written, so `bala-store` only ever removes the edges `bala-core`
-explicitly asks it to via `remove_parent_edge`/`remove_dependency_edge`.
+explicitly asks it to via `replace_parent_edges`/`remove_dependency_edge`.
+Consequently a tombstoned task keeps its own parent edges (or NULL edge), and
+appears in `list_child_edges` of its parents and, if top level, of `None`;
+every task row, live or tombstoned, satisfies the edge invariant, and readers
+skip tombstoned ids via `get_task`. (A child orphaned by a subtree delete is
+written as `TopLevel`, so it gets a NULL edge before being tombstoned.)
 
 ## Error Taxonomy
 
@@ -274,17 +296,23 @@ impl<'a> StoreTx for SqliteTx<'a> {
     fn list_tasks(&mut self, filter: &TreeFilter) -> Result<Vec<Task>, StoreError> { /* see §Query Strategy */ }
 
     fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
-        // SELECT parent_id FROM parent_edges WHERE child_id = ?  (idx_parent_edges_child)
+        // SELECT parent_id FROM parent_edges WHERE child_id = ? AND parent_id IS NOT NULL
+        // (idx_parent_edges_child; the NULL top-level edge is not a parent)
     }
-    fn list_child_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
-        // SELECT child_id FROM parent_edges WHERE parent_id = ?  (PK's leading column —
-        // no extra index needed, same table §Schema already indexes both directions)
+    fn list_child_edges(&mut self, parent: Option<TaskId>) -> Result<Vec<TaskId>, StoreError> {
+        // SELECT child_id FROM parent_edges WHERE parent_id IS ? ORDER BY position
+        // (idx_parent_edges_parent_pos). `None` lists the roots. Tombstoned tasks are
+        // included: callers filter through `get_task`.
     }
-    fn add_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError> {
-        // INSERT OR IGNORE INTO parent_edges ...  (idempotent: re-adding an existing edge is a no-op)
+    fn replace_parent_edges(&mut self, child: TaskId, parents: &Parents, placement: Placement) -> Result<(), StoreError> {
+        // DELETE the child's edges not in `parents`, then INSERT the missing ones at
+        // position MAX(position)+1 under their parent (0 if none). Edges already present
+        // are kept with their position. TopLevel = the single NULL-parent edge.
     }
-    fn remove_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError> {
-        // DELETE FROM parent_edges WHERE parent_id = ? AND child_id = ?
+    fn swap_child_positions(&mut self, parent: Option<TaskId>, a: TaskId, b: TaskId) -> Result<(), StoreError> {
+        // Read both edges' position WHERE parent_id IS ? AND child_id = ?, then UPDATE each
+        // to the other's value (no unique index on (parent_id, position)). No-op unless
+        // both edges exist. Used by Core::move_sibling.
     }
 
     fn list_dependency_edges(&mut self, id: TaskId) -> Result<Vec<Dependency>, StoreError> {
@@ -306,9 +334,9 @@ impl<'a> StoreTx for SqliteTx<'a> {
 }
 ```
 
-`add_parent_edge` and `add_dependency_edge` are both **idempotent
+`replace_parent_edges` (edges already present are skipped) and `add_dependency_edge` are both **idempotent
 upserts**, not plain inserts: the edge tables' primary keys make a
-duplicate `add_parent_edge` on an already-existing edge a silent no-op
+duplicate parent id passed to `replace_parent_edges` a silent no-op
 (`INSERT OR IGNORE`) rather than a constraint-violation error, and a
 repeated `add_dependency_edge` on an existing pair _replaces_ the type
 rather than erroring — this is what makes that call double as "change an
@@ -356,7 +384,7 @@ fine at hundreds of rows.
 - `StoreTx` methods are tested directly against `SqliteStore`, one test
   module per table group (`task`, `edges`, `types`), named for behavior
   per the repo's existing convention (LLD-core-library.md §Testing
-  Strategy): e.g. `add_parent_edge_should_be_idempotent_on_duplicate`,
+  Strategy): e.g. `replace_parent_edges_should_keep_edges_it_was_asked_to_keep`,
   `add_dependency_edge_should_replace_type_on_existing_pair`,
   `list_tasks_should_exclude_soft_deleted_by_default`,
   `list_child_edges_should_return_all_children_of_multi_child_parent`,
@@ -373,7 +401,7 @@ fine at hundreds of rows.
   guarantees depend on entirely at this layer.
 - **Multi-parent / multi-edge correctness**: a task with two parents
   round-trips both parent ids through `put_task`'s edge-independent
-  design (edges added via `add_parent_edge`, not embedded in the row) —
+  design (edges added via `replace_parent_edges`, not embedded in the row) —
   confirms `list_tasks` batching (§Query Strategy) groups correctly when
   a child has >1 parent edge row.
 - **Foreign-key/constraint smoke test**: writing an edge or dependency
