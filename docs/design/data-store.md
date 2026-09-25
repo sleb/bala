@@ -137,7 +137,7 @@ CREATE INDEX idx_tasks_type_live     ON tasks(type_key)     WHERE deleted_at IS 
 CREATE INDEX idx_tasks_status_live   ON tasks(status)       WHERE deleted_at IS NULL;
 CREATE INDEX idx_tasks_assignee_live ON tasks(assignee_id)  WHERE deleted_at IS NULL;
 
-CREATE TABLE parent_edges (          -- as of V3 (Story 3.5)
+CREATE TABLE parent_edges (          -- as of V3 (#45)
     parent_id BLOB REFERENCES tasks(id),           -- NULL = top level
     child_id  BLOB NOT NULL REFERENCES tasks(id),
     position  INTEGER NOT NULL                     -- 0-based order among the parent's children
@@ -179,7 +179,7 @@ or task row can reference a nonexistent id — invariants Core LLD already
 enforces in Rust before writing, but a DB-level constraint catches a
 `bala-store` bug (not a `bala-core` caller bug) that skips the trait.
 
-**`migrations/V2__add_users.sql` (Story 1.1a).** SQLite can't
+**`migrations/V2__add_users.sql` ([#9](https://github.com/sleb/bala/issues/9)).** SQLite can't
 `ALTER TABLE ... ADD COLUMN ... REFERENCES ...` — a `REFERENCES` clause
 can only be declared when a column is first created, and `tasks.assignee_id`
 already exists (untyped `BLOB`, no FK) from V1. Giving it the FK the
@@ -194,7 +194,7 @@ table, since `DROP TABLE` takes its indexes with it. No existing row can
 violate the new FK (V1 never populated `assignee_id`), so the copy step
 needs no data migration beyond the straight copy.
 
-**`migrations/V3__parent_edge_positions.sql` (Story 3.5).** Table rebuild
+**`migrations/V3__parent_edge_positions.sql` ([#45](https://github.com/sleb/bala/issues/45)).** Table rebuild
 like V2 (nothing references `parent_edges`, so create-copy-drop-rename):
 `parent_id` becomes nullable, `position` is added, and the primary key is
 replaced by the two partial unique indexes above. Backfill numbers each
@@ -371,8 +371,8 @@ N=1.
 Core LLD's `TreeFilter` (§Data Model there) has four fields — `type_key`,
 `status`, `assignee_id`, `include_deleted` — and the indexes above
 (`type_key`, `status`, `assignee_id`, all partial on `deleted_at IS
-NULL`) cover exactly those, making the filter predicates Stories 3.4 AC4
-("filter/group by type") and 4.3 AC4 ("show only blocked/unblocked")
+NULL`) cover exactly those, making the filter predicates [#40](https://github.com/sleb/bala/issues/40) AC4
+("filter/group by type") and [#62](https://github.com/sleb/bala/issues/62) AC4 ("show only blocked/unblocked")
 imply cheap. `include_deleted = true` simply drops the `WHERE deleted_at
 IS NULL` predicate, falling back to a full scan on the (unindexed)
 `deleted_at` column — acceptable since it's the uncommon path and still

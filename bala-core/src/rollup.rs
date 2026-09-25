@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn direct_children_progress_should_average_child_status_ignoring_grandchildren() {
-        // Epic/story/subtask example from the issue: a "parent" task has
+        // Epic/story/subtask example: a "parent" task has
         // two direct children ("stories"), each itself Complete despite
         // having ten incomplete grandchildren ("subtasks") of its own. The
         // grandchildren's incompleteness must never leak two levels up —

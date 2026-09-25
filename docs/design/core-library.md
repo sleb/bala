@@ -3,7 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-08-31
 **Deciders:** Scott (product/eng)
-**Related:** [HLD.md](./HLD.md) (Core Library component), [STORIES.md](./STORIES.md) (Epics 1, 3–4 — this library owns CRUD, hierarchy, and dependency/rollup logic; the TUI epic and the Gantt epic are rendering concerns handled by their respective clients)
+**Related:** [HLD.md](./HLD.md) (Core Library component), [user stories](https://github.com/sleb/bala/issues?q=label%3Astory) (this library owns CRUD, hierarchy, and dependency/rollup logic; the TUI and the Gantt chart are rendering concerns handled by their respective clients)
 
 ## Context
 
@@ -88,7 +88,7 @@ pub struct TaskId(Uuid);
 pub struct UserId(Uuid);
 
 /// Minimal user identity for task assignment — no auth, email, roles, or
-/// avatars (out of scope per STORIES.md Story 1.1a); just enough to give
+/// avatars (out of scope per #9); just enough to give
 /// `assignee_id` a real entity to resolve to instead of a bare id.
 pub struct User {
     pub id: UserId,
@@ -146,7 +146,7 @@ pub struct TaskType {
 /// field-for-field, matching the indexes it already built for these:
 /// `type_key`, `status`, `assignee_id` each get a partial index on
 /// `deleted_at IS NULL`, and `include_deleted` toggles that predicate.
-/// `assignee_id` filters against a real `User.id` (Story 1.1a) — `Core`
+/// `assignee_id` filters against a real `User.id` (#9) — `Core`
 /// validates it exists via `Store::get_user` at `create_task` time, so a
 /// filter value here always corresponds to a real, resolvable user.
 pub struct TreeFilter {
@@ -350,7 +350,7 @@ trips.
 
 ## Algorithms
 
-### 1. Hierarchy invariant — no circular nesting (Stories 3.1 AC5)
+### 1. Hierarchy invariant — no circular nesting ([#37](https://github.com/sleb/bala/issues/37) AC5)
 
 Multiple parents make the hierarchy a DAG, not a tree, so "ancestor
 chain" becomes "ancestor set reachable via `parent_ids`." `set_parents(id,
@@ -367,7 +367,7 @@ once regardless of how many paths reach it. `create_task` runs the same
 check per entry in `NewTask.parent_ids` (an id can't be its own ancestor
 at creation, but the check is shared code, not special-cased away).
 
-### 2. Dependency invariants (Story 4.1 AC2–3)
+### 2. Dependency invariants ([#60](https://github.com/sleb/bala/issues/60) AC2–3)
 
 `add_dependency(id, predecessor, dep_type)`:
 1. Reject if `id == predecessor` (self-dependency).
@@ -395,7 +395,7 @@ at creation, but the check is shared code, not special-cased away).
 `remove_dependency` has no invariant to check — removing an edge can
 never introduce a cycle or a relative-dependency violation.
 
-### 3. Cascade scheduling (Story 4.2 AC1–4)
+### 3. Cascade scheduling ([#61](https://github.com/sleb/bala/issues/61) AC1–4)
 
 Each `DependencyType` anchors a different field of the predecessor to a
 different field of the successor:
@@ -462,14 +462,14 @@ further out (multiple incoming edges), but each push strictly increases
 its constrained field, so the loop terminates. `preview_cascade` runs
 this against an in-memory copy of the affected subgraph and returns the
 result **without** calling `Store::put_task` — same computation, no
-commit, satisfying Story 4.2 AC3's "preview before committing".
+commit, satisfying [#61](https://github.com/sleb/bala/issues/61) AC3's "preview before committing".
 
 `update_task` calls `cascade` whenever `start_date` or `due_date` moves,
 then persists `[changed_task] + touched` inside one `Store::transaction`,
 and returns the full `Vec<Task>` so a caller can refresh every affected
 view without re-querying (HLD §Interfaces guarantee).
 
-### 4. Progress rollup (Story 3.3 AC1–5)
+### 4. Progress rollup ([#39](https://github.com/sleb/bala/issues/39) AC1–5)
 
 Computed on read inside `get_tree`, never stored, never computed by a
 caller (HLD guarantee). A task's `progress` is derived from its **direct**
@@ -519,7 +519,7 @@ and each direct child's `status`, not a graph traversal (a Complete
 shared child counts as a full `1.0` toward both Goal A's and Goal B's
 rollup, computed separately for each).
 
-### 5. `complete_task` (Story 1.4 AC2, resolved per §Context)
+### 5. `complete_task` ([#13](https://github.com/sleb/bala/issues/13) AC2, resolved per §Context)
 
 ```
 fn complete_task(id, cascade) -> Result<Vec<Task>, CoreError> {
@@ -537,16 +537,15 @@ fn complete_task(id, cascade) -> Result<Vec<Task>, CoreError> {
 children, so `IncompleteChildren.incomplete` always names exactly the set
 `cascade: true` would go on to complete — a caller rendering a
 confirmation prompt from this error (e.g. the TUI's cascade-confirm,
-Story 2.3 AC3) gets an accurate count without re-walking the hierarchy
+[#26](https://github.com/sleb/bala/issues/26) AC3) gets an accurate count without re-walking the hierarchy
 itself.
 
 Returns every task actually completed (one, or the whole touched
 subtree) — again so a caller refreshes views from the return value
 rather than re-querying.
 
-`reopen_task` is the reverse transition Story 1.4 didn't ship, closing
-the gap STORIES.md noted once Story 2.3's TUI toggle needed a real path
-back from Complete to Incomplete.
+`reopen_task` is the reverse transition, Complete → Incomplete, added
+when the TUI's completion toggle needed a way back.
 
 ## Storage Boundary
 
@@ -657,7 +656,7 @@ flagged at the HLD level, not solved by adding locking here.
   `TreeFilter`'s fields — are now resolved above: `list_child_edges`/
   `list_successor_edges` and §Data Model's `TreeFilter`.)
 - **CLI/TUI Client LLD:** how `preview_cascade`'s result is rendered as a
-  confirmation prompt (Story 4.2 AC3) and how `IncompleteChildren`/
+  confirmation prompt ([#61](https://github.com/sleb/bala/issues/61) AC3) and how `IncompleteChildren`/
   `CircularHierarchy`/etc. map to on-screen messages.
 - **Web API LLD:** near-mechanical mapping of this method contract onto
   routes; `CoreError` variants map onto HTTP status + JSON error body.
@@ -676,7 +675,7 @@ flagged at the HLD level, not solved by adding locking here.
 - `preview_cascade` and the committing path in `update_task` share the
   same `cascade()` function by construction — there's no way for preview
   to drift from what actually commits, which is the whole point of
-  Story 4.2 AC3.
+  [#61](https://github.com/sleb/bala/issues/61) AC3.
 - Multiple parents turn the hierarchy into a DAG, which is now load-bearing
   on §1's invariant check, §2's ancestor/descendant walk, §4's rollup,
   and delete cascade semantics (§Method Contract) — a future move back to
