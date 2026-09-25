@@ -118,8 +118,9 @@ pub enum GanttScale { Day, Week, Month }
 type filter is stored as `filter_type_key` in the `[tree]` table rather
 than the `[filter]` table sketched below. `gantt_scale`, `gantt_anchor`,
 and `blocked_only` are added with the Gantt view and the blocked-task
-filter. Saving happens on the normal quit path only: there's no
-`Ctrl-C`/`SIGTERM` cleanup guard, and the temp-then-rename write is what
+filter. Saving currently happens on the normal quit path only: the
+`Ctrl-C`/`SIGTERM` cleanup guard described below is the intended design
+but isn't built yet. Until it is, the temp-then-rename write is what
 keeps a crash or kill from corrupting the file.
 
 Serialized as TOML at `<config_dir>/bala/view.toml`:
@@ -143,7 +144,8 @@ db_path = "/Users/scott/.local/share/bala/bala.db"  # resolved default, override
 
 `config::load()` reads this at startup (missing file → `ViewState::default()`,
 not an error — first run). `config::save()` writes on quit (`q` in
-Normal mode) and on `Ctrl-C`/`SIGTERM` via a cleanup guard, using a
+Normal mode) and on `Ctrl-C`/`SIGTERM` via a cleanup guard (not yet
+implemented; see the status note above), using a
 write-to-temp-then-rename so a crash mid-write can't corrupt the file —
 the same atomicity concern Data Store LLD solved with SQL transactions,
 solved here with the filesystem's rename semantics since there's no

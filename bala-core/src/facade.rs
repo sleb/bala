@@ -578,9 +578,10 @@ impl<S: Store> Core<S> {
         Ok(task)
     }
 
-    /// Restores a soft-deleted task per LLD §Algorithm — the undo for
-    /// `delete_task`, which never hard-deletes:
-    /// looks `id` up via [`StoreTx::get_task_including_deleted`] — unlike
+    /// Restores a soft-deleted task per LLD §Algorithm. This restores only
+    /// the `id` row itself: it is not a full undo for `delete_task`, since
+    /// any descendants that `delete_task` tombstoned stay tombstoned and any
+    /// parent edges it removed stay removed. Looks `id` up via [`StoreTx::get_task_including_deleted`] — unlike
     /// `delete_task`'s `get_task`, this must see a tombstoned row, not
     /// just a live one — clears `deleted_at`, bumps `updated_at`, and
     /// persists.

@@ -919,9 +919,12 @@ fn handle_d_key_pressed(app: &mut App, was_pending_d: bool) {
 ///
 /// For `PendingAction::Delete(id)`, calls `Core::delete_task` with
 /// `DeleteMode::Subtree`: the TUI has no `PromoteChildren` choice yet, so
-/// deleting a parent here always takes its subtree with it (the CLI's
-/// `--promote-children` is the only way to keep the children). On success, every task actually touched (the deleted
-/// task and any descendants also tombstoned) is removed from `app.rows`,
+/// deleting a parent here takes with it every child that has no other live
+/// parent (a child shared with another parent just loses its edge to the
+/// deleted one and survives; for sole-parent children, the CLI's
+/// `--promote-children` is the only way to keep them). On success, every
+/// task actually touched (the deleted task and any descendants also
+/// tombstoned) is removed from `app.rows`,
 /// the selection is clamped to the remaining rows, and `app` returns to
 /// `Mode::Normal`/`Pane::List` (the deleted task's Detail view no longer
 /// makes sense). On failure `app.error` is set and `app` still returns to
