@@ -173,6 +173,16 @@ fn create_task_should_record_an_edge_for_each_given_parent() {
         .unwrap();
 
     assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
+    // A fresh read rebuilds `parent_ids` from the stored edges.
+    let reread = core.get_task(child.id).unwrap().unwrap();
+    assert_eq!(reread.parent_ids, vec![parent_a.id, parent_b.id]);
+    for parent in [&parent_a, &parent_b] {
+        let children = core.list_children(parent.id).unwrap();
+        assert_eq!(
+            children.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![child.id]
+        );
+    }
 }
 
 #[test]

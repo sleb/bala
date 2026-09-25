@@ -1367,6 +1367,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
+        let stored_parents = core
+            .store
+            .transaction(|tx| tx.list_parent_edges(child.id))
+            .unwrap();
+        assert_eq!(stored_parents, vec![parent_a.id, parent_b.id]);
+        for parent in [&parent_a, &parent_b] {
+            let children = core.list_children(parent.id).unwrap();
+            assert_eq!(
+                children.iter().map(|t| t.id).collect::<Vec<_>>(),
+                vec![child.id]
+            );
+        }
     }
 
     #[test]
