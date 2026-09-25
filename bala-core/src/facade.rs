@@ -191,7 +191,12 @@ impl<S: Store> Core<S> {
                 &Parents::from_ids(task.parent_ids.clone()),
                 Placement::End,
             ) {
-                return Ok(Err(e));
+                // A backend failure must abort the transaction so `put_task`
+                // rolls back; only a domain error is handed back to the caller.
+                return match e {
+                    CoreError::Store(store_error) => Err(store_error),
+                    other => Ok(Err(other)),
+                };
             }
             // A just-created task has no children of its own yet (nothing
             // can point at `task.id` before this call), so this always

@@ -305,9 +305,10 @@ impl<'a> StoreTx for SqliteTx<'a> {
         // included: callers filter through `get_task`.
     }
     fn replace_parent_edges(&mut self, child: TaskId, parents: &Parents, placement: Placement) -> Result<(), StoreError> {
-        // DELETE the child's edges not in `parents`, then INSERT the missing ones at
-        // position MAX(position)+1 under their parent (0 if none). Edges already present
-        // are kept with their position. TopLevel = the single NULL-parent edge.
+        // DELETE the child's edges not in `parents`, then INSERT the missing ones per
+        // `placement`: End = MAX(position)+1 under their parent (0 if none);
+        // After(s) = right after sibling `s`, shifting later siblings. Edges already
+        // present keep their position. TopLevel = the single NULL-parent edge.
     }
     fn swap_child_positions(&mut self, parent: Option<TaskId>, a: TaskId, b: TaskId) -> Result<(), StoreError> {
         // Read both edges' position WHERE parent_id IS ? AND child_id = ?, then UPDATE each
@@ -334,10 +335,11 @@ impl<'a> StoreTx for SqliteTx<'a> {
 }
 ```
 
-`replace_parent_edges` (edges already present are skipped) and `add_dependency_edge` are both **idempotent
-upserts**, not plain inserts: the edge tables' primary keys make a
-duplicate parent id passed to `replace_parent_edges` a silent no-op
-(`INSERT OR IGNORE`) rather than a constraint-violation error, and a
+`replace_parent_edges` and `add_dependency_edge` are both **idempotent**, not
+plain inserts: `replace_parent_edges` skips parent ids that already have an edge
+and deduplicates repeated ids in Rust before inserting (the partial unique
+indexes are a backstop, not the mechanism), so a duplicate parent id is a silent
+no-op rather than a constraint-violation error, and a
 repeated `add_dependency_edge` on an existing pair _replaces_ the type
 rather than erroring — this is what makes that call double as "change an
 existing edge's type" per Core LLD §Algorithm 2 step 4, with no special
