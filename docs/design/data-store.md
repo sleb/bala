@@ -52,9 +52,10 @@ open question it surfaces back to Core LLD (§Open Questions).
 
 `bala-store` is a single crate exposing one public type, `SqliteStore`,
 implementing Core LLD's `Store` trait. Internally it mirrors the trait's
-four concerns as modules: `schema` (DDL + migrations), `task` (task-row
+five concerns as modules: `schema` (DDL + migrations), `task` (task-row
 read/write), `edges` (parent + dependency edge queries), `types`
-(`TaskType` CRUD).
+(`TaskType` CRUD), `user` (`User` CRUD); `convert` holds the shared
+row/column conversions.
 
 ```mermaid
 flowchart TB
@@ -65,6 +66,7 @@ flowchart TB
         TaskMod["task\n(row <-> Task mapping)"]
         Edges["edges\n(parent_edges, dependency_edges)"]
         Types["types\n(task_types CRUD)"]
+        Users["user\n(users CRUD)"]
     end
     Core["bala-core\n(Core Library LLD)"] -- "Store trait" --> SqliteStore
     SqliteStore -- "opens" --> Schema
@@ -72,9 +74,11 @@ flowchart TB
     SqliteTx --> TaskMod
     SqliteTx --> Edges
     SqliteTx --> Types
+    SqliteTx --> Users
     TaskMod --> DB[("bala.db\n(single SQLite file, WAL mode)")]
     Edges --> DB
     Types --> DB
+    Users --> DB
 ```
 
 `SqliteStore` holds a single `rusqlite::Connection` wrapped in a
@@ -166,7 +170,7 @@ CREATE UNIQUE INDEX idx_parent_edges_real_pair ON parent_edges(parent_id, child_
 CREATE UNIQUE INDEX idx_parent_edges_one_null ON parent_edges(child_id)
     WHERE parent_id IS NULL;                                            -- at most one NULL edge
 CREATE INDEX idx_parent_edges_child ON parent_edges(child_id);            -- parents of X
-                                                                          -- (hierarchy upward walk)
+                                                                          -- (hierarchy upward walk, Core LLD §Algorithm 1)
 CREATE INDEX idx_parent_edges_parent_pos ON parent_edges(parent_id, position); -- ordered children of X
                                                                           -- (rollup, subtree delete)
 
@@ -180,10 +184,10 @@ CREATE TABLE dependency_edges (
                                                  -- add_dependency_edge upserts, doesn't duplicate
 );
 -- PK's leading column (predecessor_id) indexes "what depends on X"
--- (cascade forward-propagation; list_successor_edges). Reverse needs its own
--- index:
+-- (cascade forward-propagation, Core LLD §Algorithm 3; list_successor_edges).
+-- Reverse needs its own index:
 CREATE INDEX idx_dependency_edges_successor ON dependency_edges(successor_id); -- "what does X depend on"
-                                                                                -- (dependency validity walk;
+                                                                                -- (dependency validity walk, Core LLD §Algorithm 2;
                                                                                 -- list_dependency_edges)
 
 -- Seed the default "task" TaskType every `Core` expects to exist.
@@ -235,7 +239,11 @@ and an existing database is reset (delete `bala.db`; see
 the first release the baseline is frozen. From then on migrations are only
 added, never edited, because refinery checksums each applied migration's
 full text, comments included, and refuses to open a database whose applied
-migration differs from the embedded file.
+migration differs from the embedded file. `SqliteStore` adds a
+"delete the database file" hint to that error (and only that one: a
+migration missing from the build means an older build is opening a newer
+database, where deleting it would be wrong); the hint goes when the baseline
+is frozen.
 
 **`users` and `tasks.assignee_id`.** `tasks.assignee_id` references
 `users(id)`, so a task can only name a user that was stored with `put_user`;

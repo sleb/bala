@@ -57,7 +57,7 @@ CREATE UNIQUE INDEX idx_parent_edges_real_pair ON parent_edges(parent_id, child_
 CREATE UNIQUE INDEX idx_parent_edges_one_null ON parent_edges(child_id)
     WHERE parent_id IS NULL;                                            -- at most one NULL edge
 CREATE INDEX idx_parent_edges_child ON parent_edges(child_id);            -- parents of X
-                                                                          -- (hierarchy upward walk)
+                                                                          -- (hierarchy upward walk, Core LLD §Algorithm 1)
 CREATE INDEX idx_parent_edges_parent_pos ON parent_edges(parent_id, position); -- ordered children of X
                                                                           -- (rollup, subtree delete)
 
@@ -71,10 +71,10 @@ CREATE TABLE dependency_edges (
                                                  -- add_dependency_edge upserts, doesn't duplicate
 );
 -- PK's leading column (predecessor_id) indexes "what depends on X"
--- (cascade forward-propagation; list_successor_edges). Reverse needs its own
--- index:
+-- (cascade forward-propagation, Core LLD §Algorithm 3; list_successor_edges).
+-- Reverse needs its own index:
 CREATE INDEX idx_dependency_edges_successor ON dependency_edges(successor_id); -- "what does X depend on"
-                                                                                -- (dependency validity walk;
+                                                                                -- (dependency validity walk, Core LLD §Algorithm 2;
                                                                                 -- list_dependency_edges)
 
 -- Seed the default "task" TaskType every `Core` expects to exist.

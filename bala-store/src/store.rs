@@ -82,7 +82,7 @@ impl SqliteStore {
         }
         migrations
             .run(&mut conn)
-            .map_err(|err| StoreError::Backend(err.to_string()))?;
+            .map_err(|err| migration_err(&err))?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(task::sqlite_err)?;
         check_foreign_keys(&conn)?;
@@ -90,6 +90,26 @@ impl SqliteStore {
             conn: RefCell::new(conn),
         })
     }
+}
+
+/// Maps a refinery error to [`StoreError::Backend`].
+///
+/// An applied migration whose text differs from this build's means the
+/// database was created from an earlier version of the schema baseline,
+/// which is rewritten in place until the first release (LLD-2 §Schema,
+/// Migration policy). Such a database can't be migrated, so the message
+/// says how to recover. A migration missing from this build gets no such
+/// hint: that is an older build opening a newer database, where deleting
+/// it would be the wrong advice.
+fn migration_err(err: &refinery::Error) -> StoreError {
+    let message = match err.kind() {
+        refinery::error::Kind::DivergentVersion(..) => format!(
+            "{err}: the database was created from an earlier schema baseline; \
+             delete the database file and a new one is created on next open"
+        ),
+        _ => err.to_string(),
+    };
+    StoreError::Backend(message)
 }
 
 /// Fails if `PRAGMA foreign_key_check` reports any violation.
@@ -682,6 +702,31 @@ mod tests {
 
         let StoreError::Backend(message) = err;
         assert!(message.contains("parent_edges"), "message: {message}");
+    }
+
+    #[test]
+    fn open_should_suggest_a_reset_when_the_applied_baseline_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old-baseline.db");
+        let old_baseline =
+            Migration::unapplied("V1__init", "CREATE TABLE t (id INTEGER);").unwrap();
+        drop(
+            SqliteStore::init(
+                Connection::open(&path).unwrap(),
+                true,
+                &Runner::new(&[old_baseline]),
+            )
+            .unwrap(),
+        );
+
+        let err = SqliteStore::open(&path).unwrap_err();
+
+        let StoreError::Backend(message) = err;
+        assert!(message.contains("is different than"), "message: {message}");
+        assert!(
+            message.contains("delete the database file"),
+            "message: {message}"
+        );
     }
 
     #[test]
