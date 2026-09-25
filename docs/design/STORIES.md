@@ -183,6 +183,20 @@ TOML shape (`[tree]` table) that extends without a format break.
 5. Type list is editable/configurable, so teams can rename or add levels to match their own vocabulary.
 6. Changing a task's type does not affect its dates, dependencies, or subtasks.
 
+### Story 3.5 — Reorder and Re-parent a Task via Keyboard (TUI) [![Issue #45](https://img.shields.io/github/issues/detail/state/sleb/bala/45)](https://github.com/sleb/bala/issues/45)
+**Description:** As a TUI user, I want to move the focused task up/down among its siblings or in/out a level with single keystrokes, so that I can restructure the task tree without opening a form.
+
+**Acceptance Criteria:**
+1. In Normal mode, `J`/`K` move the focused task down/up among its siblings (same parent, same depth) by one position, without changing its parent or depth.
+2. `K` on a task that is already first among its siblings is a no-op; `J` on a task that is already last is a no-op — neither changes state or shows an error.
+3. In Normal mode, `L` (indent) makes the focused task a subtask of the sibling immediately above it, keeping its own subtree intact; if there is no sibling above it (it's already first), `L` is a no-op.
+4. In Normal mode, `H` (outdent) moves the focused task up to become a sibling of its current parent, keeping its own subtree intact — or promotes it to top-level if its parent has no parent of its own; a task already at top level is a no-op on `H`.
+5. `H`/`L` reuse the reparenting (`set_parents`) path from Story 3.1 AC4, including its circular-hierarchy guard (Story 3.1 AC5) — an indent/outdent that would create a cycle is rejected the same way.
+6. Because a task can have more than one parent (DAG hierarchy — see the tree view's per-path rendering note), `J`/`K`/`H`/`L` act on the specific parent/path the focused row is currently rendered under, not on some assumed single "the" parent.
+7. A per-parent sibling order is introduced to determine rendering order in tree, list, and Gantt views (no such ordering exists prior to this story); it defaults to task-creation order for pre-existing data. *(Gantt rendering is deferred to Story 5.1, which will consume the same `sibling_order()`; this story covers the tree and list views.)*
+8. The moved task's new position is reflected immediately in the tree and list views without a reload. *(Gantt: see AC7 note.)*
+9. `J`/`K`/`H`/`L` appear in the Help overlay (Story 2.5) alongside their lowercase Normal-mode counterparts (`j`/`k` selection, `h`/`l` collapse/expand).
+
 ---
 
 ## Epic 4: Task Dependencies
@@ -277,4 +291,4 @@ TOML shape (`[tree]` table) that extends without a format break.
 
 ---
 
-These 22 stories are independently shippable and sized for roughly one sprint each. A sensible build order: **Epic 1 → Epic 2 → Epic 3 → Epic 4 → Epic 5**, since the terminal UI needs core task CRUD to exist first, and the Gantt chart and dependency enforcement both depend on core task CRUD and hierarchy existing before them. Story 5.3 (TUI) and Story 5.4 (Web/GUI) are client-specific variants of the same capability — ship whichever matches the client that exists at the time (TUI for v1, Web/GUI once the web client lands).
+These 24 stories are independently shippable and sized for roughly one sprint each. A sensible build order: **Epic 1 → Epic 2 → Epic 3 → Epic 4 → Epic 5**, since the terminal UI needs core task CRUD to exist first, and the Gantt chart and dependency enforcement both depend on core task CRUD and hierarchy existing before them. Story 5.3 (TUI) and Story 5.4 (Web/GUI) are client-specific variants of the same capability — ship whichever matches the client that exists at the time (TUI for v1, Web/GUI once the web client lands).
