@@ -203,6 +203,16 @@ Spawn a `general-purpose` agent (the `Agent` tool) with a prompt that:
   sub-agent's local decision breaks a later checkpoint's assumptions.
 - Instructs it to invoke `/rust-skills` (the `Skill` tool, name
   `rust-skills`) before writing code, and follow it throughout.
+- Tells it that code comments and doc comments describe the code, not
+  the process that produced it: never cite story or AC numbers,
+  checkpoint numbers, epics, `STORIES.md`, or "this story/checkpoint",
+  "a later story". State the rule itself inline instead (not "per AC1"
+  but "hierarchy depth is deliberately unbounded, so…"). A note about
+  something not built yet names the missing capability ("dependencies
+  aren't implemented yet"), not the story that will add it. Citing an
+  LLD section (`LLD §Algorithm 4`) is fine; the LLDs are living design
+  docs. The plan's AC tags on tests are for the plan and issue, not the
+  code.
 - Requires strict TDD: write the named tests first (name them
   explicitly if the plan does), confirm red, then implement to green,
   then refactor — not implement-then-backfill-tests.
@@ -231,6 +241,9 @@ was actually followed:
   the deep review is Phase 4.
 - Confirm no unrelated crate was touched, and no stray scratch/backup
   files were left behind.
+- Grep the changed files for process references in comments (`rg -n
+  -i 'story [0-9]|\bAC[0-9]|checkpoint|epic [0-9]|STORIES' <files>`)
+  and send back any hits. They're cheap to fix now and go stale fast.
 - Treat any inline tool diagnostic that contradicts a command you just
   ran cleanly (e.g. a stale-looking "unresolved import" after `cargo
   build` already succeeded) as a stale editor/LSP snapshot, not a real
@@ -333,11 +346,19 @@ Ask it to work through, and report on, each of:
      case, variant, or subcommand should show up everywhere its
      siblings are enumerated — doc comments, help text, match arms —
      not just where the compiler forces it to.
+   - **Did this change make an existing comment false?** Look at comments
+     near the changed code, not just new ones. Scope notes ("X can't
+     happen yet", "Y is a placeholder", "only N methods exist") are the
+     usual casualties: the story that was supposed to lift them just
+     landed. Also flag any comment that cites a story, AC, checkpoint, or
+     epic instead of stating the rule it stands for.
 
    This list names the shapes of bug that have actually slipped through
    this process before (a multi-transaction race, a redundant tree
    fetch, a test-fake/real-backend divergence, unbounded recursion, a
-   non-idempotent completion, stale help text) as concrete illustrations
+   non-idempotent completion, stale help text, a "no task can have
+   children yet" comment that outlived its truth and hid a real
+   behavior gap) as concrete illustrations
    of each question — treat them as examples of what to look for, not
    the complete set of what to check. If something doesn't fit any
    bullet above but still smells like the code would surprise its own

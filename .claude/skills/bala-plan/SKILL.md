@@ -117,7 +117,12 @@ For each checkpoint:
 - List the specific tests to write **first**, named for behavior per this
   repo's convention (`create_task_should_reject_empty_title`, not
   `test_create_task_1`), each tagged with the AC it proves where one
-  applies.
+  applies. The AC tags are for the plan and issue only. Don't tell the
+  implementer to put story, AC, or checkpoint numbers in test names or
+  code comments, and don't phrase planned comments that way ("no-op
+  until Story 3.1"). A comment states the rule or the missing
+  capability itself, so it still reads correctly after the story is
+  done.
 - Say what minimal production code makes each test pass — cite real
   types/methods from the LLDs (§Phase 1.3), not placeholders.
 - If the checkpoint adds or changes anything a user-facing doc from
