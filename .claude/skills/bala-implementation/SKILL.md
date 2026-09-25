@@ -122,10 +122,14 @@ the same agent and re-check the revision.
 
 On the user's confirmation, `SendMessage` the same agent to finish
 `/bala-plan`'s Phase 4 (milestone, issue, any confirmed `STORIES.md`
-edit) and report the issue number/link. Then confirm it yourself:
-`gh issue view <number>` shows the confirmed body with its task list,
-and the issue is in the story's `Epic N: <Title>` milestone. That issue
-is now the plan — carry on to Phase 1 with it.
+edit) and report the issue number/link. If this is a closed issue the
+user chose to reopen in Phase 0, also have it run `gh issue reopen
+<number>` — `/bala-plan`'s revision path only edits the body, so
+without this the story would be implemented against a closed issue.
+Then confirm it yourself: `gh issue view <number>` shows the issue
+open, with the confirmed body and its task list, in the story's
+`Epic N: <Title>` milestone. That issue is now the plan — carry on to
+Phase 1 with it.
 
 A `STORIES.md` edit from this phase is expected, uncommitted work in
 the tree: it's part of this story, so Phase 1's clean-tree check should
