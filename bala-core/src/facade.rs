@@ -114,12 +114,6 @@ impl<S: Store> Core<S> {
     ///   existing task.
     /// - [`CoreError::UnknownUser`] if `new.assignee_id` is `Some` and
     ///   names no existing [`User`].
-    /// - [`CoreError::CircularHierarchy`] if any of `new.parent_ids` would
-    ///   make the new task its own ancestor — not reachable in practice
-    ///   today, since a brand-new [`TaskId`] can never already be an
-    ///   ancestor of anything, but `hierarchy::check_new_parent` runs
-    ///   unconditionally, the same check `set_parents` relies on when
-    ///   reattaching an *existing* task.
     /// - [`CoreError::Store`] if the backend fails.
     pub fn create_task(&mut self, new: NewTask) -> Result<Task, CoreError> {
         if new.title.trim().is_empty() {
@@ -177,33 +171,23 @@ impl<S: Store> Core<S> {
         };
 
         let progress = self.store.transaction(|tx| {
-            // A freshly minted id has no descendants, so `replace_parents`'
-            // cycle check below cannot fail for a real cycle; a rejection
-            // that did occur after `put_task` would still commit the row,
-            // which is why the check is not a separate pre-pass.
+            // No cycle check: a new id has no descendants, so it cannot be
+            // an ancestor of any of its parents, and every parent's
+            // existence was checked above.
             tx.put_task(&task)?;
-            if let Err(e) = replace_parents(
-                tx,
+            tx.replace_parent_edges(
                 task.id,
                 &Parents::from_ids(task.parent_ids.clone()),
                 Placement::End,
-            ) {
-                // A backend failure must abort the transaction so `put_task`
-                // rolls back; only a domain error is handed back to the caller.
-                return match e {
-                    CoreError::Store(store_error) => Err(store_error),
-                    other => Ok(Err(other)),
-                };
-            }
+            )?;
             // A just-created task has no children of its own yet (nothing
             // can point at `task.id` before this call), so this always
             // degenerates to the same `0.0` a leaf-only placeholder would
             // give — but it's computed via the shared helper, after
             // `put_task`, for consistency with every other `Task`-returning
             // method rather than assumed.
-            let progress = compute_progress(tx, task.id, task.status)?;
-            Ok(Ok(progress))
-        })??;
+            compute_progress(tx, task.id, task.status)
+        })?;
         task.progress = progress;
 
         Ok(task)
@@ -1187,6 +1171,7 @@ mod tests {
     use super::*;
     use crate::in_memory_store::InMemoryStore;
     use crate::model::TaskStatus;
+    use crate::test_support::CountingStore;
     use chrono::NaiveDate;
 
     fn new_core() -> Core<InMemoryStore> {
@@ -1332,14 +1317,44 @@ mod tests {
     }
 
     #[test]
-    fn create_task_should_run_hierarchy_check_for_each_given_parent() {
-        // A freshly created task has no existing edges, so it can never
-        // already be an ancestor of any of its given parents — this
-        // asserts that attaching it under several parents in one call
-        // succeeds and records every edge, i.e. the per-parent check
-        // (`hierarchy::check_new_parent`) runs without rejecting any of
-        // them. `hierarchy::tests` separately unit-tests the cycle-rejection
-        // paths of the function itself.
+    fn create_task_should_make_the_same_store_calls_at_any_parent_depth() {
+        let (store, calls) = CountingStore::new();
+        let mut core = Core::new(store).unwrap();
+        let top = core.create_task(minimal_new_task("Top")).unwrap();
+        let mut deepest = top.id;
+        for i in 0..50 {
+            deepest = core
+                .create_task(NewTask {
+                    parent_ids: vec![deepest],
+                    ..minimal_new_task(&format!("Level {i}"))
+                })
+                .unwrap()
+                .id;
+        }
+
+        let before_shallow = calls.get();
+        core.create_task(NewTask {
+            parent_ids: vec![top.id],
+            ..minimal_new_task("Under top")
+        })
+        .unwrap();
+        let shallow_calls = calls.get() - before_shallow;
+
+        let before_deep = calls.get();
+        core.create_task(NewTask {
+            parent_ids: vec![deepest],
+            ..minimal_new_task("Under deepest")
+        })
+        .unwrap();
+        let deep_calls = calls.get() - before_deep;
+
+        assert_eq!(deep_calls, shallow_calls);
+    }
+
+    #[test]
+    fn create_task_should_record_an_edge_for_each_given_parent() {
+        // Attaching a new task under several parents in one call succeeds
+        // and records one edge per parent, in the given order.
         let mut core = new_core();
         let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
         let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
@@ -1352,6 +1367,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
+        let stored_parents = core
+            .store
+            .transaction(|tx| tx.list_parent_edges(child.id))
+            .unwrap();
+        assert_eq!(stored_parents, vec![parent_a.id, parent_b.id]);
+        for parent in [&parent_a, &parent_b] {
+            let children = core.list_children(parent.id).unwrap();
+            assert_eq!(
+                children.iter().map(|t| t.id).collect::<Vec<_>>(),
+                vec![child.id]
+            );
+        }
     }
 
     #[test]

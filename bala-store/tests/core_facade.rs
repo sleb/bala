@@ -158,10 +158,9 @@ fn create_task_should_reject_due_date_before_start_date() {
 }
 
 #[test]
-fn create_task_should_run_hierarchy_check_for_each_given_parent() {
-    // A brand-new task can't already be anyone's ancestor, so the
-    // per-parent cycle check (`hierarchy::check_new_parent`) must pass
-    // for every parent and every edge must be recorded.
+fn create_task_should_record_an_edge_for_each_given_parent() {
+    // Attaching a new task under several parents in one call succeeds
+    // and records one edge per parent, in the given order.
     let mut core = new_core();
     let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
     let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
@@ -174,6 +173,16 @@ fn create_task_should_run_hierarchy_check_for_each_given_parent() {
         .unwrap();
 
     assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
+    // A fresh read rebuilds `parent_ids` from the stored edges.
+    let reread = core.get_task(child.id).unwrap().unwrap();
+    assert_eq!(reread.parent_ids, vec![parent_a.id, parent_b.id]);
+    for parent in [&parent_a, &parent_b] {
+        let children = core.list_children(parent.id).unwrap();
+        assert_eq!(
+            children.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![child.id]
+        );
+    }
 }
 
 #[test]

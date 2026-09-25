@@ -363,9 +363,14 @@ reject the whole call with `CircularHierarchy { task: id, attempted_parent:
 parent }` — no edges are written until every candidate parent has passed
 the check. O(edges) per call, same complexity class as the old O(depth)
 single-chain walk since `visited` bounds the work to each ancestor node
-once regardless of how many paths reach it. `create_task` runs the same
-check per entry in `NewTask.parent_ids` (an id can't be its own ancestor
-at creation, but the check is shared code, not special-cased away).
+once regardless of how many paths reach it. `create_task` skips the
+check and writes the new task's edges directly: a freshly minted id has no
+descendants, so it cannot be an ancestor of any entry in
+`NewTask.parent_ids`, and each parent's existence is already validated.
+Running the walk anyway would cost one `list_parent_edges` per ancestor,
+making every create under a deep chain O(depth) for a check that can never
+fail. Every write that adds a parent to an *existing* task still goes
+through `hierarchy::replace_parents` and its check.
 
 ### 2. Dependency invariants ([#60](https://github.com/sleb/bala/issues/60) AC2–3)
 
