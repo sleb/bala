@@ -3,8 +3,7 @@
 //! `out_of_sync` is unused by `bala-core`'s current `Task` shape (see crate
 //! docs) and is written with a fixed default (`0`) on every `put_task`,
 //! never read back into a `Task`, since `Task` has nowhere to put it yet.
-//! `assignee_id` (Story 1.1a), `deleted_at` (Story 1.3), and `completed_at`
-//! (Story 1.4) *are* read/written.
+//! `assignee_id`, `deleted_at`, and `completed_at` *are* read/written.
 
 use bala_core::{StoreError, Task, TaskId, TreeFilter};
 use rusqlite::{OptionalExtension, Row, ToSql, Transaction, params};

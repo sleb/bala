@@ -3,15 +3,38 @@
 **Status:** Proposed
 **Date:** 2026-08-30
 **Deciders:** Scott (product/eng)
-**Related:** [STORIES.md](./STORIES.md) (Epics 1–5)
+**Related:** [user stories](https://github.com/sleb/bala/issues?q=label%3Astory) (GitHub issues labeled `story`, grouped into [epic milestones](https://github.com/sleb/bala/milestones?state=all))
 
 ## Context
 
 Bala is a new task management app: arbitrarily-nested tasks (which may
 have more than one parent), typed dependencies (finish-to-start as the
-baseline case, per STORIES.md) with cascading reschedule, and a Gantt
-view derived from task data. Per STORIES.md it starts single-user /
-small-team with no existing design files.
+baseline case) with cascading reschedule, and a Gantt view derived from
+task data. It starts single-user / small-team with no existing design
+files.
+
+### Product Assumptions
+
+- Single-user or small-team to start; no design mockups exist yet.
+- "Arbitrary nesting" means a task can have subtasks, which can have
+  their own subtasks, with no depth limit. This lets users model
+  initiatives, goals, projects, stories, and subtasks however they like.
+- Dependencies are finish-to-start (B can't start until A finishes) as
+  the baseline case.
+- The Gantt chart is a read view generated from task dates, hierarchy,
+  and dependencies, not drawn by hand.
+
+### Build Order and Tracking
+
+Core task CRUD → terminal UI → nested hierarchy → dependencies → Gantt.
+The terminal UI needs core CRUD first, and dependency enforcement and
+the Gantt chart both need CRUD and the hierarchy to exist before them.
+
+Work is tracked in GitHub: each user-facing capability is an issue
+labeled `story`, holding its description, acceptance criteria, plan, and
+a changelog of scope changes. Stories are grouped into epic milestones,
+each with a goal, exit criteria, and a fixed story list; an epic closes
+when its exit criteria pass. Issues with no milestone are the backlog.
 
 This HLD stays intentionally coarse: it fixes the component boundaries and
 the contracts between them so that each component can get its own LLD
@@ -102,7 +125,7 @@ delete_task(id, mode: Subtree | PromoteChildren) -> Vec<Task>   // touched
 set_parents(id, newParentIds)                  -> Task
 add_dependency(id, predecessorId, type)        -> Task
 remove_dependency(id, predecessorId)           -> Task
-preview_cascade(id, TaskPatch)                 -> Vec<Task>     // Story 4.2 AC3, no commit
+preview_cascade(id, TaskPatch)                 -> Vec<Task>     // #61 AC3, no commit
 get_tree(filter)                               -> Vec<Task>     // progress pre-computed
 list_task_types() / upsert_task_type(...)
 ```
@@ -128,13 +151,13 @@ out so an LLD doesn't build that prematurely.
 **Not resolved by this HLD (CLI/TUI-specific, defer to that Client's
 LLD):**
 - Rescheduling from the Gantt chart is now split into two client-specific
-  stories rather than one drag-oriented story: Story 5.3 (TUI, keyboard —
+  stories rather than one drag-oriented story: [#65](https://github.com/sleb/bala/issues/65) (TUI, keyboard —
   select a bar, nudge dates with keys/numeric input, same as an editor
-  "insert mode") targets v1 and Story 5.4 (Web/GUI, mouse drag) targets
+  "insert mode") targets v1 and [#66](https://github.com/sleb/bala/issues/66) (Web/GUI, mouse drag) targets
   the future Web Client. Both call the same `update_task`/`preview_cascade`
   methods — only the input mechanism differs, so no new library surface
   is needed for either.
-- Story 5.5 (PNG/PDF export) has no natural terminal output. Options:
+- [#67](https://github.com/sleb/bala/issues/67) (PNG/PDF export) has no natural terminal output. Options:
   a text/ASCII export for v1, or defer true image export until the Web
   Client exists (canvas rendering is a natural fit there). Not decided
   here — flagged as an open question for the CLI/TUI Client LLD.
@@ -164,16 +187,16 @@ parent) plus a separate typed dependency edge set (`predecessorId →
 successorId`, each edge carrying a finish-to-start/start-to-start/
 finish-to-finish/start-to-finish type), stored distinctly — hierarchy and
 dependency are related but independent graphs (a dependency validity
-check must walk the hierarchy graph too, per Story 4.1 AC2). Given the
+check must walk the hierarchy graph too, per [#60](https://github.com/sleb/bala/issues/60) AC2). Given the
 CLI/TUI runs locally and in-process, an embedded engine (e.g. SQLite) is
 the natural v1 choice, but that's a Data Store LLD decision. Schema,
 indexing, and transaction boundaries are also deferred there.
 
 ## Deferred to LLDs
 
-- **CLI/TUI Client LLD (v1):** terminal view components, text-based Gantt rendering/zoom/pan, keyboard-driven rescheduling (replacing drag), export mechanism decision (Story 5.5), local config file format for view state.
-- **Core Library LLD:** method/error signatures, hierarchy invariant enforcement, dependency cycle detection algorithm, cascade scheduling algorithm (and its "preview before committing" UX per Story 4.2 AC3), progress rollup computation, task-type config storage.
-- **Data Store LLD:** engine choice (embedded, e.g. SQLite, given v1 runs locally in-process), schema, indexing strategy for tree + graph queries at 200+ tasks. Soft- vs. hard-delete for Story 1.3 AC5 is resolved (soft-delete, per Core Library LLD §Context) — the Data Store LLD implements the `deletedAt` tombstone, it doesn't re-decide the question.
+- **CLI/TUI Client LLD (v1):** terminal view components, text-based Gantt rendering/zoom/pan, keyboard-driven rescheduling (replacing drag), export mechanism decision ([#67](https://github.com/sleb/bala/issues/67)), local config file format for view state.
+- **Core Library LLD:** method/error signatures, hierarchy invariant enforcement, dependency cycle detection algorithm, cascade scheduling algorithm (and its "preview before committing" UX per [#61](https://github.com/sleb/bala/issues/61) AC3), progress rollup computation, task-type config storage.
+- **Data Store LLD:** engine choice (embedded, e.g. SQLite, given v1 runs locally in-process), schema, indexing strategy for tree + graph queries at 200+ tasks. Soft- vs. hard-delete for [#12](https://github.com/sleb/bala/issues/12) AC5 is resolved (soft-delete, per Core Library LLD §Context) — the Data Store LLD implements the `deletedAt` tombstone, it doesn't re-decide the question.
 - **Web Client LLD / Web API LLD:** deferred until that phase starts; the Web API LLD should mostly fall out of the Core Library LLD's method list.
 
 ## Consequences
@@ -181,11 +204,11 @@ indexing, and transaction boundaries are also deferred there.
 - Domain logic lives in one library from the start, not in the CLI binary — adding the web client later is additive (new Web API + Web Client components) rather than a refactor to pull business logic out of `main()`.
 - Fewer moving parts to stand up and run for v1: no server process, no service-to-service auth, no deploy — the CLI links the library and reads/writes a local store directly.
 - The Core Library is a single point carrying real domain complexity (hierarchy + dependency + rollup together) — worth its own careful LLD, and its method boundary is now also the future HTTP API's boundary, so it's worth getting the shapes (especially error types and the "touched tasks" return values) right early.
-- No real-time sync (WebSocket/SSE) between multiple concurrent users/clients is in this HLD; "immediate" updates (Stories 1.1, 3.2, 3.3) are satisfied by direct calls into the library (v1) or normal request/response + optimistic UI (future web). Multi-client concurrent editing (e.g. CLI and web open on the same task data at once) isn't addressed here — noted so it isn't silently assumed away.
+- No real-time sync (WebSocket/SSE) between multiple concurrent users/clients is in this HLD; "immediate" updates ([#6](https://github.com/sleb/bala/issues/6), [#38](https://github.com/sleb/bala/issues/38), [#39](https://github.com/sleb/bala/issues/39)) are satisfied by direct calls into the library (v1) or normal request/response + optimistic UI (future web). Multi-client concurrent editing (e.g. CLI and web open on the same task data at once) isn't addressed here — noted so it isn't silently assumed away.
 
 ## Action Items
 1. [x] Write Core Library LLD (method contract, hierarchy / scheduling / rollup modules)
 2. [x] Write Data Store LLD
 3. [x] Write CLI/TUI Client LLD
-4. [x] Decide soft-delete vs. undo mechanism for Story 1.3 AC5 — resolved: soft-delete, per Core Library LLD §Context
-5. [x] Decide v1 export approach for Story 5.5 — resolved: text/ASCII export now, per CLI/TUI Client LLD §Algorithm 4 (PNG/PDF deferred to Web Client)
+4. [x] Decide soft-delete vs. undo mechanism for [#12](https://github.com/sleb/bala/issues/12) AC5 — resolved: soft-delete, per Core Library LLD §Context
+5. [x] Decide v1 export approach for [#67](https://github.com/sleb/bala/issues/67) — resolved: text/ASCII export now, per CLI/TUI Client LLD §Algorithm 4 (PNG/PDF deferred to Web Client)

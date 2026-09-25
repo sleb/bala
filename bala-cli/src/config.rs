@@ -67,13 +67,12 @@ pub fn view_state_path() -> Result<PathBuf, ConfigError> {
 }
 
 /// Persisted TUI view state: which task (if any) is currently selected in
-/// the tree, and which tasks are collapsed.
+/// the tree, which tasks are collapsed, and the active type filter.
 ///
-/// Other fields (`gantt_scale`, `gantt_anchor`, `filter`, `blocked_only`,
-/// ...) described in the design doc are deliberately out of scope for this
-/// story and may join later without a format break, since they'd live
-/// alongside `selected` and `collapsed` inside the same `[tree]` table (or a
-/// sibling table).
+/// The design doc's other fields (`gantt_scale`, `gantt_anchor`,
+/// `blocked_only`) are added when the Gantt view and blocked-task filter
+/// exist. They can join without a format break, alongside these in the
+/// `[tree]` table or in a sibling table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ViewState {
     pub selected: Option<TaskId>,

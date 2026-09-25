@@ -11,8 +11,7 @@ use uuid::Uuid;
 /// Maps any lower-level failure (bad blob length, unparseable date/status
 /// text) into the one variant `bala_core::StoreError` currently has.
 ///
-/// `bala-core`'s `StoreError` is a Checkpoint-1 placeholder (`Backend(String)`
-/// only) — see this crate's module docs for why `bala-store` maps into it
+/// `bala-core`'s `StoreError` has only `Backend(String)` — see this crate's module docs for why `bala-store` maps into it
 /// via `.to_string()` rather than growing its own separate error type.
 pub(crate) fn corrupt(context: &str, detail: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(format!(

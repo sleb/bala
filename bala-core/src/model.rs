@@ -83,8 +83,7 @@ impl From<UserId> for Uuid {
 }
 
 /// Minimal user identity for task assignment — no auth, email, roles, or
-/// avatars (out of scope per STORIES.md Story 1.1a); just enough to give
-/// `assignee_id` a real entity to resolve to instead of a bare id.
+/// avatars; just enough to give `assignee_id` a real entity to resolve to instead of a bare id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct User {
     pub id: UserId,
@@ -100,9 +99,9 @@ pub enum TaskStatus {
 
 /// A task as stored and returned by the core library.
 ///
-/// Deliberately narrower than the full LLD shape for this story: fields
-/// belonging to later stories/epics (`depends_on`, `out_of_sync`) are
-/// omitted until the stories that need them land.
+/// Deliberately narrower than the full LLD shape: the dependency fields
+/// (`depends_on`, `out_of_sync`) are omitted until dependencies are
+/// implemented.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: TaskId,
@@ -118,8 +117,9 @@ pub struct Task {
     /// this mirrors the task's own `status` (`0.0` for
     /// [`TaskStatus::Incomplete`], `1.0` for [`TaskStatus::Complete`]).
     /// For a task with direct children, it's the average of each direct
-    /// child's own `status` flag — grandchildren never factor in (Story
-    /// 3.3 AC1/AC2; see `rollup::direct_children_progress`).
+    /// child's own `status` flag — grandchildren never factor in, so an
+    /// epic with two stories of ten subtasks each reads 0–2 of 2, never
+    /// 0–20 (see `rollup::direct_children_progress`).
     pub progress: f32,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,

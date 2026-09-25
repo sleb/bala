@@ -2,7 +2,7 @@
 //! (`bala-core/src/facade.rs`'s `tests` module) against `SqliteStore`
 //! instead of `InMemoryStore`, to prove `Core::create_task`/`get_tree`/
 //! `list_task_types`/`upsert_task_type` behave identically regardless of
-//! which `Store` backs them (Story 1.1 TDD plan, Checkpoint 5).
+//! which `Store` backs them.
 //!
 //! Test bodies and assertions are ported verbatim from `bala-core`'s
 //! suite — only the store construction changes (`SqliteStore::open_in_memory()`
@@ -159,12 +159,9 @@ fn create_task_should_reject_due_date_before_start_date() {
 
 #[test]
 fn create_task_should_run_hierarchy_check_for_each_given_parent() {
-    // The hierarchy check is a no-op at this checkpoint (Story 3.1
-    // gives it teeth), so the honest thing to assert here is that
-    // attaching a task under several parents in one call still
-    // succeeds and records every edge — i.e. the per-parent check
-    // (`hierarchy::check_new_parent`) runs without rejecting any of
-    // them.
+    // A brand-new task can't already be anyone's ancestor, so the
+    // per-parent cycle check (`hierarchy::check_new_parent`) must pass
+    // for every parent and every edge must be recorded.
     let mut core = new_core();
     let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
     let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();

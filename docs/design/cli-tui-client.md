@@ -3,7 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-09-03
 **Deciders:** Scott (product/eng)
-**Related:** [HLD.md](./HLD.md) (CLI/TUI Client component), [core-library.md](./core-library.md) (`Core<S: Store>` facade this LLD calls in-process), [data-store.md](./data-store.md) (`SqliteStore::open` path this LLD supplies), [STORIES.md](./STORIES.md) (Epics 1–5)
+**Related:** [HLD.md](./HLD.md) (CLI/TUI Client component), [core-library.md](./core-library.md) (`Core<S: Store>` facade this LLD calls in-process), [data-store.md](./data-store.md) (`SqliteStore::open` path this LLD supplies), [user stories](https://github.com/sleb/bala/issues?q=label%3Astory)
 
 ## Context
 
@@ -11,7 +11,7 @@ HLD.md fixed the CLI/TUI Client as terminal rendering, keyboard-driven
 interaction, and client-local view state, calling `bala-core` in-process
 with no business logic of its own. It deferred five things to this LLD:
 terminal view components, text-based Gantt rendering/zoom/pan,
-keyboard-driven rescheduling (Story 5.3, replacing drag), the Story 5.5
+keyboard-driven rescheduling ([#65](https://github.com/sleb/bala/issues/65), replacing drag), the [#67](https://github.com/sleb/bala/issues/67)
 export mechanism decision, and the local config file format for view
 state. This LLD is also the last piece needed to close HLD's action item
 5 (v1 export approach), still open at the top of HLD.md.
@@ -33,12 +33,12 @@ their implementation:
   redraws the whole frame from `App` state each tick, which keeps the
   render path a pure function of state — important here because §Screens
   reuses the same layout/rendering functions for the interactive Gantt
-  pane and the Story 5.5 text export (render once, either to a terminal
+  pane and the [#67](https://github.com/sleb/bala/issues/67) text export (render once, either to a terminal
   frame or a string buffer). `crossterm` gives cross-platform raw-mode
   input without pulling in a heavier framework than four screens and a
   handful of widgets need.
 - **Keybindings: vim-modal.** A `Mode` enum (§Modes & Keybindings) drives
-  input dispatch the way HLD's own "insert mode" analogy for Story 5.3
+  input dispatch the way HLD's own "insert mode" analogy for [#65](https://github.com/sleb/bala/issues/65)
   already implied — Normal mode for navigation, dedicated modes for text
   entry, rescheduling, and destructive-action confirmation, `Esc` always
   cancels back to Normal. One consistent modal grammar reused across
@@ -102,17 +102,26 @@ consumer duplicates layout logic, mirroring how Core LLD's
 
 ```rust
 pub struct ViewState {
-    pub collapsed: HashSet<TaskId>,      // Story 3.2 AC2: persists across sessions
+    pub collapsed: HashSet<TaskId>,      // #38 AC2: persists across sessions
     pub selected: Option<TaskId>,        // last-focused task, restored on relaunch
-    pub gantt_scale: GanttScale,         // Story 5.2 AC5: persists across sessions
+    pub gantt_scale: GanttScale,         // #64 AC5: persists across sessions
     pub gantt_anchor: NaiveDate,         // left edge of the last viewport (pan position)
     pub filter: TreeFilter,              // Core LLD's TreeFilter, reused verbatim —
-                                          // Story 3.4 AC4 / Story 4.3 AC4 filter/group state
-    pub blocked_only: bool,              // Story 4.3 AC4, not expressible via TreeFilter
+                                          // #40 AC4 / #62 AC4 filter/group state
+    pub blocked_only: bool,              // #62 AC4, not expressible via TreeFilter
 }
 
 pub enum GanttScale { Day, Week, Month }
 ```
+
+**Implemented so far:** `selected`, `collapsed`, and the type filter. The
+type filter is stored as `filter_type_key` in the `[tree]` table rather
+than the `[filter]` table sketched below. `gantt_scale`, `gantt_anchor`,
+and `blocked_only` are added with the Gantt view and the blocked-task
+filter. Saving currently happens on the normal quit path only: the
+`Ctrl-C`/`SIGTERM` cleanup guard described below is the intended design
+but isn't built yet. Until it is, the temp-then-rename write is what
+keeps a crash or kill from corrupting the file.
 
 Serialized as TOML at `<config_dir>/bala/view.toml`:
 
@@ -135,7 +144,8 @@ db_path = "/Users/scott/.local/share/bala/bala.db"  # resolved default, override
 
 `config::load()` reads this at startup (missing file → `ViewState::default()`,
 not an error — first run). `config::save()` writes on quit (`q` in
-Normal mode) and on `Ctrl-C`/`SIGTERM` via a cleanup guard, using a
+Normal mode) and on `Ctrl-C`/`SIGTERM` via a cleanup guard (not yet
+implemented; see the status note above), using a
 write-to-temp-then-rename so a crash mid-write can't corrupt the file —
 the same atomicity concern Data Store LLD solved with SQL transactions,
 solved here with the filesystem's rename semantics since there's no
@@ -150,9 +160,9 @@ path and calls `open`.
 pub enum Mode {
     Normal,
     Insert { field: EditableField, buffer: String },   // title/description/date text entry
-    Reschedule { task: TaskId, edge: Edge, preview: Vec<Task> }, // Story 5.3
+    Reschedule { task: TaskId, edge: Edge, preview: Vec<Task> }, // #65
     Confirm { prompt: String, action: PendingAction },  // delete/complete cascades
-    Filter,                                             // Story 3.4 AC4 / Story 4.3 AC4
+    Filter,                                             // #40 AC4 / #62 AC4
     Help,                                                // '?' overlay, current mode's keys
 }
 
@@ -168,35 +178,35 @@ every non-`Normal` mode maps it to "discard and return to `Normal`" — for
 `Reschedule` that means the `preview` field's uncommitted cascade is
 simply dropped, never persisted (§Algorithm 3).
 
-**Normal mode** (default; tree pane always visible on the left, per Story
-5.1 AC2's "tree on the left" — the right pane toggles between Detail and
+**Normal mode** (default; tree pane always visible on the left, per
+[#63](https://github.com/sleb/bala/issues/63) AC2's "tree on the left" — the right pane toggles between Detail and
 Gantt):
 
 | Key                  | Action                                                                                                                                            |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `j`/`k`, `↓`/`↑`     | move selection in the flattened visible tree                                                                                                      |
-| `h`/`l`, `←`/`→`     | collapse/expand focused task (Story 3.2 AC1)                                                                                                      |
+| `h`/`l`, `←`/`→`     | collapse/expand focused task ([#38](https://github.com/sleb/bala/issues/38) AC1)                                                                                                      |
 | `gg` / `G`           | jump to first/last visible task                                                                                                                   |
-| `E` / `C`            | expand all / collapse all (Story 3.2 AC3)                                                                                                         |
-| `J` / `K`            | move focused task down/up among siblings via `Core::move_sibling` under the row's rendered parent (`TaskRow.parent_id`); selection follows the task (Story 3.5). Swaps use the full sibling order, so with a type filter a press may look like a no-op when the neighbor is hidden (known caveat) |
-| `L` / `H`            | indent / outdent the focused task via `Core::indent_task` / `Core::outdent_task` using the row's rendered path (`parent_id`, `grandparent_id`); indent expands the new parent (previous live sibling, from `SiblingOrder`) and selection follows the task to its new row; no-op is silent, errors (e.g. `CircularHierarchy`) show inline (Story 3.5) |
-| `o` / `O`            | new subtask under focused task / new top-level task → `Insert{title}` (Stories 1.1, 3.1)                                                          |
+| `E` / `C`            | expand all / collapse all ([#38](https://github.com/sleb/bala/issues/38) AC3)                                                                                                         |
+| `J` / `K`            | move focused task down/up among siblings via `Core::move_sibling` under the row's rendered parent (`TaskRow.parent_id`); selection follows the task ([#45](https://github.com/sleb/bala/issues/45)). Swaps use the full sibling order, so with a type filter a press may look like a no-op when the neighbor is hidden (known caveat) |
+| `L` / `H`            | indent / outdent the focused task via `Core::indent_task` / `Core::outdent_task` using the row's rendered path (`parent_id`, `grandparent_id`); indent expands the new parent (previous live sibling, from `SiblingOrder`) and selection follows the task to its new row; no-op is silent, errors (e.g. `CircularHierarchy`) show inline ([#45](https://github.com/sleb/bala/issues/45)) |
+| `o` / `O`            | new subtask under focused task / new top-level task → `Insert{title}` ([#6](https://github.com/sleb/bala/issues/6), [#37](https://github.com/sleb/bala/issues/37))                                                          |
 | `Enter`              | open Detail pane on focused task                                                                                                                  |
-| `i` (in Detail pane) | edit a field → `Insert` (Story 1.2)                                                                                                               |
-| `dd`                 | delete focused task → `Confirm` (Story 1.3)                                                                                                       |
-| `x` / `Space`        | toggle complete → `Confirm` only if blocked by incomplete children (Story 1.4)                                                                    |
-| `m`                  | reparent (`set_parents`) → `Insert{parent list}` (Story 3.1 AC4)                                                                                  |
-| `p` / `P`            | add / remove dependency → `Insert{predecessor}` (Story 4.1)                                                                                       |
-| `t`                  | set task type → `Insert{type}` (Story 3.4)                                                                                                        |
-| `g` (Gantt toggle)   | switch right pane Detail ↔ Gantt (Story 5.1)                                                                                                      |
-| `r`                  | enter `Reschedule` for focused task; switches right pane to Gantt if it isn't already showing, so the bar being nudged is visible (Story 5.3 AC1) |
-| `+`/`-`              | zoom gantt scale in/out — Day↔Week↔Month (Story 5.2 AC1)                                                                                          |
-| `T`                  | jump-to-today: recenters `gantt_anchor` (Story 5.2 AC3)                                                                                           |
+| `i` (in Detail pane) | edit a field → `Insert` ([#11](https://github.com/sleb/bala/issues/11))                                                                                                               |
+| `dd`                 | delete focused task → `Confirm` ([#12](https://github.com/sleb/bala/issues/12))                                                                                                       |
+| `x` / `Space`        | toggle complete → `Confirm` only if blocked by incomplete children ([#13](https://github.com/sleb/bala/issues/13))                                                                    |
+| `m`                  | reparent (`set_parents`) → `Insert{parent list}` ([#37](https://github.com/sleb/bala/issues/37) AC4)                                                                                  |
+| `p` / `P`            | add / remove dependency → `Insert{predecessor}` ([#60](https://github.com/sleb/bala/issues/60))                                                                                       |
+| `t`                  | set task type → `Insert{type}` ([#40](https://github.com/sleb/bala/issues/40))                                                                                                        |
+| `g` (Gantt toggle)   | switch right pane Detail ↔ Gantt ([#63](https://github.com/sleb/bala/issues/63))                                                                                                      |
+| `r`                  | enter `Reschedule` for focused task; switches right pane to Gantt if it isn't already showing, so the bar being nudged is visible ([#65](https://github.com/sleb/bala/issues/65) AC1) |
+| `+`/`-`              | zoom gantt scale in/out — Day↔Week↔Month ([#64](https://github.com/sleb/bala/issues/64) AC1)                                                                                          |
+| `T`                  | jump-to-today: recenters `gantt_anchor` ([#64](https://github.com/sleb/bala/issues/64) AC3)                                                                                           |
 | `f`                  | open filter menu → `Filter` (type/status/blocked-only)                                                                                            |
 | `?`                  | help overlay → `Help`                                                                                                                             |
 | `q`                  | save config, quit                                                                                                                                 |
 
-**Reschedule mode** (Story 5.3 AC1–3):
+**Reschedule mode** ([#65](https://github.com/sleb/bala/issues/65) AC1–3):
 
 | Key                           | Action                                                                           |
 | ----------------------------- | -------------------------------------------------------------------------------- |
@@ -218,12 +228,12 @@ Rendering) and accepts `y`/`n` only; `y` runs the `PendingAction`
 
 Flattens the visible subset of `get_tree`'s result — a task is visible
 if every ancestor on at least one of its paths to a root is expanded
-(Story 3.2) — into ordered rows, each showing: expand/collapse glyph,
-indentation by depth, type label/color tag (Story 3.4 AC3), title,
-progress fraction (Story 3.3 AC1, `"3/7"` style per Story 3.2 AC4's
+([#38](https://github.com/sleb/bala/issues/38)) — into ordered rows, each showing: expand/collapse glyph,
+indentation by depth, type label/color tag ([#40](https://github.com/sleb/bala/issues/40) AC3), title,
+progress fraction ([#39](https://github.com/sleb/bala/issues/39) AC1, `"3/7"` style per [#38](https://github.com/sleb/bala/issues/38) AC4's
 collapsed-summary requirement — shown on every row, not just collapsed
 ones, since it's cheap once computed), a completion glyph, and a blocked
-indicator (Story 4.3 AC1, §Algorithm 2). A task shared by two parents
+indicator ([#62](https://github.com/sleb/bala/issues/62) AC1, §Algorithm 2). A task shared by two parents
 (HLD's DAG hierarchy) appears once per parent it's expanded under — the
 tree view is a rendering of paths through the DAG, not a claim that the
 task itself is duplicated; selecting either instance operates on the
@@ -231,7 +241,7 @@ same underlying `TaskId`.
 
 ### Task Detail View (right pane)
 
-All fields from HLD's shared `Task` shape, plus the two lists Story 4.1
+All fields from HLD's shared `Task` shape, plus the two lists [#60](https://github.com/sleb/bala/issues/60)
 AC5 requires: "blocked by" (this task's `depends_on`, each with its
 predecessor's title/status) and "blocks" (successor lookup — the CLI has
 no direct `list_successors` call on `Core`; it derives this by scanning
@@ -256,7 +266,7 @@ keys actually do.
 
 ## Algorithms
 
-### 1. Gantt rendering: scale mapping, bars, collapsed summaries (Stories 5.1, 5.2)
+### 1. Gantt rendering: scale mapping, bars, collapsed summaries ([#63](https://github.com/sleb/bala/issues/63), [#64](https://github.com/sleb/bala/issues/64))
 
 `GanttScale` fixes a column width in days: `Day` → 1, `Week` → 7,
 `Month` → 30 (calendar-approximate; exact month boundaries aren't needed
@@ -269,22 +279,22 @@ ever change their inputs, never the drawing code that calls them.
 
 For each visible row (same visibility rule as the tree pane), draw a bar
 from `date_to_column(task.start_date)` to `date_to_column(task.due_date)`
-using `═`; unscheduled tasks (Story 5.1 AC3: missing either date) are
+using `═`; unscheduled tasks ([#63](https://github.com/sleb/bala/issues/63) AC3: missing either date) are
 excluded from the bar area and listed in a fixed "Unscheduled" section
 below the chart instead of occupying a row with no bar. Bar styling
 encodes status: complete (dim/checked), blocked (§Algorithm 2, distinct
-color per Story 4.3 AC5), out-of-sync (Core LLD's `out_of_sync` flag,
+color per [#62](https://github.com/sleb/bala/issues/62) AC5), out-of-sync (Core LLD's `out_of_sync` flag,
 distinct glyph at the bar's edge), normal. The `today` column is always
-highlighted regardless of scroll position, per Story 5.2 AC2.
+highlighted regardless of scroll position, per [#64](https://github.com/sleb/bala/issues/64) AC2.
 
-**Collapsed parent → single summary bar (Story 5.2 AC4):** when a parent
+**Collapsed parent → single summary bar ([#64](https://github.com/sleb/bala/issues/64) AC4):** when a parent
 is collapsed, its row's bar spans `min(start_date)`..`max(due_date)`
 across every descendant in its (currently hidden) subtree — computed
 once per render via the same post-order walk `render` already does for
 progress-rollup display, reusing Core LLD's `list_child_edges` traversal
 shape rather than a second bespoke walk.
 
-**Dependency arrows (Story 5.1 AC4), scoped down:** full multi-row arrow
+**Dependency arrows ([#63](https://github.com/sleb/bala/issues/63) AC4), scoped down:** full multi-row arrow
 routing between arbitrary bars is a genuine text-layout problem (arrows
 must dodge other bars mid-flight); v1 renders **edge markers** instead —
 a `◀` glyph at a successor bar's constrained edge (§scheduling table's
@@ -295,7 +305,7 @@ an explicit scope reduction from the HLD story, not an oversight — full
 arrow routing is a reasonable future addition to this same module, not a
 redesign.
 
-### 2. Blocked-task derivation (Story 4.3)
+### 2. Blocked-task derivation ([#62](https://github.com/sleb/bala/issues/62))
 
 Core LLD's `Task` has no `blocked` field — `progress`/`status` are the
 only library-computed read fields (HLD's rule: nothing else is
@@ -321,7 +331,7 @@ filters rows post-hoc using this same function, applied after Core's
 filter's fields (Core LLD deliberately keeps it out — it's derived, not
 stored).
 
-### 3. Reschedule mode: live preview via `preview_cascade` (Story 5.3 AC2–5)
+### 3. Reschedule mode: live preview via `preview_cascade` ([#65](https://github.com/sleb/bala/issues/65) AC2–5)
 
 Every nudge (`h`/`l`/`H`/`L`, or a committed date-entry sub-edit) updates
 a local, uncommitted `TaskPatch` for the focused task and immediately
@@ -329,13 +339,13 @@ calls `Core::preview_cascade(task_id, patch)` (read-only, no store
 write per Core LLD §Algorithm 3) — the result replaces `Reschedule.preview`,
 and the Gantt pane redraws those specific rows in a distinct "pending"
 style so the user sees exactly what committing would touch, satisfying
-Story 5.3 AC4's "same cascade logic as the task form" by construction:
+[#65](https://github.com/sleb/bala/issues/65) AC4's "same cascade logic as the task form" by construction:
 this mode calls the identical library method the Detail-pane date edit
 does, just on every keystroke instead of on submit. An `InvalidDateRange`
 (start pushed past due) is the only error `preview_cascade` can return
 here — Core LLD doesn't reject a schedule-violating edit, it flags
 `out_of_sync` (Core LLD §Algorithm 3), so a reschedule can never be
-"rejected" for violating a dependency (Story 5.3 AC5's spirit is met by
+"rejected" for violating a dependency ([#65](https://github.com/sleb/bala/issues/65) AC5's spirit is met by
 the preview showing the resulting `out_of_sync` flags before commit, not
 by blocking the edit). `Enter` calls `update_task` with the same patch —
 already validated by every prior preview call — and returns to `Normal`
@@ -343,20 +353,20 @@ with the committed result replacing the tree/gantt state; `Esc` simply
 drops `Reschedule.preview` and the local patch without ever having
 called a mutating method.
 
-### 4. Text export (Story 5.5, closes HLD action item 5)
+### 4. Text export ([#67](https://github.com/sleb/bala/issues/67), closes HLD action item 5)
 
 `bala export gantt [--out <path>] [--scale day|week|month] [--from
 <date>] [--filter ...]` renders the same `render::gantt` data structure
 §Algorithm 1 draws in the TUI, but through a plain-text formatter instead
 of `ratatui` widgets: box-drawing characters for bars/axis, one line per
 visible row, a trailing legend block (status/blocked/out-of-sync glyph
-key — Story 5.5 AC3) and an "Unscheduled" section. Default `--out` is
-`bala-gantt-<view-or-filter-name>-<export-date>.txt` (Story 5.5 AC5,
+key — [#67](https://github.com/sleb/bala/issues/67) AC3) and an "Unscheduled" section. Default `--out` is
+`bala-gantt-<view-or-filter-name>-<export-date>.txt` ([#67](https://github.com/sleb/bala/issues/67) AC5,
 adapted to a text extension since there's no image format to name).
 Filters/scale/collapse state default to the current `ViewState` when run
 from within the TUI (a `Ctrl-E` shortcut, not listed in §Modes since it's
 a one-shot action, not a mode) or to CLI flags when run as a subcommand
-— Story 5.5 AC2's "reflects current zoom/filters/collapse" is satisfied
+— [#67](https://github.com/sleb/bala/issues/67) AC2's "reflects current zoom/filters/collapse" is satisfied
 either way because both paths go through the same `ViewState` struct.
 True PNG/PDF export is explicitly deferred to the Web Client LLD, where
 canvas rendering is a natural fit (HLD §Interfaces already flagged this
@@ -451,7 +461,7 @@ rather than falling back to string parsing, per HLD's original
   business logic in either client).
 - Nothing here is deferred _from_ HLD that isn't now resolved: terminal
   view components, Gantt rendering/zoom/pan, keyboard rescheduling, the
-  Story 5.5 export mechanism, and the config file format (HLD's five
+  [#67](https://github.com/sleb/bala/issues/67) export mechanism, and the config file format (HLD's five
   explicit action items for this LLD) are all fixed above. Data Store
   LLD's one deferred item — where the SQLite file lives on disk — is
   also resolved here (§View State & Config, `directories::ProjectDirs`).
@@ -471,12 +481,12 @@ rather than falling back to string parsing, per HLD's original
   to find and press `?` before anything is obvious. Worth revisiting if
   early usage shows this is a bigger onboarding cost than expected.
 - Dependency arrows scoped down to edge markers (§Algorithm 1) is a
-  deliberate, documented reduction from Story 5.1 AC4's literal ask —
+  deliberate, documented reduction from [#63](https://github.com/sleb/bala/issues/63) AC4's literal ask —
   full arrow routing remains addable inside `render::gantt` later without
   touching any other module, since it was never load-bearing on the
   column-mapping or bar-drawing functions other features depend on.
 - `render` being pure and shared between the interactive Gantt pane and
-  the Story 5.5 text export is the same "single source of truth" pattern
+  the [#67](https://github.com/sleb/bala/issues/67) text export is the same "single source of truth" pattern
   Core LLD used for `preview_cascade`/`update_task` — the concrete payoff
   is the parity test in §Testing Strategy, which would fail immediately
   if the two ever drew a different picture of the same schedule.

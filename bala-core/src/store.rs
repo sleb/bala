@@ -1,21 +1,17 @@
 //! The persistence trait boundary (LLD §Storage Boundary).
 //!
-//! [`Store`]/[`StoreTx`] cover what Story 1.1 needs — task put/get/list,
-//! parent edges, and task types — plus the edge/soft-delete lookups Story
-//! 1.3 ("Delete a Task") needs: `list_child_edges`, `replace_parent_edges`,
-//! `get_task_including_deleted`. The full LLD contract also has the
-//! dependency-edge methods; those land in later stories that actually use
-//! them, per the "don't speculatively build methods this story doesn't
-//! need" guidance.
+//! The full LLD contract also has dependency-edge methods; they are not
+//! declared yet and get added alongside the dependency features that call
+//! them.
 
 use crate::model::{Parents, Placement, Task, TaskId, TaskType, TreeFilter, User, UserId};
 
 /// Errors from the storage boundary.
 ///
-/// Placeholder for Checkpoint 1: just enough for `CoreError::Store` to
-/// wrap something. Checkpoint 2 builds out the real `Store` trait and will
-/// likely extend this with variants for the concrete failure modes it can
-/// hit.
+/// A single catch-all variant for now: backends map every failure into
+/// `Backend` with a message. Distinguishing failure modes (e.g. corrupt
+/// data vs. an unavailable backend, per the LLD's proposed taxonomy) means
+/// adding variants here.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("store backend error: {0}")]

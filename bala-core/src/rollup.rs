@@ -1,7 +1,7 @@
-//! Direct-children progress rollup (LLD §Algorithm 4, Story 3.3).
+//! Direct-children progress rollup (LLD §Algorithm 4).
 //!
 //! [`direct_children_progress`] computes a task's `progress` from its
-//! *direct* children only, per the corrected formula: average each direct
+//! *direct* children only: average each direct
 //! child's own `status` flag (`Complete` -> `1.0`, `Incomplete` -> `0.0`).
 //! Grandchildren never factor in — a child that is itself `Complete` but
 //! has ten incomplete grandchildren still counts as a full `1.0` toward its
@@ -12,16 +12,15 @@
 
 use crate::model::{Task, TaskStatus};
 
-/// Computes a task's progress from its direct children's `status` alone
-/// (AC1, AC2): averages `1.0` for each [`TaskStatus::Complete`] child and
-/// `0.0` for each [`TaskStatus::Incomplete`] child, ignoring every child's
+/// Computes a task's progress from its direct children's `status` alone:
+/// averages `1.0` for each [`TaskStatus::Complete`] child and `0.0` for each [`TaskStatus::Incomplete`] child, ignoring every child's
 /// own `progress` field and never looking past direct children.
 ///
 /// When `children` is empty, returns `1.0` if `own_status` is
-/// [`TaskStatus::Complete`] else `0.0` (AC5) — a leaf's progress is just
+/// [`TaskStatus::Complete`] else `0.0` — a leaf's progress is just
 /// its own completion state. Once there is at least one child, `own_status`
 /// plays no further role: the result is governed purely by the children's
-/// statuses (AC4), independent of whatever `own_status` happens to be.
+/// statuses, independent of whatever `own_status` happens to be.
 pub(crate) fn direct_children_progress(children: &[Task], own_status: TaskStatus) -> f32 {
     if children.is_empty() {
         return match own_status {
@@ -71,7 +70,7 @@ mod tests {
 
     #[test]
     fn direct_children_progress_should_average_child_status_ignoring_grandchildren() {
-        // Epic/story/subtask example from the issue: a "parent" task has
+        // Epic/story/subtask example: a "parent" task has
         // two direct children ("stories"), each itself Complete despite
         // having ten incomplete grandchildren ("subtasks") of its own. The
         // grandchildren's incompleteness must never leak two levels up —

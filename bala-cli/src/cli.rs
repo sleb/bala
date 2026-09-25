@@ -269,7 +269,8 @@ pub enum CliError {
 
     /// The target task has subtasks and neither `--cascade` nor
     /// `--promote-children` was given, so the caller must choose a mode
-    /// before anything is deleted (AC2's "warned and can choose").
+    /// before anything is deleted — a delete never silently decides what
+    /// happens to a task's subtasks.
     #[error(
         "task {title:?} has subtasks that must be handled; pass --cascade or --promote-children:\n{}",
         children

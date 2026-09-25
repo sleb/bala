@@ -8,8 +8,8 @@ description: >
   on, then closed out with a comprehensive end-to-end review, a branch,
   and a PR. Use whenever the user wants to build/implement a story
   (planned or not), work through a Bala issue's checkpoints, or turn a
-  /bala-plan issue into code. Invoke with /bala-implementation <issue number or
-  story number/name>.
+  /bala-plan issue into code. Invoke with /bala-implementation <issue
+  number or story title>.
 metadata:
   internal: true
 ---
@@ -30,16 +30,17 @@ add up to a story that doesn't hang together.
 ## Phase 0 — Which issue, and starting fresh or resuming?
 
 If the user didn't name an issue/story unambiguously, ask. Resolve it
-to a concrete GitHub issue number (search by story number/title if
-they gave you that instead: `gh issue list --repo <owner>/<repo>
---state all --search "Story <N.M> in:title"`).
+to a concrete GitHub issue number (search by title if they gave you
+that instead: `gh issue list --repo <owner>/<repo> --label story
+--state all --search "<words> in:title"`; older stories are titled
+`Story N.M — …`, so a story number works as search words too).
 
 Fetch the issue body (`gh issue view <number>` or the `github` MCP
-tool) — it **is** the plan: a checkpoint task list (`- [ ] N — ...`)
-plus an "out of scope" section. If there's no issue for the story
-yet, or the issue exists but its body has no checkpoint task list
-(a bare placeholder, or just the story text), the plan hasn't been
-made — do Phase 0b before anything else. If the only match is a
+tool). It holds the story (description and ACs), and once planned, the
+plan: a `## Plan` checkpoint task list (`- [ ] …`) plus an "out of
+scope" section, then a `## Changelog`. If there's no issue for the
+story yet, or its body has no `## Plan` checkpoint list, the plan
+hasn't been made — do Phase 0b before anything else. If the only match is a
 *closed* issue, ask the user whether it's being reopened or whether
 this is really a different story before planning over it.
 
@@ -73,21 +74,22 @@ Phase 3 has the user confirm the draft before anything is published.
 So split the run at those gates. Spawn a `general-purpose` agent
 (the `Agent` tool) whose prompt:
 
-- States the repo path and the story (number and title, plus the
-  existing issue number if Phase 0 found a planless one, so it edits
-  that issue rather than creating a duplicate).
+- States the repo path and the story (issue number and title if Phase 0
+  found one, so it plans into that issue rather than creating a
+  duplicate).
 - Instructs it to invoke `/bala-plan` (the `Skill` tool, name
   `bala-plan`) and follow it, **up to but not including publishing**:
   do its Phases 0–3, and wherever the skill says to ask the user, do
   not guess — collect the question, with the skill's concrete
   recommendation, into its report instead.
-- Says explicitly: do NOT create or edit the GitHub issue or
-  milestone, and do NOT edit `STORIES.md` yet — those happen only after
-  the user confirms.
-- Asks it to report back: the full draft plan exactly as it would be
-  published (the issue body, checkpoint task list plus "out of scope"),
-  every scope-gap question with its recommendation, and any
-  `STORIES.md` edit it would propose.
+- Says explicitly: do NOT create or edit any GitHub issue or milestone
+  yet — that happens only after the user confirms.
+- Asks it to report back: the full draft exactly as it would be
+  published (the story issue's new body — ACs, `## Plan` checkpoint
+  list, "out of scope", Changelog entry), every scope-gap question with
+  its recommendation, any backlog issues it would file, and the
+  milestone call (which epic; for an existing epic, the `Scope
+  changes:` line; for a new one, its goal and exit criteria).
 
 ### 0b-ii. Minimal check, yourself, then the user's confirmation
 
@@ -98,16 +100,16 @@ not a full review:
   `- [ ]` task list of checkpoints, each naming its tests
   (`should_...`-style behavior names, tagged with ACs) and ending in a
   **Demo** line, plus an "out of scope" section.
-- Every AC of the story in `docs/design/STORIES.md` is either proven by
-  some checkpoint's tests or listed out of scope — nothing silently
-  dropped.
+- Every AC of the story is either proven by some checkpoint's tests or
+  listed out of scope with a link to the backlog issue that takes it —
+  nothing silently dropped.
 - Spot-check two or three types/methods/error variants the checkpoints
   cite against the LLDs or the actual code (`grep`), to catch an
   invented signature.
 - It hasn't re-planned something earlier stories already built (a crate
   or schema that already exists in the repo).
-- Nothing was published or edited: no new/changed issue, and
-  `git status` is as clean as it was before.
+- Nothing was published or edited: no new/changed issue or milestone,
+  and `git status` is as clean as it was before.
 
 If something's off, send the same agent a follow-up (`SendMessage`)
 rather than fixing the draft yourself. Once it passes, bring the
@@ -121,19 +123,15 @@ the same agent and re-check the revision.
 ### 0b-iii. Publish, and verify it landed
 
 On the user's confirmation, `SendMessage` the same agent to finish
-`/bala-plan`'s Phase 4 (milestone, issue, any confirmed `STORIES.md`
-edit) and report the issue number/link. If this is a closed issue the
+`/bala-plan`'s Phase 4 (milestone, backlog issues, the story issue's
+body) and report the issue number/link. If this is a closed issue the
 user chose to reopen in Phase 0, also have it run `gh issue reopen
 <number>` — `/bala-plan`'s revision path only edits the body, so
 without this the story would be implemented against a closed issue.
 Then confirm it yourself: `gh issue view <number>` shows the issue
-open, with the confirmed body and its task list, in the story's
-`Epic N: <Title>` milestone. That issue is now the plan — carry on to
-Phase 1 with it.
-
-A `STORIES.md` edit from this phase is expected, uncommitted work in
-the tree: it's part of this story, so Phase 1's clean-tree check should
-treat it as such, and it goes into the story's commit in Phase 5.
+open, with the confirmed body, its `## Plan` task list, and a Changelog
+entry, in an `Epic N: …` milestone. That issue is now the plan — carry
+on to Phase 1 with it.
 
 ## Phase 1 — Load context once, up front
 
@@ -141,24 +139,24 @@ Before touching any checkpoint, read (once, into your own context —
 this is what every sub-agent you spawn will need restated, since each
 starts cold):
 
-1. The issue body itself — every checkpoint, in order, plus the "out
-   of scope" list.
-2. `docs/design/STORIES.md` — the target story's full text, for the
-   acceptance criteria the checkpoints are proving.
-3. `docs/design/HLD.md` and whichever `docs/design/<component>.md` LLDs
+1. The issue body itself — the story's description and ACs (what the
+   checkpoints are proving), every checkpoint in order, the "out of
+   scope" list, and the Changelog. Also note the milestone's goal and
+   exit criteria (`gh api repos/<owner>/<repo>/milestones/<n>`).
+2. `docs/design/HLD.md` and whichever `docs/design/<component>.md` LLDs
    the story's checkpoints touch — the real types, signatures, error
    variants, schema, and testing conventions checkpoints must build
    against. You'll be citing these in every sub-agent prompt so it
    doesn't invent a signature the LLD already settled.
-4. Current repo state: `find`/`ls` the crates that exist, what's
+3. Current repo state: `find`/`ls` the crates that exist, what's
    already implemented vs. still a placeholder, `git status` (is the
    tree clean?), `git log --oneline -10`. If mid-story work already
    exists in the tree from a prior session, treat it like a completed
    checkpoint's output — verify it (Phase 3) before building on it,
    don't redo it.
 
-If the working tree isn't clean — beyond a `STORIES.md` edit Phase 0b
-just made — and this isn't a deliberate resume, stop and ask the user how to proceed rather than mixing unrelated
+If the working tree isn't clean and this isn't a deliberate resume,
+stop and ask the user how to proceed rather than mixing unrelated
 changes into this story's commit.
 
 ## Phase 2 — Branch
@@ -167,7 +165,7 @@ Create (or check out, if resuming) a feature branch off the repo's
 default branch before any checkpoint work starts:
 
 ```
-git checkout -b story-<N.M>-<short-slug>
+git checkout -b story-<issue>-<short-slug>
 ```
 
 Never implement checkpoints directly on the default branch.
@@ -203,6 +201,15 @@ Spawn a `general-purpose` agent (the `Agent` tool) with a prompt that:
   sub-agent's local decision breaks a later checkpoint's assumptions.
 - Instructs it to invoke `/rust-skills` (the `Skill` tool, name
   `rust-skills`) before writing code, and follow it throughout.
+- Tells it that code comments and doc comments describe the code, not
+  the process that produced it: never cite issue, story, or AC numbers,
+  checkpoint numbers, epics, or "this story/checkpoint", "a later
+  story". State the rule itself inline instead (not "per AC1"
+  but "hierarchy depth is deliberately unbounded, so…"). A note about
+  something not built yet names the missing capability ("dependencies
+  aren't implemented yet"), not the story that will add it. Citing an
+  LLD section (`LLD §Algorithm 4`) is fine; the LLDs are living design
+  docs. The plan's AC tags on tests are for the issue, not the code.
 - Requires strict TDD: write the named tests first (name them
   explicitly if the plan does), confirm red, then implement to green,
   then refactor — not implement-then-backfill-tests.
@@ -231,6 +238,9 @@ was actually followed:
   the deep review is Phase 4.
 - Confirm no unrelated crate was touched, and no stray scratch/backup
   files were left behind.
+- Grep the changed files for process references in comments (`rg -n
+  -i 'stor(y|ies) [0-9#]|\bAC[0-9]|checkpoint|epic [0-9]|#[0-9]+' <files>`)
+  and send back any hits. They're cheap to fix now and go stale fast.
 - Treat any inline tool diagnostic that contradicts a command you just
   ran cleanly (e.g. a stale-looking "unresolved import" after `cargo
   build` already succeeded) as a stale editor/LSP snapshot, not a real
@@ -243,7 +253,11 @@ addressable, e.g. via `SendMessage` to continue it) or spawn a small
 corrective task, and only proceed once this checkpoint is actually
 right. If the deviation looks like it might legitimately need a scope
 change to the plan itself (not just a bug), pause and ask the user
-rather than deciding unilaterally.
+rather than deciding unilaterally. If the user approves a scope
+change, record it on the issue right away, as `/bala-plan` §Changelog
+describes: update the affected AC or checkpoint, append a dated
+Changelog line, and also post a comment if it's substantial. Anything
+deferred gets its own backlog issue, linked from the story.
 
 ### 3c. Move to the next checkpoint
 
@@ -266,9 +280,9 @@ Phase 1 gave you — it's reviewing the whole story, not one checkpoint,
 so it needs the full picture a checkpoint sub-agent deliberately
 didn't get:
 
-- The repo path, the branch name, and the full issue body (every
-  checkpoint plus the "out of scope" list) verbatim.
-- The target story's full text from `docs/design/STORIES.md`.
+- The repo path, the branch name, and the full issue body verbatim
+  (the story's ACs, every checkpoint, the "out of scope" list, and the
+  Changelog).
 - Which `docs/design/HLD.md`/`docs/design/<component>.md` LLD sections
   govern this story, so it can check the merged code against them
   itself rather than trusting each checkpoint sub-agent's own claim of
@@ -333,11 +347,19 @@ Ask it to work through, and report on, each of:
      case, variant, or subcommand should show up everywhere its
      siblings are enumerated — doc comments, help text, match arms —
      not just where the compiler forces it to.
+   - **Did this change make an existing comment false?** Look at comments
+     near the changed code, not just new ones. Scope notes ("X can't
+     happen yet", "Y is a placeholder", "only N methods exist") are the
+     usual casualties: the story that was supposed to lift them just
+     landed. Also flag any comment that cites a story, AC, checkpoint, or
+     epic instead of stating the rule it stands for.
 
    This list names the shapes of bug that have actually slipped through
    this process before (a multi-transaction race, a redundant tree
    fetch, a test-fake/real-backend divergence, unbounded recursion, a
-   non-idempotent completion, stale help text) as concrete illustrations
+   non-idempotent completion, stale help text, a "no task can have
+   children yet" comment that outlived its truth and hid a real
+   behavior gap) as concrete illustrations
    of each question — treat them as examples of what to look for, not
    the complete set of what to check. If something doesn't fit any
    bullet above but still smells like the code would surprise its own
@@ -390,15 +412,25 @@ Don't paper over it to reach a green build.
 
 Once Phase 4 is clean:
 
-1. `git add` exactly the files this story's checkpoints produced (sanity
-   check `git status` first — nothing unrelated should be staged).
-2. One commit (or, if the user prefers a commit per checkpoint, ask
+1. **Check that nothing deferred is orphaned.** Every item in the
+   issue's "out of scope" list, and every AC this story didn't fully
+   deliver, must link an open issue that takes it (a backlog issue, or
+   another story). File any missing one as a backlog issue with an
+   `**Origin:** follow-up to #<story> AC<n> — <why>` line, after
+   checking with the user, and log it in the story's Changelog. A
+   design decision made along the way (a scope call, a behavior choice
+   an AC left open) goes into the relevant LLD in this commit, since
+   the closed issue is history, not the design.
+2. `git add` exactly the files this story's checkpoints produced
+   (sanity check `git status` first — nothing unrelated should be
+   staged).
+3. One commit (or, if the user prefers a commit per checkpoint, ask
    before assuming — default to one commit for the whole story, since
    checkpoints aren't meaningful standalone history once the story is
    done) summarizing what was built, checkpoint by checkpoint, test
    counts, and any deliberate scope deviations — end with this
    session's attribution footer.
-3. Push the branch, then open a PR (check for a
+4. Push the branch, then open a PR (check for a
    `pull_request_template.md`/`.github/PULL_REQUEST_TEMPLATE/` first
    and use it if present) with:
    - `Closes #<issue>`.
@@ -410,6 +442,14 @@ Once Phase 4 is clean:
    - This session's attribution footer.
 
 ## Phase 6 — Hand back
+
+If this story is the last open issue in its milestone, re-run the
+milestone's exit criteria (the "Done when" in its description) against
+the branch. If they pass, tell the user and offer to close the milestone
+once the PR merges, moving anything still open in it to the backlog
+(`gh issue edit <n> --milestone ""`). If they don't pass, say what's
+missing: the epic needs another story, or its exit criteria need a
+scope change (a `Scope changes:` line, with the user's OK).
 
 Report the branch and PR link. Note which checkpoints (if any) needed
 a correction during Phase 3b, and summarize anything flagged in Phase
