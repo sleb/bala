@@ -268,6 +268,8 @@ mod tests {
             has_children: false,
             collapsed: false,
             direct_summary: None,
+            parent_id: None,
+            grandparent_id: None,
         }
     }
 
@@ -523,7 +525,7 @@ mod tests {
         let mut core = core();
         let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
 
-        let backend = TestBackend::new(60, 20);
+        let backend = TestBackend::new(60, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
 

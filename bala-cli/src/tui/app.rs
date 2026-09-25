@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use bala_core::{
-    Core, CoreError, DeleteMode, Field, NewTask, Store, Task, TaskId, TaskPatch, TaskStatus, UserId,
+    Core, CoreError, DeleteMode, Field, NewTask, SiblingOrder, Store, Task, TaskId, TaskPatch,
+    TaskStatus, UserId,
 };
 use crossterm::event::KeyEvent;
 
@@ -39,6 +40,9 @@ pub struct App {
     /// re-derives `rows` from this plus `collapsed` whenever collapse state
     /// changes, without needing to re-fetch from `Core`.
     tasks: Vec<Task>,
+    /// Sibling order fetched alongside `tasks` (`Core::sibling_order`);
+    /// kept so a later reorder/reparent can re-render without a reload.
+    sibling_order: SiblingOrder,
     /// Ids of tasks whose children are currently hidden from `rows`.
     collapsed: HashSet<TaskId>,
     /// Whether a single `d` key press is pending a second consecutive `d` to
@@ -77,6 +81,7 @@ impl App {
             user_names: HashMap::new(),
             descriptions: HashMap::new(),
             tasks: Vec::new(),
+            sibling_order: SiblingOrder::default(),
             collapsed: HashSet::new(),
             pending_d: false,
             type_filter: None,
@@ -91,6 +96,15 @@ impl App {
     #[must_use]
     pub fn with_tasks(mut self, tasks: Vec<Task>) -> Self {
         self.tasks = tasks;
+        self
+    }
+
+    /// Attaches the fetched sibling order used by [`App::rebuild_rows`], so a
+    /// later reorder/reparent can re-render without a reload. Call before
+    /// [`App::with_collapsed`].
+    #[must_use]
+    pub fn with_sibling_order(mut self, sibling_order: SiblingOrder) -> Self {
+        self.sibling_order = sibling_order;
         self
     }
 
@@ -267,6 +281,7 @@ impl App {
         let selected_id = self.selected_row().map(|row| row.id);
         self.rows = render::task_rows(
             &self.tasks,
+            &self.sibling_order,
             &self.type_labels,
             &self.user_names,
             &self.collapsed,
@@ -478,7 +493,113 @@ pub fn apply_action<S: Store>(
             refresh_rows_from_tree(app, core, app.selected_row().map(|row| row.id));
             ControlFlow::Continue(())
         }
+        Action::MoveTaskDown => {
+            move_focused_task(app, core, bala_core::Direction::Down);
+            ControlFlow::Continue(())
+        }
+        Action::MoveTaskUp => {
+            move_focused_task(app, core, bala_core::Direction::Up);
+            ControlFlow::Continue(())
+        }
+        Action::IndentTask => {
+            reparent_focused_task(app, core, Reparent::Indent);
+            ControlFlow::Continue(())
+        }
+        Action::OutdentTask => {
+            reparent_focused_task(app, core, Reparent::Outdent);
+            ControlFlow::Continue(())
+        }
         Action::Noop => ControlFlow::Continue(()),
+    }
+}
+
+/// Handles `Action::MoveTaskDown`/`MoveTaskUp`: swaps the focused task with
+/// its neighbor among the siblings of the parent it is *rendered under*
+/// (`row.parent_id`), via `Core::move_sibling`. The swap uses the full
+/// sibling order, so with a type filter active the neighbor may be hidden
+/// and a press can look like a no-op. On success the tree is refetched and
+/// selection stays on the moved task under the same parent (a task shown
+/// under several parents may have several rows). At either end of the
+/// sibling list nothing changes and no error is shown; Core errors are
+/// surfaced via `app.error`.
+fn move_focused_task<S: Store>(app: &mut App, core: &mut Core<S>, direction: bala_core::Direction) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let (id, parent) = (row.id, row.parent_id);
+    match core.move_sibling(parent, id, direction) {
+        Ok(false) => {}
+        Ok(true) => {
+            app.error = None;
+            refresh_rows_from_tree(app, core, Some(id));
+            if let Some(pos) = app
+                .rows
+                .iter()
+                .position(|r| r.id == id && r.parent_id == parent)
+            {
+                app.selected = Some(pos);
+            }
+        }
+        Err(err) => app.error = Some(err.to_string()),
+    }
+}
+
+/// Which way `reparent_focused_task` moves the focused task.
+#[derive(Clone, Copy)]
+enum Reparent {
+    Indent,
+    Outdent,
+}
+
+/// Handles `Action::IndentTask`/`OutdentTask` via `Core::indent_task` /
+/// `Core::outdent_task`, using the focused row's rendered path
+/// (`parent_id`, `grandparent_id`). On indent the new parent (the previous
+/// live sibling, read from the pre-move sibling order) is expanded so the
+/// moved task stays visible. Selection follows the task to its row under
+/// the new parent. `Ok(false)` is a silent no-op; Core errors (e.g.
+/// circular hierarchy) are surfaced via `app.error`.
+fn reparent_focused_task<S: Store>(app: &mut App, core: &mut Core<S>, kind: Reparent) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let (id, parent, grandparent) = (row.id, row.parent_id, row.grandparent_id);
+    let (result, new_parent) = match kind {
+        Reparent::Indent => {
+            // Re-read the order rather than trusting `app.sibling_order`,
+            // which paths like delete leave stale, so the row expanded and
+            // selected is the parent Core will actually pick.
+            if let Ok(order) = core.sibling_order() {
+                app.sibling_order = order;
+            }
+            let siblings = app.sibling_order.children_of(parent);
+            let target = siblings
+                .iter()
+                .position(|&s| s == id)
+                .and_then(|i| i.checked_sub(1))
+                .map(|i| siblings[i]);
+            (core.indent_task(parent, id), target)
+        }
+        Reparent::Outdent => (core.outdent_task(parent, grandparent, id), grandparent),
+    };
+    match result {
+        Ok(false) => {}
+        Ok(true) => {
+            app.error = None;
+            if matches!(kind, Reparent::Indent)
+                && let Some(target) = new_parent
+            {
+                app.collapsed.remove(&target);
+            }
+            refresh_rows_from_tree(app, core, Some(id));
+            if let Some(pos) = app
+                .rows
+                .iter()
+                .position(|r| r.id == id && r.parent_id == new_parent)
+            {
+                app.selected = Some(pos);
+            }
+        }
+        Err(err) => app.error = Some(err.to_string()),
     }
 }
 
@@ -1021,17 +1142,22 @@ fn submit_set_type<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buff
 /// numeric index here would leave it dangling past the end of a shrunk row
 /// list, or pointing at an unrelated row of the same length.
 fn refresh_rows_from_tree<S: Store>(app: &mut App, core: &mut Core<S>, select_id: Option<TaskId>) {
-    match core.get_tree(bala_core::TreeFilter {
-        type_key: app.type_filter.clone(),
-        ..Default::default()
-    }) {
-        Ok(tasks) => {
+    let fetched = core
+        .get_tree(bala_core::TreeFilter {
+            type_key: app.type_filter.clone(),
+            ..Default::default()
+        })
+        .and_then(|tasks| core.sibling_order().map(|order| (tasks, order)));
+    match fetched {
+        Ok((tasks, sibling_order)) => {
             for task in &tasks {
                 app.descriptions.insert(task.id, task.description.clone());
             }
             app.tasks = tasks;
+            app.sibling_order = sibling_order;
             app.rows = render::task_rows(
                 &app.tasks,
+                &app.sibling_order,
                 &app.type_labels,
                 &app.user_names,
                 &app.collapsed,
@@ -1221,6 +1347,8 @@ mod tests {
             has_children: false,
             collapsed: false,
             direct_summary: None,
+            parent_id: None,
+            grandparent_id: None,
         }
     }
 
@@ -1859,6 +1987,236 @@ mod tests {
         assert!(tasks.iter().any(|task| task.id == id));
     }
 
+    /// Builds an `App` over the full tree of `core`, as `tui::run` does.
+    fn app_from_core(core: &mut Core<InMemoryStore>) -> App {
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let order = core.sibling_order().expect("sibling_order should succeed");
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        App::new(rows).with_tasks(tasks).with_sibling_order(order)
+    }
+
+    fn shift_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    fn titles(app: &App) -> Vec<String> {
+        app.rows().iter().map(|r| r.title.clone()).collect()
+    }
+
+    #[test]
+    fn move_down_key_should_swap_with_next_sibling_and_keep_selection_on_moved_task() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let _b = core.create_task(minimal_new_task("B")).expect("create");
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(a.id));
+
+        let _ = handle_key(&mut app, &mut core, shift_key('J'));
+
+        assert_eq!(titles(&app), vec!["B", "A"]);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(a.id));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn move_up_key_should_be_noop_on_first_sibling() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let _b = core.create_task(minimal_new_task("B")).expect("create");
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(a.id));
+
+        let _ = handle_key(&mut app, &mut core, shift_key('K'));
+
+        assert_eq!(titles(&app), vec!["A", "B"]);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(a.id));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn move_key_should_act_on_the_path_the_row_is_rendered_under() {
+        let mut core = core();
+        let p1 = core.create_task(minimal_new_task("P1")).expect("create");
+        let p2 = core.create_task(minimal_new_task("P2")).expect("create");
+        let x = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![p1.id, p2.id],
+                ..minimal_new_task("X")
+            })
+            .expect("create");
+        let _y1 = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![p1.id],
+                ..minimal_new_task("Y1")
+            })
+            .expect("create");
+        let _y2 = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![p2.id],
+                ..minimal_new_task("Y2")
+            })
+            .expect("create");
+        let mut app = app_from_core(&mut core);
+        // Select X under P2 (the second rendered X row).
+        let idx = app
+            .rows()
+            .iter()
+            .position(|r| r.id == x.id && r.parent_id == Some(p2.id))
+            .expect("X under P2");
+        app.selected = Some(idx);
+
+        let _ = handle_key(&mut app, &mut core, shift_key('J'));
+
+        assert_eq!(titles(&app), vec!["P1", "X", "Y1", "P2", "Y2", "X"]);
+        let sel = app.selected_row().expect("selection");
+        assert_eq!((sel.id, sel.parent_id), (x.id, Some(p2.id)));
+    }
+
+    /// Selects the row for `id` rendered under `parent`.
+    fn select_under(app: &mut App, id: TaskId, parent: Option<TaskId>) {
+        let idx = app
+            .rows()
+            .iter()
+            .position(|r| r.id == id && r.parent_id == parent)
+            .expect("row under parent");
+        app.selected = Some(idx);
+    }
+
+    fn child_of(core: &mut Core<InMemoryStore>, title: &str, parent: TaskId) -> bala_core::Task {
+        core.create_task(bala_core::NewTask {
+            parent_ids: vec![parent],
+            ..minimal_new_task(title)
+        })
+        .expect("create")
+    }
+
+    #[test]
+    fn indent_key_should_nest_under_previous_sibling_and_expand_it() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let mut app = app_from_core(&mut core);
+        app.collapsed.insert(a.id);
+        app.select_by_id(Some(b.id));
+
+        let _ = handle_key(&mut app, &mut core, shift_key('L'));
+
+        assert_eq!(titles(&app), vec!["A", "B"]);
+        assert!(!app.collapsed.contains(&a.id));
+        let sel = app.selected_row().expect("selection");
+        assert_eq!((sel.id, sel.parent_id, sel.depth), (b.id, Some(a.id), 1));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn indent_key_should_expand_the_parent_core_chose_after_a_sibling_was_deleted() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let c = core.create_task(minimal_new_task("C")).expect("create");
+        let mut app = app_from_core(&mut core);
+        app.collapsed.insert(a.id);
+        app.select_by_id(Some(b.id));
+        let _ = handle_key(
+            &mut app,
+            &mut core,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        let _ = handle_key(
+            &mut app,
+            &mut core,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        let _ = handle_key(
+            &mut app,
+            &mut core,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        app.select_by_id(Some(c.id));
+
+        let _ = handle_key(&mut app, &mut core, shift_key('L'));
+
+        // Core nests C under A (B is gone); A must be expanded and C selected.
+        assert!(!app.collapsed.contains(&a.id));
+        let sel = app.selected_row().expect("selection");
+        assert_eq!((sel.id, sel.parent_id), (c.id, Some(a.id)));
+    }
+
+    #[test]
+    fn indent_key_should_be_noop_on_first_sibling() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let _b = core.create_task(minimal_new_task("B")).expect("create");
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(a.id));
+
+        let _ = handle_key(&mut app, &mut core, shift_key('L'));
+
+        assert_eq!(titles(&app), vec!["A", "B"]);
+        assert_eq!(app.selected_row().map(|r| (r.id, r.depth)), Some((a.id, 0)));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn outdent_key_should_move_after_old_parent() {
+        let mut core = core();
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let x = child_of(&mut core, "X", p.id);
+        let _q = core.create_task(minimal_new_task("Q")).expect("create");
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(x.id));
+
+        let _ = handle_key(&mut app, &mut core, shift_key('H'));
+
+        assert_eq!(titles(&app), vec!["P", "X", "Q"]);
+        let sel = app.selected_row().expect("selection");
+        assert_eq!((sel.id, sel.parent_id, sel.depth), (x.id, None, 0));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn outdent_key_should_be_noop_at_top_level() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(a.id));
+
+        let _ = handle_key(&mut app, &mut core, shift_key('H'));
+
+        assert_eq!(titles(&app), vec!["A"]);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(a.id));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn indent_key_should_show_inline_error_on_circular_hierarchy() {
+        let mut core = core();
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let y2 = child_of(&mut core, "Y2", p.id);
+        let x2 = child_of(&mut core, "X2", p.id);
+        // Y2 (previous sibling of X2) is also a child of X2.
+        core.set_parents(y2.id, vec![p.id, x2.id])
+            .expect("set_parents");
+        let mut app = app_from_core(&mut core);
+        select_under(&mut app, x2.id, Some(p.id));
+
+        let _ = handle_key(&mut app, &mut core, shift_key('L'));
+
+        assert!(app.error().is_some());
+        assert_eq!(
+            app.selected_row().map(|r| (r.id, r.parent_id)),
+            Some((x2.id, Some(p.id)))
+        );
+    }
+
     fn row_for(task: &bala_core::Task) -> TaskRow {
         TaskRow {
             id: task.id,
@@ -1870,6 +2228,8 @@ mod tests {
             has_children: false,
             collapsed: false,
             direct_summary: None,
+            parent_id: None,
+            grandparent_id: None,
         }
     }
 
@@ -2554,8 +2914,13 @@ mod tests {
             })
             .expect("create_task should succeed");
         let tasks = vec![parent.clone(), child.clone()];
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks);
 
         let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
@@ -2572,8 +2937,13 @@ mod tests {
             .create_task(minimal_new_task("Leaf"))
             .expect("create_task should succeed");
         let tasks = vec![leaf.clone()];
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks);
 
         let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
@@ -2595,8 +2965,13 @@ mod tests {
             })
             .expect("create_task should succeed");
         let tasks = vec![parent.clone(), child.clone()];
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks);
         let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
 
@@ -2630,8 +3005,13 @@ mod tests {
         let tasks = core
             .get_tree(bala_core::TreeFilter::default())
             .expect("get_tree should succeed");
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks.clone());
         let _ = apply_action(&mut app, &mut core, Action::CollapseAll);
 
@@ -2673,8 +3053,13 @@ mod tests {
         let tasks = core
             .get_tree(bala_core::TreeFilter::default())
             .expect("get_tree should succeed");
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks);
 
         let _ = apply_action(&mut app, &mut core, Action::CollapseAll);
@@ -2713,8 +3098,13 @@ mod tests {
             })
             .expect("create_task should succeed");
         let tasks = vec![parent.clone(), child.clone()];
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks);
         let _ = apply_action(&mut app, &mut core, Action::CollapseFocused);
         let rows_len_after_first_collapse = app.rows().len();
@@ -2743,8 +3133,13 @@ mod tests {
             })
             .expect("create_task should succeed");
         let tasks = vec![parent.clone(), child.clone()];
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks);
         app.select_by_id(Some(child.id));
         let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
@@ -2795,8 +3190,13 @@ mod tests {
             })
             .expect("create_task should succeed");
         let tasks = vec![parent.clone(), child.clone()];
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks);
         app.select_by_id(Some(child.id));
         let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
@@ -2830,8 +3230,13 @@ mod tests {
             })
             .expect("create_task should succeed");
         let tasks = vec![parent.clone(), child.clone()];
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks);
         app.select_by_id(Some(parent.id));
         let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
@@ -2890,8 +3295,13 @@ mod tests {
             })
             .expect("create_task should succeed");
         let tasks = vec![root.clone(), parent.clone(), child.clone()];
-        let rows =
-            crate::render::task_rows(&tasks, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        let rows = crate::render::task_rows(
+            &tasks,
+            &crate::render::order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let mut app = App::new(rows).with_tasks(tasks);
         app.select_by_id(Some(child.id));
 

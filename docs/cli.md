@@ -47,6 +47,8 @@ instead of a blank screen.
 | `l` / `→` (in the list) | Expand the focused task, revealing its subtasks again. No-op if it isn't collapsed. |
 | `E` (in the list) | Expand every task. |
 | `C` (in the list) | Collapse every task that has subtasks. |
+| `J` / `K` (in the list) | Move the focused task down / up among its siblings, under the parent it is shown beneath (a task shown under several parents moves only there). Selection stays on the moved task. No-op at the end of the list. With a type filter active the swap uses the full sibling order, so a press can look like a no-op when the neighbor is hidden. |
+| `L` / `H` (in the list) | Indent / outdent the focused task. `L` nests it as the last child of its previous sibling (which is expanded so the task stays visible); `H` moves it to its parent's level, right after that parent. Only the path it is shown under changes. Selection stays on the moved task. No-op with no previous sibling / at the top level; a cycle shows an inline error. Distinct from lowercase `h`/`l` (collapse/expand). |
 | `O` | Create a new top-level task: opens a text-entry line for its title. `Enter` submits, `Esc` cancels. |
 | `o` (in the list) | Create a new subtask under the selected task: opens a text-entry line for its title, nested under the focused task. `Enter` submits, `Esc` cancels. If the parent has an assignee or dates, you're then asked whether to inherit them onto the new subtask (`y`/`n`). |
 | `m` (in the list) | Reparent the selected task: opens a text-entry line prefilled with its current parent ids (comma-separated). `Enter` submits, `Esc` cancels. |

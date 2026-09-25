@@ -80,6 +80,7 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
         type_key: view_state.filter_type_key.clone(),
         ..Default::default()
     })?;
+    let sibling_order = core.sibling_order()?;
     let available_type_keys: Vec<String> = types
         .iter()
         .map(|task_type| task_type.key.clone())
@@ -96,6 +97,7 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
         .collect();
     let rows = render::task_rows(
         &tasks,
+        &sibling_order,
         &type_labels,
         &user_names,
         &std::collections::HashSet::new(),
@@ -104,6 +106,7 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
     let mut app = App::new(rows)
         .with_lookup_maps(type_labels, user_names)
         .with_descriptions(descriptions)
+        .with_sibling_order(sibling_order)
         .with_tasks(tasks)
         .with_collapsed(view_state.collapsed)
         .with_type_filter_state(view_state.filter_type_key, available_type_keys);

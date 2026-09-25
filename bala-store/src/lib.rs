@@ -8,8 +8,8 @@
 //!
 //! `bala-core`'s current `Store`/`StoreTx` trait only declares 7 methods
 //! (`get_task`, `put_task`, `list_tasks`, `list_parent_edges`,
-//! `add_parent_edge`, `get_task_types`, `put_task_type`) — the full LLD
-//! contract's `list_child_edges`, `remove_parent_edge`, and the
+//! `replace_parent_edges`, `get_task_types`, `put_task_type`) — the full LLD
+//! contract's `list_child_edges`, `replace_parent_edges`, and the
 //! dependency-edge methods aren't implemented here because `bala-core`
 //! doesn't declare them yet; they land in later stories that extend the
 //! trait.

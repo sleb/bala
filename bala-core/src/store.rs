@@ -2,13 +2,13 @@
 //!
 //! [`Store`]/[`StoreTx`] cover what Story 1.1 needs — task put/get/list,
 //! parent edges, and task types — plus the edge/soft-delete lookups Story
-//! 1.3 ("Delete a Task") needs: `list_child_edges`, `remove_parent_edge`,
+//! 1.3 ("Delete a Task") needs: `list_child_edges`, `replace_parent_edges`,
 //! `get_task_including_deleted`. The full LLD contract also has the
 //! dependency-edge methods; those land in later stories that actually use
 //! them, per the "don't speculatively build methods this story doesn't
 //! need" guidance.
 
-use crate::model::{Task, TaskId, TaskType, TreeFilter, User, UserId};
+use crate::model::{Parents, Placement, Task, TaskId, TaskType, TreeFilter, User, UserId};
 
 /// Errors from the storage boundary.
 ///
@@ -98,30 +98,58 @@ pub trait StoreTx {
     /// `Err`, when `id` has no parents.
     fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
 
-    /// Records that `child` sits under `parent`.
+    /// Replaces the whole set of `child`'s parent edges with `parents` in
+    /// one step. Edges already in the new set are kept, edges not in it are
+    /// removed, and missing ones are added. `Parents::TopLevel` gives the
+    /// child a single NULL-parent edge (and removes any real ones); an `Under`
+    /// set removes the NULL edge. Kept edges keep their position; new ones go
+    /// at the end of their parent's children. `placement` says where the child lands among the
+    /// siblings of newly added parents.
     ///
     /// # Errors
     ///
     /// Returns `Err` if the backend fails.
-    fn add_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
+    fn replace_parent_edges(
+        &mut self,
+        child: TaskId,
+        parents: &Parents,
+        placement: Placement,
+    ) -> Result<(), StoreError>;
 
-    /// Lists the ids of `id`'s children — the reverse of
-    /// [`list_parent_edges`](StoreTx::list_parent_edges).
+    /// Swaps the positions of `a` and `b` among `parent`'s children
+    /// (`None` = the top level). Only the `parent` list changes: either
+    /// task's edges under other parents keep their positions. Does nothing
+    /// if either task is not a child of `parent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    fn swap_child_positions(
+        &mut self,
+        parent: Option<TaskId>,
+        a: TaskId,
+        b: TaskId,
+    ) -> Result<(), StoreError>;
+
+    /// Lists the ids of `parent`'s children in position order — the reverse
+    /// of [`list_parent_edges`](StoreTx::list_parent_edges). `None` lists the
+    /// top-level tasks. Soft-deleted tasks keep their edges and are included.
     ///
     /// # Errors
     ///
     /// Returns `Err` if the backend fails. Returns an empty `Vec`, not
-    /// `Err`, when `id` has no children.
-    fn list_child_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
+    /// `Err`, when there are no children.
+    fn list_child_edges(&mut self, parent: Option<TaskId>) -> Result<Vec<TaskId>, StoreError>;
 
-    /// Removes the edge recording that `child` sits under `parent`, leaving
-    /// any other parent edges `child` has untouched.
+    /// Lists every `(parent, child)` edge, grouped by parent and in position
+    /// order within each parent (`None` = the top-level list). Soft-deleted
+    /// tasks are included. One call replaces a `list_child_edges` per parent,
+    /// so whole-hierarchy reads avoid N+1 queries.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the backend fails. Removing an edge that doesn't
-    /// exist is not an error.
-    fn remove_parent_edge(&mut self, parent: TaskId, child: TaskId) -> Result<(), StoreError>;
+    /// Returns `Err` if the backend fails.
+    fn list_all_child_edges(&mut self) -> Result<Vec<(Option<TaskId>, TaskId)>, StoreError>;
 
     /// Looks up a task by id, including soft-deleted ones that
     /// [`get_task`](StoreTx::get_task) would filter out.
