@@ -2,7 +2,7 @@
 //!
 //! Not a production backend — no persistence, no concurrency control
 //! beyond a single [`RefCell`]. It exists so `bala-core`'s algorithms (and
-//! this checkpoint's own put/get/list/edge round-trip tests) can run
+//! this module's own put/get/list/edge round-trip tests) can run
 //! without a real database.
 //!
 //! Parent edges are kept in two maps mirroring the SQLite `parent_edges`

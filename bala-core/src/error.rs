@@ -9,10 +9,8 @@ use crate::store::StoreError;
 /// Errors the `Core` facade can return.
 ///
 /// This is a subset of the full taxonomy in `docs/design/core-library.md`
-/// §Error Taxonomy: the variants needed by Story 1.1 (create a task),
-/// Story 1.1a (assign a task), Story 1.4 (mark a task complete), and Story
-/// 3.1 (hierarchy cycle detection). Later stories add `DependsOnRelative`
-/// and `CircularDependency`.
+/// §Error Taxonomy: the dependency variants (`DependsOnRelative`,
+/// `CircularDependency`) are added when task dependencies are implemented.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("task {0:?} not found")]

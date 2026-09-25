@@ -2,7 +2,7 @@
 //!
 //! `dependency_edges` exists in the schema (LLD-2 §Schema) but has no
 //! module of its own yet — it sits unused until the dependency-edge
-//! `StoreTx` methods land in a later story/epic that actually needs them.
+//! `StoreTx` methods are added alongside task dependencies.
 
 use bala_core::{Parents, Placement, StoreError, TaskId};
 use rusqlite::{OptionalExtension, Transaction, params};

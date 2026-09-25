@@ -74,7 +74,7 @@ fn split_for_input(app: &App, area: Rect) -> (Rect, Option<Rect>) {
 ///
 /// Without a cap, indenting a chain of `n` tasks allocates `"  ".repeat(0)`
 /// through `"  ".repeat(n-1)` — quadratic total work in `n` (a 5,000-level
-/// chain, which `render::task_rows` supports with no depth limit per AC1,
+/// chain, which `render::task_rows` supports since hierarchy depth is unbounded,
 /// would format roughly 25 million space characters on every single
 /// redraw). A cap most users will never visually notice (a terminal rarely
 /// shows more than this many columns of pure indentation usefully anyway)
@@ -130,8 +130,8 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Renders the `Mode::Insert` buffer as an editable line, labeled by which
 /// field is being edited, plus any inline error message from `app.error()`
-/// on the line below it (AC5: validation errors are shown inline in the
-/// entry field). Used for both the List pane's new-task-title entry and the
+/// on the line below it, so a validation error shows up right under the
+/// input that caused it. Used for both the List pane's new-task-title entry and the
 /// Detail pane's title/description edits — the same input+error layout,
 /// just a different label depending on `EditableField`.
 fn draw_insert_input(frame: &mut Frame, app: &App, area: Rect) {

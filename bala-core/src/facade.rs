@@ -1,10 +1,8 @@
 //! The `Core` facade (LLD §Decision, §Method Contract): the single entry
 //! point every caller (CLI today, Web API later) drives.
 //!
-//! Scoped to exactly what Story 1.1 needs: `create_task`, `get_tree`, and
-//! thin `TaskType` pass-throughs. Dependency methods, cascade, and rollup
-//! belong to later stories/epics and are deliberately absent.
-//! `set_parents` (Story 3.1) is the bulk, atomic reparent method.
+//! Task dependencies and date-cascade rescheduling are not implemented
+//! yet.
 
 use std::collections::{HashMap, HashSet};
 
@@ -69,8 +67,7 @@ impl<S: Store> Core<S> {
         Ok(Self { store })
     }
 
-    /// Creates a user, so `Task::assignee_id` (added in a later checkpoint)
-    /// has a real entity to resolve to.
+    /// Creates a user, so `Task::assignee_id` has a real entity to resolve to.
     ///
     /// # Errors
     ///
@@ -101,7 +98,7 @@ impl<S: Store> Core<S> {
         Ok(self.store.transaction(|tx| tx.list_users())?)
     }
 
-    /// Creates a task per LLD §Algorithm (Story 1.1): validates the
+    /// Creates a task per LLD §Algorithm: validates the
     /// title, type key, date range, and each given parent, then persists
     /// the new task and its parent edges.
     ///
@@ -121,8 +118,8 @@ impl<S: Store> Core<S> {
     ///   make the new task its own ancestor — not reachable in practice
     ///   today, since a brand-new [`TaskId`] can never already be an
     ///   ancestor of anything, but [`hierarchy::check_new_parent`] runs
-    ///   unconditionally so this stays true once a later checkpoint's
-    ///   `set_parents` can reattach an *existing* task.
+    ///   unconditionally, the same check `set_parents` relies on when
+    ///   reattaching an *existing* task.
     /// - [`CoreError::Store`] if the backend fails.
     pub fn create_task(&mut self, new: NewTask) -> Result<Task, CoreError> {
         if new.title.trim().is_empty() {
@@ -262,12 +259,11 @@ impl<S: Store> Core<S> {
     }
 
     /// Lists tasks matching `filter`, with each result's `progress`
-    /// overwritten by a direct-children rollup (LLD §Algorithm 4, Story
-    /// 3.3 AC1/AC2/AC5): for each task `Store::list_tasks` returns, its
+    /// overwritten by a direct-children rollup (LLD §Algorithm 4): for each task `Store::list_tasks` returns, its
     /// direct children are fetched (`StoreTx::list_child_edges` +
     /// `StoreTx::get_task`, the same pattern `list_children` uses) and
     /// [`rollup::direct_children_progress`] averages their `status` flags —
-    /// a leaf task's `progress` falls back to its own `status` (AC5).
+    /// a leaf task's `progress` falls back to its own `status`.
     /// Hierarchy assembly beyond what `Task::parent_ids` already carries is
     /// still out of scope.
     ///
@@ -319,18 +315,17 @@ impl<S: Store> Core<S> {
         Ok(self.store.transaction(|tx| tx.get_task_types())?)
     }
 
-    /// Updates an existing task per LLD §Algorithm (Story 1.2): applies
+    /// Updates an existing task per LLD §Algorithm: applies
     /// `patch` field-by-field, validates the resulting state, bumps
     /// `updated_at`, and persists.
     ///
     /// `patch.title` and `patch.type_key` are `String`-backed, not
     /// `Option`-backed, on [`Task`], so [`Field::Clear`] on either is a
     /// defensive no-op equivalent to [`Field::Keep`] rather than a real
-    /// path — no caller in this checkpoint constructs one.
+    /// path — no caller constructs one.
     ///
-    /// Scoped to exactly what Story 1.2 needs: no cascade rescheduling of
-    /// dependents or subtasks (Epic 3) — a task's own dates and
-    /// assignment change in isolation, and this always returns a
+    /// Editing never reschedules dependents or subtasks — a task's own
+    /// dates and assignment change in isolation, and this always returns a
     /// single-element `Vec` until that cascade lands.
     ///
     /// # Errors
@@ -435,7 +430,7 @@ impl<S: Store> Core<S> {
         Ok(t)
     }
 
-    /// Deletes a task per LLD §Algorithm (Story 1.3): tombstones `id`
+    /// Deletes a task per LLD §Algorithm: tombstones `id`
     /// (`deleted_at` set, never a hard delete) and, per `mode`, either
     /// recursively tombstones every child left with no other live parent
     /// ([`DeleteMode::Subtree`]) or reparents each child onto `id`'s own
@@ -546,9 +541,8 @@ impl<S: Store> Core<S> {
         Ok(touched)
     }
 
-    /// Reopens a completed task per Story 2.3: the reverse of
-    /// `complete_task`, closing the gap noted in STORIES.md where Story 1.4
-    /// only ever shipped the forward Incomplete→Complete transition.
+    /// Reopens a completed task: the reverse of `complete_task`'s
+    /// Incomplete→Complete transition.
     /// Looks `id` up via [`StoreTx::get_task`] — a soft-deleted task is not
     /// reopenable, matching `delete_task`'s own use of `get_task` rather
     /// than `get_task_including_deleted` — sets `status =`
@@ -584,7 +578,8 @@ impl<S: Store> Core<S> {
         Ok(task)
     }
 
-    /// Restores a soft-deleted task per LLD §Algorithm (Story 1.3, AC5):
+    /// Restores a soft-deleted task per LLD §Algorithm — the undo for
+    /// `delete_task`, which never hard-deletes:
     /// looks `id` up via [`StoreTx::get_task_including_deleted`] — unlike
     /// `delete_task`'s `get_task`, this must see a tombstoned row, not
     /// just a live one — clears `deleted_at`, bumps `updated_at`, and
@@ -622,7 +617,7 @@ impl<S: Store> Core<S> {
         Ok(task)
     }
 
-    /// Completes a task per LLD §Algorithm 5 (Story 1.4): marks `id`
+    /// Completes a task per LLD §Algorithm 5: marks `id`
     /// `status = Complete`, `completed_at = Some(now)`, `updated_at = now`.
     ///
     /// If `id` has any descendant, at any depth, whose `status` is still
@@ -691,7 +686,7 @@ impl<S: Store> Core<S> {
         Ok(touched)
     }
 
-    /// Bulk, atomic reparent per LLD §Method Contract (AC4, AC5): replaces
+    /// Bulk, atomic reparent per LLD §Method Contract: replaces
     /// `id`'s entire parent set with `new_parents` in one commit.
     ///
     /// Every candidate in `new_parents` is checked — for existence and for

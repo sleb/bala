@@ -2,8 +2,8 @@
 //!
 //! `task_rows` turns already-fetched `Task`s (plus small lookup maps for
 //! type labels and user names) into `TaskRow`s ready for display. It does no
-//! I/O and never touches `Core` itself — later checkpoints (the TUI's `app`
-//! and `screens` modules) call it after fetching data through `Core`, which
+//! I/O and never touches `Core` itself — the TUI's `app` and `screens`
+//! modules call it after fetching data through `Core`, which
 //! keeps this projection unit-testable without a terminal or a database.
 
 use std::collections::{HashMap, HashSet};
@@ -166,7 +166,7 @@ fn positions(ids: &[TaskId]) -> HashMap<TaskId, usize> {
 /// Iterative (an explicit work-stack), not recursive, matching
 /// `bala-core`'s own convention for arbitrary-depth hierarchy walks (see
 /// `hierarchy::check_new_parent`'s and `facade::tombstone_subtree`'s doc
-/// comments): AC1 promises no fixed nesting depth limit, so this walk must
+/// comments): hierarchy depth is deliberately unbounded, so this walk must
 /// not be bounded by the process stack either. Each stack entry carries the
 /// length `ancestors_on_path` should be truncated back to before visiting
 /// it, so backtracking to a sibling branch correctly forgets the ancestors
@@ -457,8 +457,8 @@ mod tests {
 
     #[test]
     fn task_rows_should_not_overflow_the_stack_on_a_deep_chain() {
-        // Regression test for the iterative (not recursive) DFS walk: AC1
-        // promises no fixed nesting depth limit, so a chain deep enough to
+        // Regression test for the iterative (not recursive) DFS walk:
+        // hierarchy depth is deliberately unbounded, so a chain deep enough to
         // blow a recursive call stack must still render correctly.
         let mut tasks = Vec::new();
         let mut parent_id = None;

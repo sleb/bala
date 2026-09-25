@@ -7,7 +7,7 @@
 //! [`StoreTx::list_parent_edges`] — including the trivial case
 //! `parent == child` (self-parenting). The walk is an explicit work-stack,
 //! not recursion, matching `facade::tombstone_subtree`'s deep-chain safety:
-//! `create_task` and (in a later checkpoint) `set_parents` place no limit
+//! `create_task` and `set_parents` place no limit
 //! on hierarchy depth, so a user-built chain deep enough could overflow the
 //! process stack if this recursed instead.
 

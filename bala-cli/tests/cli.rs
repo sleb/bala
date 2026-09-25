@@ -221,8 +221,8 @@ fn task_edit_should_clear_description() {
     );
 
     // `task ls` doesn't currently surface description at all, so there's no
-    // visible-output assertion available here — the observable surface for
-    // this checkpoint is just that the edit itself succeeds.
+    // visible-output assertion available here — the observable surface is
+    // just that the edit itself succeeds.
     bala_cmd(&db_path)
         .args(["task", "edit", &task_id, "--clear-description"])
         .assert()

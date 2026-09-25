@@ -139,7 +139,7 @@ impl App {
     /// Attaches the per-task description lookup the Detail pane uses to
     /// show/edit a task's description (`TaskRow` itself carries no
     /// description — only title/type/status/assignee — since the list view
-    /// never needed one before this checkpoint). Builder-style for the same
+    /// doesn't show one). Builder-style for the same
     /// reason as [`App::with_lookup_maps`].
     #[must_use]
     pub fn with_descriptions(mut self, descriptions: HashMap<TaskId, Option<String>>) -> Self {
@@ -918,9 +918,9 @@ fn handle_d_key_pressed(app: &mut App, was_pending_d: bool) {
 /// Handles `Action::ConfirmYes`: runs the `Mode::Confirm`'s `PendingAction`.
 ///
 /// For `PendingAction::Delete(id)`, calls `Core::delete_task` with
-/// `DeleteMode::Subtree` (no TUI-created task can have children yet, so
-/// `PromoteChildren`'s choice UI is out of scope until Epic 3's hierarchy
-/// lands in the TUI). On success, every task actually touched (the deleted
+/// `DeleteMode::Subtree`: the TUI has no `PromoteChildren` choice yet, so
+/// deleting a parent here always takes its subtree with it (the CLI's
+/// `--promote-children` is the only way to keep the children). On success, every task actually touched (the deleted
 /// task and any descendants also tombstoned) is removed from `app.rows`,
 /// the selection is clamped to the remaining rows, and `app` returns to
 /// `Mode::Normal`/`Pane::List` (the deleted task's Detail view no longer
