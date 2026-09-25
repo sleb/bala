@@ -6,9 +6,9 @@
 //!
 //! ## Unused schema
 //!
-//! The initial migration (`migrations/V1__init.sql`) creates the full
-//! shape from `docs/design/data-store.md` §Schema, so adding task
-//! dependencies needs no breaking migration. Until then the
+//! The schema baseline (`migrations/V1__init.sql`) creates the full shape
+//! from `docs/design/data-store.md` §Schema, so adding task dependencies
+//! needs no schema change. Until then the
 //! `dependency_edges` table and the `tasks.out_of_sync` column sit unused
 //! — `bala-core`'s `Store` trait has no dependency methods and `Task` has
 //! no `out_of_sync` field (see the `edges` and `task` module docs).
