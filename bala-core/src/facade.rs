@@ -117,7 +117,7 @@ impl<S: Store> Core<S> {
     /// - [`CoreError::CircularHierarchy`] if any of `new.parent_ids` would
     ///   make the new task its own ancestor — not reachable in practice
     ///   today, since a brand-new [`TaskId`] can never already be an
-    ///   ancestor of anything, but [`hierarchy::check_new_parent`] runs
+    ///   ancestor of anything, but `hierarchy::check_new_parent` runs
     ///   unconditionally, the same check `set_parents` relies on when
     ///   reattaching an *existing* task.
     /// - [`CoreError::Store`] if the backend fails.
@@ -262,7 +262,7 @@ impl<S: Store> Core<S> {
     /// overwritten by a direct-children rollup (LLD §Algorithm 4): for each task `Store::list_tasks` returns, its
     /// direct children are fetched (`StoreTx::list_child_edges` +
     /// `StoreTx::get_task`, the same pattern `list_children` uses) and
-    /// [`rollup::direct_children_progress`] averages their `status` flags —
+    /// `rollup::direct_children_progress` averages their `status` flags —
     /// a leaf task's `progress` falls back to its own `status`.
     /// Hierarchy assembly beyond what `Task::parent_ids` already carries is
     /// still out of scope.
@@ -690,10 +690,10 @@ impl<S: Store> Core<S> {
     /// `id`'s entire parent set with `new_parents` in one commit.
     ///
     /// Every candidate in `new_parents` is checked — for existence and for
-    /// the hierarchy invariant via [`check_new_parent`] — before any edge is
-    /// touched, so a bad candidate anywhere in the list (existence failure
-    /// or a would-be cycle) leaves `id`'s existing parent edges completely
-    /// untouched rather than partially reparented. An empty `new_parents`
+    /// the hierarchy invariant via `hierarchy::check_new_parent` — before
+    /// any edge is touched, so a bad candidate anywhere in the list
+    /// (existence failure or a would-be cycle) leaves `id`'s existing parent
+    /// edges completely untouched rather than partially reparented. An empty `new_parents`
     /// promotes `id` to top-level.
     ///
     /// # Errors
@@ -986,7 +986,7 @@ fn sort_by_hierarchy_order(tx: &mut dyn StoreTx, tasks: &mut [Task]) -> Result<(
 /// Fetches `id`'s direct children the same way `get_tree`/`list_children`
 /// already do (`StoreTx::list_child_edges` + `StoreTx::get_task`, skipping
 /// any child id that no longer resolves) and hands them to
-/// [`rollup::direct_children_progress`] along with `status` — `id`'s own
+/// `rollup::direct_children_progress` along with `status` — `id`'s own
 /// current status, passed in rather than re-fetched, since every call site
 /// already has it in hand from the row it just read or is about to write.
 fn compute_progress(
