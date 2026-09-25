@@ -65,8 +65,10 @@ pub fn check_new_parent(
 /// Sets `child`'s complete parent set to `parents`, after checking that no
 /// new parent would make `child` its own ancestor.
 ///
-/// This is the only place Core writes parent edges. Every newly added
-/// parent is checked with [`check_new_parent`] before anything is written, so a
+/// Every write that adds a parent to an existing task goes through it;
+/// `create_task` writes a brand-new task's edges directly, since a new id
+/// has no descendants to form a cycle with. Every newly added parent is
+/// checked with [`check_new_parent`] before anything is written, so a
 /// rejected call leaves the edges untouched.
 ///
 /// # Errors
