@@ -162,7 +162,7 @@ fn draw_insert_input(frame: &mut Frame, app: &App, area: Rect) {
 /// `area`, overlaid on whatever pane is showing beneath it — the same
 /// "last line of the frame" convention `draw_insert_input` uses for the
 /// new-task/edit entry line, but a single, self-contained line (no separate
-/// error line) since a confirm prompt carries its own y/n hint rather than
+/// error line) since a confirm prompt carries its own key hint rather than
 /// a validation error.
 fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let Mode::Confirm { prompt, .. } = app.mode() else {
