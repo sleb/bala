@@ -149,6 +149,26 @@ pub enum DeleteMode {
     PromoteChildren,
 }
 
+/// What `Core::delete_task` changed, split by kind (LLD §Method Contract).
+///
+/// Both lists hold only tasks whose own stored row changed, each at most
+/// once and at its final committed value:
+///
+/// - `deleted`: every task the call tombstoned (`deleted_at` set).
+/// - `updated`: every surviving task whose own fields changed without
+///   being tombstoned — a child that lost a parent edge but is still
+///   reachable through another live parent, or a child reparented under
+///   [`DeleteMode::PromoteChildren`].
+///
+/// No id appears in both lists. A task whose rolled-up `progress` changed
+/// only because its children changed (e.g. a surviving parent that lost a
+/// child) is in neither; a caller that shows it re-fetches it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DeleteOutcome {
+    pub deleted: Vec<Task>,
+    pub updated: Vec<Task>,
+}
+
 /// Input to `Core::create_task`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewTask {

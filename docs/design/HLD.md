@@ -121,7 +121,7 @@ exact signatures/error types are a Core Library LLD concern):
 ```
 create_task(NewTask)                          -> Task
 update_task(id, TaskPatch)                     -> Task
-delete_task(id, mode: Subtree | PromoteChildren) -> Vec<Task>   // touched
+delete_task(id, mode: Subtree | PromoteChildren) -> DeleteOutcome   // deleted + updated
 set_parents(id, newParentIds)                  -> Task
 add_dependency(id, predecessorId, type)        -> Task
 remove_dependency(id, predecessorId)           -> Task
@@ -137,9 +137,13 @@ them consistently rather than parsing strings.
 **Contract behaviors the library guarantees** (so no caller reimplements
 them): rejects circular nesting and circular/invalid dependencies;
 cascades a predecessor's date change through successors and returns
-*every* task it touched from one call, so a caller can refresh every
-affected view without re-querying; `progress` is always library-computed
-on read, never derived by a caller, so list/tree/Gantt can't drift apart.
+*every* task whose own stored fields it changed from one call, so a
+caller can refresh those rows without re-querying (a delete splits them
+into `deleted` and `updated`, so no caller has to infer which is which;
+a parent whose rolled-up `progress` moved only because its children
+changed is not included and is re-fetched); `progress` is always
+library-computed on read, never derived by a caller, so list/tree/Gantt
+can't drift apart.
 
 **Client-only state:** collapse/expand state and Gantt scale/zoom are
 per-user view preferences with no cross-device requirement yet — not

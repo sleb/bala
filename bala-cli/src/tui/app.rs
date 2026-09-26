@@ -922,14 +922,19 @@ fn handle_d_key_pressed(app: &mut App, was_pending_d: bool) {
 /// deleting a parent here takes with it every child that has no other live
 /// parent (a child shared with another parent just loses its edge to the
 /// deleted one and survives; for sole-parent children, the CLI's
-/// `--promote-children` is the only way to keep them). On success, every
-/// task actually touched (the deleted task and any descendants also
-/// tombstoned) is removed from `app.rows`,
-/// the selection is clamped to the remaining rows, and `app` returns to
-/// `Mode::Normal`/`Pane::List` (the deleted task's Detail view no longer
-/// makes sense). On failure `app.error` is set and `app` still returns to
-/// `Mode::Normal` — there's no in-progress input to preserve here, unlike
-/// `submit_insert`'s failure path.
+/// `--promote-children` is the only way to keep them). On success, `app.rows`
+/// is rebuilt from a fresh tree via `refresh_rows_from_tree` rather than
+/// patched: in a multi-parent tree a shared child is rendered under several
+/// parents and a surviving parent's `has_children` flag and rolled-up
+/// progress can change, so only a full re-render gets every row right.
+/// `app.error` is cleared before that refresh, so an error the refresh
+/// itself sets (e.g. the follow-up `get_tree` failing after the delete
+/// committed) is preserved. The selection keeps its previous index, clamped
+/// to the new rows, and `app` returns to `Mode::Normal`/`Pane::List` (the
+/// deleted task's Detail view no longer makes sense). On failure
+/// `app.error` is set and `app` still returns to `Mode::Normal` — there's
+/// no in-progress input to preserve here, unlike `submit_insert`'s failure
+/// path.
 ///
 /// For `PendingAction::CompleteCascade(id)`, calls
 /// `Core::complete_task(id, true)`. On success every touched row's status is
@@ -945,24 +950,17 @@ fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
 
     match *action {
         PendingAction::Delete(id) => match core.delete_task(id, DeleteMode::Subtree) {
-            Ok(deleted) => {
-                let deleted_ids: std::collections::HashSet<TaskId> =
-                    deleted.iter().map(|task| task.id).collect();
-                app.rows.retain(|row| !deleted_ids.contains(&row.id));
-                // Also drop the deleted tasks from `app.tasks`: it's the
-                // cache `rebuild_rows` re-derives `app.rows` from on the
-                // next collapse/expand action, so leaving deleted tasks in
-                // it would resurrect them into `app.rows` as soon as the
-                // user collapsed or expanded anything.
-                app.tasks.retain(|task| !deleted_ids.contains(&task.id));
-                app.selected = if app.rows.is_empty() {
-                    None
-                } else {
-                    Some(app.selected.unwrap_or(0).min(app.rows.len() - 1))
-                };
+            Ok(_) => {
+                app.error = None;
+                let previous = app.selected;
+                refresh_rows_from_tree(app, core, None);
+                app.selected = app
+                    .rows
+                    .len()
+                    .checked_sub(1)
+                    .map(|last| previous.unwrap_or(0).min(last));
                 app.pane = Pane::List;
                 app.mode = Mode::Normal;
-                app.error = None;
             }
             Err(err) => {
                 app.mode = Mode::Normal;
@@ -1959,6 +1957,50 @@ mod tests {
             .get_tree(bala_core::TreeFilter::default())
             .expect("get_tree should succeed");
         assert!(!tasks.iter().any(|task| task.id == id));
+    }
+
+    #[test]
+    fn apply_action_confirm_yes_delete_should_keep_row_of_child_with_another_parent() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let c = child_of(&mut core, "C", a.id);
+        core.set_parents(c.id, vec![a.id, b.id])
+            .expect("set_parents should succeed");
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(a.id));
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
+
+        assert_eq!(app.error(), None);
+        assert_eq!(titles(&app), vec!["B", "C"]);
+        let c_row = &app.rows()[1];
+        assert_eq!(c_row.id, c.id);
+        assert_eq!(c_row.depth, 1);
+        assert_eq!(c_row.parent_id, Some(b.id));
+        let selected = app.selected.expect("a row should stay selected");
+        assert!(selected < app.rows().len());
+    }
+
+    #[test]
+    fn apply_action_confirm_yes_delete_should_clear_has_children_when_parent_loses_its_only_child()
+    {
+        let mut core = core();
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let k = child_of(&mut core, "K", p.id);
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(k.id));
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
+
+        assert_eq!(app.error(), None);
+        assert_eq!(titles(&app), vec!["P"]);
+        assert!(!app.rows()[0].has_children);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(p.id));
     }
 
     #[test]
