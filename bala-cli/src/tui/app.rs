@@ -929,7 +929,9 @@ fn handle_d_key_pressed(app: &mut App, was_pending_d: bool) {
 /// progress can change, so only a full re-render gets every row right.
 /// `app.error` is cleared before that refresh, so an error the refresh
 /// itself sets (e.g. the follow-up `get_tree` failing after the delete
-/// committed) is preserved. The selection keeps its previous index, clamped
+/// committed) is preserved; in that case the cached rows are stale, so the
+/// tasks in `DeleteOutcome::deleted` are dropped from them rather than left
+/// on screen to act on. The selection keeps its previous index, clamped
 /// to the new rows, and `app` returns to `Mode::Normal`/`Pane::List` (the
 /// deleted task's Detail view no longer makes sense). On failure
 /// `app.error` is set and `app` still returns to `Mode::Normal` — there's
@@ -950,10 +952,20 @@ fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
 
     match *action {
         PendingAction::Delete(id) => match core.delete_task(id, DeleteMode::Subtree) {
-            Ok(_) => {
+            Ok(outcome) => {
                 app.error = None;
                 let previous = app.selected;
                 refresh_rows_from_tree(app, core, None);
+                if app.error.is_some() {
+                    // The delete committed but the re-fetch failed, so the
+                    // cached rows are stale: at least drop the tombstoned
+                    // tasks, which would otherwise stay on screen and fail
+                    // any action taken on them with `NotFound`.
+                    let deleted: HashSet<TaskId> =
+                        outcome.deleted.iter().map(|task| task.id).collect();
+                    app.rows.retain(|row| !deleted.contains(&row.id));
+                    app.tasks.retain(|task| !deleted.contains(&task.id));
+                }
                 app.selected = app
                     .rows
                     .len()
@@ -2001,6 +2013,76 @@ mod tests {
         assert_eq!(titles(&app), vec!["P"]);
         assert!(!app.rows()[0].has_children);
         assert_eq!(app.selected_row().map(|r| r.id), Some(p.id));
+    }
+
+    /// A [`bala_core::Store`] over an [`InMemoryStore`] that fails every transaction
+    /// once its shared budget of successful ones runs out (`None` = no
+    /// limit), so a test can let a mutation commit and then fail the
+    /// follow-up fetch.
+    struct FlakyStore {
+        inner: InMemoryStore,
+        remaining: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+    }
+
+    impl bala_core::Store for FlakyStore {
+        fn transaction<T>(
+            &self,
+            f: impl FnOnce(&mut dyn bala_core::StoreTx) -> Result<T, bala_core::StoreError>,
+        ) -> Result<T, bala_core::StoreError> {
+            match self.remaining.get() {
+                Some(0) => Err(bala_core::StoreError::Backend("flaky".to_string())),
+                Some(n) => {
+                    self.remaining.set(Some(n - 1));
+                    self.inner.transaction(f)
+                }
+                None => self.inner.transaction(f),
+            }
+        }
+    }
+
+    #[test]
+    fn apply_action_confirm_yes_delete_should_drop_deleted_rows_when_refresh_fails() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let c = core
+            .create_task(bala_core::NewTask {
+                parent_ids: vec![a.id, b.id],
+                ..minimal_new_task("C")
+            })
+            .expect("create");
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let order = core.sibling_order().expect("sibling_order should succeed");
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        app.select_by_id(Some(a.id));
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        // The delete commits; the refresh's `get_tree` then fails.
+        remaining.set(Some(1));
+
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
+
+        assert!(app.error().is_some());
+        assert!(!app.rows().iter().any(|row| row.id == a.id));
+        assert!(!app.tasks.iter().any(|task| task.id == a.id));
+        assert!(app.rows().iter().any(|row| row.id == c.id));
+        let selected = app.selected.expect("a row should stay selected");
+        assert!(selected < app.rows().len());
+        assert_eq!(app.mode(), &Mode::Normal);
     }
 
     #[test]
