@@ -390,6 +390,9 @@ making every create under a deep chain O(depth) for a check that can never
 fail. Every write that adds a parent to an *existing* task still goes
 through `hierarchy::replace_parents` and its check.
 
+Both `create_task` and `set_parents` remove repeated parent ids before
+any check or write, keeping each id's first occurrence.
+
 ### 2. Dependency invariants ([#60](https://github.com/sleb/bala/issues/60) AC2–3)
 
 `add_dependency(id, predecessor, dep_type)`:

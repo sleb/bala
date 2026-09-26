@@ -158,6 +158,25 @@ fn create_task_should_reject_due_date_before_start_date() {
 }
 
 #[test]
+fn create_task_should_deduplicate_repeated_parent_ids_preserving_first_occurrence_order() {
+    let mut core = new_core();
+    let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
+    let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
+
+    let child = core
+        .create_task(NewTask {
+            parent_ids: vec![parent_a.id, parent_b.id, parent_a.id],
+            ..minimal_new_task("Child")
+        })
+        .unwrap();
+
+    assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
+    // A fresh read rebuilds `parent_ids` from the stored edges.
+    let reread = core.get_task(child.id).unwrap().unwrap();
+    assert_eq!(reread.parent_ids, vec![parent_a.id, parent_b.id]);
+}
+
+#[test]
 fn create_task_should_record_an_edge_for_each_given_parent() {
     // Attaching a new task under several parents in one call succeeds
     // and records one edge per parent, in the given order.

@@ -180,7 +180,7 @@ bala task add --title "Write docs" \
 | --- | --- | --- |
 | `--title` | yes | The task's title. |
 | `--description` | no | A longer description of the task. |
-| `--parent` | no (repeatable) | Id of a parent task. May be given multiple times to attach the new task under several parents. |
+| `--parent` | no (repeatable) | Id of a parent task. May be given multiple times to attach the new task under several parents; repeating the same id attaches the task under that parent only once. |
 | `--start` | no | Start date, `YYYY-MM-DD`. |
 | `--due` | no | Due date, `YYYY-MM-DD`. |
 | `--assignee` | no | Id of the user to assign the task to. |
@@ -255,7 +255,7 @@ bala task mv <task-id> --parents <parent-id>[,<parent-id>...]
 
 | Flag | Required | Description |
 | --- | --- | --- |
-| `--parents` | no (comma-separated) | New parent ids, comma-separated. Omit to promote the task to top-level (no parents). |
+| `--parents` | no (comma-separated) | New parent ids, comma-separated. Omit to promote the task to top-level (no parents). A repeated id attaches the task under that parent only once. |
 
 Prints the reparented task, in the same format as `task ls`.
 

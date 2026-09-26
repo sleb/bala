@@ -74,7 +74,8 @@ pub struct AddArgs {
     pub description: Option<String>,
 
     /// May be given multiple times to attach the new task under several
-    /// parents.
+    /// parents; repeating the same id attaches it under that parent only
+    /// once.
     #[arg(long = "parent")]
     pub parent: Vec<Uuid>,
 
@@ -199,7 +200,8 @@ pub struct MvArgs {
     pub id: Uuid,
 
     /// New parent ids, comma-separated. Omit (empty) to promote the task
-    /// to top-level.
+    /// to top-level. A repeated id attaches the task under that parent only
+    /// once.
     #[arg(long, value_delimiter = ',')]
     pub parents: Vec<Uuid>,
 }
