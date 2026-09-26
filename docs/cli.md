@@ -59,7 +59,7 @@ instead of a blank screen.
 | `k` / `↑` (in the Detail pane) | Move the field cursor up (Description → Title). |
 | `i` (in the Detail pane) | Edit the field under the cursor: opens a text-entry line prefilled with its current value. `Enter` submits, `Esc` cancels. |
 | `Esc` (in the Detail pane) | Leave the Detail pane, back to the list. |
-| `dd` (in the list) | Delete the selected task: press `d` twice in a row to prompt for confirmation. `y` confirms, `n`/`Esc` cancels. |
+| `dd` (in the list) | Delete the selected task: press `d` twice in a row to prompt for confirmation. For a task with no subtasks, `y` confirms and `n`/`Esc` cancels. For a task with subtasks, the prompt names how many it has: `s` deletes the task and its subtasks, `p` deletes only the task and promotes its subtasks to its parents (or to top level), and `n`/`Esc` cancels. |
 | `x` / `Space` (in the list or Detail pane) | Toggle the selected task's complete/incomplete state. Completing a task with incomplete subtasks prompts for confirmation: `y` completes the whole cascade, `n`/`Esc` cancels. |
 | `?` | Open the help overlay, listing every key bound in the current mode. Not available in Insert mode, where `?` types a literal question mark — use `F1` there instead. |
 | `F1` (in a text-entry line) | Open the help overlay. |
@@ -116,10 +116,18 @@ an empty description is accepted. `Esc` in the Detail pane itself (not
 mid-edit) leaves it and returns to the list.
 
 Pressing `d` twice in a row on a selected task shows a confirmation prompt
-naming the task, at the bottom of the screen: press `y` to delete it (along
-with its subtasks, if it has any), or `n`/`Esc` to cancel without deleting
-anything. Pressing `d` once and then any other key (rather than a second
-`d`) does not count toward the sequence — the next `d` starts fresh.
+naming the task, at the bottom of the screen. For a task with no subtasks,
+press `y` to delete it or `n`/`Esc` to cancel without deleting anything. For
+a task with subtasks, the prompt says how many direct subtasks it has
+(counting any hidden by the type filter or a collapsed row) and asks how to
+treat them, matching `bala task delete`'s `--cascade` and
+`--promote-children`: press `s` to delete the task along with its subtree (a
+subtask that also has another parent keeps that parent and is not deleted),
+`p` to delete only the task and move its direct subtasks up to the task's
+own parents (or to top level if it had none), or `n`/`Esc` to cancel. `y`
+does nothing at this prompt. Pressing `d` once and then any other key
+(rather than a second `d`) does not count toward the sequence — the next `d`
+starts fresh.
 
 The TUI requires a real terminal (a TTY) on stdin: running it in a
 non-interactive context (e.g. piped/redirected input, as CI or scripting

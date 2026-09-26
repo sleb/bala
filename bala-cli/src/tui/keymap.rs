@@ -6,9 +6,10 @@
 //! things in different modes/panes without a giant flat `match` spread
 //! across mode-aware branches inside the mutation logic itself.
 
+use bala_core::DeleteMode;
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::tui::mode::{DetailField, Mode, Pane};
+use crate::tui::mode::{DetailField, Mode, Pane, PendingAction};
 
 /// An intent derived from a key event and the current mode/pane, ready to be
 /// applied to `App`/`Core` by `app::apply_action`.
@@ -59,8 +60,12 @@ pub enum Action {
     /// `Normal` mode, `List` pane, `d`: one `d` key press. `App::apply_action`
     /// decides whether this is the first or second of a `dd` sequence.
     DKeyPressed,
-    /// `Confirm` mode, `y`: run the pending action.
+    /// `Confirm` mode (other than a delete of a task with children), `y`:
+    /// run the pending action.
     ConfirmYes,
+    /// `Confirm` mode, delete of a task with children: `s` deletes with
+    /// `DeleteMode::Subtree`, `p` with `DeleteMode::PromoteChildren`.
+    ConfirmDelete(DeleteMode),
     /// `Confirm` mode, `n`/`Esc`: cancel back to `Normal`.
     ConfirmNo,
     /// `Normal` mode (either pane) or `Confirm` mode, `?`; `Insert` mode,
@@ -316,7 +321,8 @@ pub static INSERT_BINDINGS: &[Binding] = &[
     },
 ];
 
-/// Bindings active in `Mode::Confirm`.
+/// Bindings active in `Mode::Confirm` for every [`PendingAction`] except
+/// [`PendingAction::DeleteWithChildren`].
 pub static CONFIRM_BINDINGS: &[Binding] = &[
     Binding {
         keys: &[KeyCode::Char('y')],
@@ -337,6 +343,51 @@ pub static CONFIRM_BINDINGS: &[Binding] = &[
         description: "Show the keybinding help overlay",
     },
 ];
+
+/// Bindings active in `Mode::Confirm` for
+/// [`PendingAction::DeleteWithChildren`]: the user picks how the task's
+/// children are treated rather than answering yes/no, so `y` is unbound.
+pub static CONFIRM_DELETE_CHILDREN_BINDINGS: &[Binding] = &[
+    Binding {
+        keys: &[KeyCode::Char('s')],
+        action: Action::ConfirmDelete(DeleteMode::Subtree),
+        label: "s",
+        description: "Delete the task and its subtasks",
+    },
+    Binding {
+        keys: &[KeyCode::Char('p')],
+        action: Action::ConfirmDelete(DeleteMode::PromoteChildren),
+        label: "p",
+        description: "Delete the task, promoting its subtasks to its parents",
+    },
+    Binding {
+        keys: &[KeyCode::Char('n'), KeyCode::Esc],
+        action: Action::ConfirmNo,
+        label: "n/Esc",
+        description: "Cancel",
+    },
+    Binding {
+        keys: &[KeyCode::Char('?')],
+        action: Action::OpenHelp,
+        label: "?",
+        description: "Show the keybinding help overlay",
+    },
+];
+
+/// The binding table for a `Mode::Confirm` prompt awaiting `action`.
+///
+/// Both [`key_to_action`] and [`help_entries`] pick their `Confirm` table
+/// through this one function, so dispatch and the help overlay can't
+/// disagree about which keys a prompt accepts. The `match` is exhaustive so
+/// a new [`PendingAction`] variant must choose its table here.
+fn confirm_bindings(action: PendingAction) -> &'static [Binding] {
+    match action {
+        PendingAction::DeleteWithChildren(_) => CONFIRM_DELETE_CHILDREN_BINDINGS,
+        PendingAction::Delete(_)
+        | PendingAction::CompleteCascade(_)
+        | PendingAction::InheritFromParent { .. } => CONFIRM_BINDINGS,
+    }
+}
 
 /// Looks up `code` in `bindings`, returning the first matching binding's
 /// action, or `None` if no binding covers `code`.
@@ -373,7 +424,9 @@ pub fn key_to_action(mode: &Mode, pane: Pane, detail_field: DetailField, key: Ke
             KeyCode::Char(c) => Action::InsertChar(c),
             _ => Action::Noop,
         }),
-        Mode::Confirm { .. } => lookup(CONFIRM_BINDINGS, key.code).unwrap_or(Action::Noop),
+        Mode::Confirm { action, .. } => {
+            lookup(confirm_bindings(*action), key.code).unwrap_or(Action::Noop)
+        }
         Mode::Help { .. } => match key.code {
             KeyCode::Esc => Action::CloseHelp,
             _ => Action::Noop,
@@ -438,7 +491,10 @@ pub fn help_entries(mode: &Mode, pane: Pane, detail_field: DetailField) -> Vec<H
             }
         },
         Mode::Insert { .. } => INSERT_BINDINGS.iter().map(HelpEntry::from).collect(),
-        Mode::Confirm { .. } => CONFIRM_BINDINGS.iter().map(HelpEntry::from).collect(),
+        Mode::Confirm { action, .. } => confirm_bindings(*action)
+            .iter()
+            .map(HelpEntry::from)
+            .collect(),
         Mode::Help { .. } => vec![],
     }
 }
@@ -447,8 +503,10 @@ pub fn help_entries(mode: &Mode, pane: Pane, detail_field: DetailField) -> Vec<H
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    use bala_core::{DeleteMode, TaskId};
+
     use super::{Action, help_entries, key_to_action};
-    use crate::tui::mode::{DetailField, EditableField, Mode, Pane};
+    use crate::tui::mode::{DetailField, EditableField, Mode, Pane, PendingAction};
 
     #[test]
     fn key_to_action_should_map_uppercase_o_in_normal_list_to_start_insert_new_title() {
@@ -1047,5 +1105,84 @@ mod tests {
         let entries = help_entries(&mode, Pane::List, DetailField::Title);
 
         assert!(entries.is_empty());
+    }
+
+    /// A `Mode::Confirm` for `dd` on a task that has children.
+    fn delete_with_children_confirm_mode() -> Mode {
+        Mode::Confirm {
+            prompt:
+                "\"Task\" has 2 subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?"
+                    .to_string(),
+            action: PendingAction::DeleteWithChildren(TaskId::new()),
+        }
+    }
+
+    fn map_in(mode: &Mode, code: KeyCode) -> Action {
+        key_to_action(
+            mode,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(code, KeyModifiers::NONE),
+        )
+    }
+
+    #[test]
+    fn key_to_action_in_delete_with_children_confirm_should_map_s_to_confirm_delete_subtree() {
+        let action = map_in(&delete_with_children_confirm_mode(), KeyCode::Char('s'));
+
+        assert_eq!(action, Action::ConfirmDelete(DeleteMode::Subtree));
+    }
+
+    #[test]
+    fn key_to_action_in_delete_with_children_confirm_should_map_p_to_confirm_delete_promote() {
+        let action = map_in(&delete_with_children_confirm_mode(), KeyCode::Char('p'));
+
+        assert_eq!(action, Action::ConfirmDelete(DeleteMode::PromoteChildren));
+    }
+
+    #[test]
+    fn key_to_action_in_delete_with_children_confirm_should_map_n_and_esc_to_confirm_no() {
+        let mode = delete_with_children_confirm_mode();
+
+        assert_eq!(map_in(&mode, KeyCode::Char('n')), Action::ConfirmNo);
+        assert_eq!(map_in(&mode, KeyCode::Esc), Action::ConfirmNo);
+    }
+
+    #[test]
+    fn key_to_action_in_delete_with_children_confirm_should_ignore_y() {
+        let action = map_in(&delete_with_children_confirm_mode(), KeyCode::Char('y'));
+
+        assert_eq!(action, Action::Noop);
+    }
+
+    #[test]
+    fn key_to_action_in_leaf_delete_confirm_should_still_map_y_to_confirm_yes() {
+        let mode = Mode::Confirm {
+            prompt: "Delete \"Task\"? (y/n)".to_string(),
+            action: PendingAction::Delete(TaskId::new()),
+        };
+
+        assert_eq!(map_in(&mode, KeyCode::Char('y')), Action::ConfirmYes);
+        assert_eq!(map_in(&mode, KeyCode::Char('s')), Action::Noop);
+        assert_eq!(map_in(&mode, KeyCode::Char('p')), Action::Noop);
+    }
+
+    #[test]
+    fn help_entries_for_delete_with_children_confirm_should_list_s_p_n() {
+        let entries = help_entries(
+            &delete_with_children_confirm_mode(),
+            Pane::List,
+            DetailField::Title,
+        );
+
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "s" && e.description == "Delete the task and its subtasks")
+        );
+        assert!(entries.iter().any(|e| e.key == "p"
+            && e.description == "Delete the task, promoting its subtasks to its parents"));
+        assert!(entries.iter().any(|e| e.key == "n/Esc"));
+        assert!(!entries.iter().any(|e| e.key == "y"));
     }
 }

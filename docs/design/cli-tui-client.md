@@ -193,7 +193,7 @@ Gantt):
 | `o` / `O`            | new subtask under focused task / new top-level task → `Insert{title}` ([#6](https://github.com/sleb/bala/issues/6), [#37](https://github.com/sleb/bala/issues/37))                                                          |
 | `Enter`              | open Detail pane on focused task                                                                                                                  |
 | `i` (in Detail pane) | edit a field → `Insert` ([#11](https://github.com/sleb/bala/issues/11))                                                                                                               |
-| `dd`                 | delete focused task → `Confirm` ([#12](https://github.com/sleb/bala/issues/12))                                                                                                       |
+| `dd`                 | delete focused task → `Confirm` ([#12](https://github.com/sleb/bala/issues/12)): `PendingAction::Delete` (`y`/`n`) if `Core::list_children` is empty, else `PendingAction::DeleteWithChildren` naming the child count (`s` = `DeleteMode::Subtree`, `p` = `DeleteMode::PromoteChildren`, `n`/`Esc` cancels); a `list_children` error shows inline and stays in `Normal` |
 | `x` / `Space`        | toggle complete → `Confirm` only if blocked by incomplete children ([#13](https://github.com/sleb/bala/issues/13))                                                                    |
 | `m`                  | reparent (`set_parents`) → `Insert{parent list}` ([#37](https://github.com/sleb/bala/issues/37) AC4)                                                                                  |
 | `p` / `P`            | add / remove dependency → `Insert{predecessor}` ([#60](https://github.com/sleb/bala/issues/60))                                                                                       |
@@ -217,10 +217,21 @@ Gantt):
 | `Enter`                       | commit — calls `update_task` with the accumulated date change                    |
 | `Esc`                         | discard preview, return to `Normal`                                              |
 
-**Confirm mode** presents the `CoreError`-derived prompt text (§Error
-Rendering) and accepts `y`/`n` only; `y` runs the `PendingAction`
-(`delete_task` with the chosen `DeleteMode`, or `complete_task` with
-`cascade: true`), `n`/`Esc` cancels.
+**Confirm mode** presents the prompt text (§Error Rendering for
+`CoreError`-derived prompts) and, for most `PendingAction`s, accepts `y`/`n`
+only; `y` runs the `PendingAction` (`delete_task` for a task with no
+children, or `complete_task` with `cascade: true`), `n`/`Esc` cancels. The
+childless delete passes `DeleteMode::PromoteChildren`: identical to
+`Subtree` for a leaf, but if another process gave the task children after
+the prompt opened, they are promoted rather than silently deleted.
+`PendingAction::DeleteWithChildren` (`dd` on a task that has live children,
+counted via `Core::list_children` so children hidden by the type filter
+still count) instead accepts `s` (`delete_task` with
+`DeleteMode::Subtree`), `p` (`delete_task` with `DeleteMode::PromoteChildren`,
+reparenting the children to the deleted task's parents or to top level), or
+`n`/`Esc`; `y` is unbound there, mirroring the CLI's refusal to delete a
+parent without `--cascade` or `--promote-children`. After either delete the
+list is re-rendered from a fresh `get_tree`.
 
 ## Screens
 

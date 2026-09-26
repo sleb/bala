@@ -362,7 +362,10 @@ pub fn handle_key<S: Store>(app: &mut App, core: &mut Core<S>, key: KeyEvent) ->
 /// nothing. `CycleTypeFilter` advances `app.type_filter` through `None ->
 /// available_type_keys[0] -> ... -> None` (see `cycle_type_filter`) and then
 /// calls `refresh_rows_from_tree` so the visible rows immediately reflect
-/// the new filter. `Noop` does nothing.
+/// the new filter. `ConfirmDelete(mode)` deletes the task pending in a
+/// `Mode::Confirm` for `PendingAction::Delete`/`DeleteWithChildren` with
+/// `mode` (see `confirm_delete`); in any other mode it does nothing. `Noop`
+/// does nothing.
 #[allow(clippy::too_many_lines)] // one big dispatch table by design; see doc comment above
 pub fn apply_action<S: Store>(
     app: &mut App,
@@ -445,11 +448,21 @@ pub fn apply_action<S: Store>(
             ControlFlow::Continue(())
         }
         Action::DKeyPressed => {
-            handle_d_key_pressed(app, was_pending_d);
+            handle_d_key_pressed(app, core, was_pending_d);
             ControlFlow::Continue(())
         }
         Action::ConfirmYes => {
             confirm_yes(app, core);
+            ControlFlow::Continue(())
+        }
+        Action::ConfirmDelete(mode) => {
+            if let Mode::Confirm {
+                action: PendingAction::Delete(id) | PendingAction::DeleteWithChildren(id),
+                ..
+            } = app.mode
+            {
+                confirm_delete(app, core, id, mode);
+            }
             ControlFlow::Continue(())
         }
         Action::ConfirmNo => {
@@ -896,53 +909,70 @@ fn start_edit_description(app: &mut App) {
 
 /// Handles `Action::DKeyPressed` given whether a `d` was already pending
 /// (`was_pending_d`, read from `App.pending_d` before `apply_action` reset
-/// it for this action). On the second of two consecutive presses, enters
-/// `Mode::Confirm` naming the selected task when there is one; with no
-/// selection it's a no-op. On the first press, sets `app.pending_d` so the
-/// next `DKeyPressed` is recognized as the second.
-fn handle_d_key_pressed(app: &mut App, was_pending_d: bool) {
-    if was_pending_d {
-        if let Some(row) = app.selected_row() {
-            let id = row.id;
-            let title = row.title.clone();
+/// it for this action). On the first press, sets `app.pending_d` so the
+/// next `DKeyPressed` is recognized as the second. On the second press
+/// with no selection it's a no-op; otherwise it enters `Mode::Confirm`
+/// naming the selected task.
+///
+/// Which prompt depends on the task's live direct children, fetched via
+/// `Core::list_children` rather than read from `app.rows`, so a parent whose
+/// children are all hidden by the type filter (or collapsed) still gets the
+/// choice. With no children the prompt is a plain `y`/`n` and the pending
+/// action is `PendingAction::Delete`; with children it names the child
+/// count and offers `s` (delete the subtree), `p` (promote the children) or
+/// `n` (cancel), and the pending action is
+/// `PendingAction::DeleteWithChildren`. If listing the children fails,
+/// `app.error` is set and `app` stays in `Mode::Normal`.
+fn handle_d_key_pressed<S: Store>(app: &mut App, core: &Core<S>, was_pending_d: bool) {
+    if !was_pending_d {
+        app.pending_d = true;
+        return;
+    }
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let id = row.id;
+    let title = row.title.clone();
+    match core.list_children(id) {
+        Ok(children) if children.is_empty() => {
             app.mode = Mode::Confirm {
                 prompt: format!("Delete \"{title}\"? (y/n)"),
                 action: PendingAction::Delete(id),
             };
         }
-    } else {
-        app.pending_d = true;
+        Ok(children) => {
+            let count = children.len();
+            app.mode = Mode::Confirm {
+                prompt: format!(
+                    "\"{title}\" has {count} subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?"
+                ),
+                action: PendingAction::DeleteWithChildren(id),
+            };
+        }
+        Err(err) => app.error = Some(err.to_string()),
     }
 }
 
 /// Handles `Action::ConfirmYes`: runs the `Mode::Confirm`'s `PendingAction`.
 ///
-/// For `PendingAction::Delete(id)`, calls `Core::delete_task` with
-/// `DeleteMode::Subtree`: the TUI has no `PromoteChildren` choice yet, so
-/// deleting a parent here takes with it every child that has no other live
-/// parent (a child shared with another parent just loses its edge to the
-/// deleted one and survives; for sole-parent children, the CLI's
-/// `--promote-children` is the only way to keep them). On success, `app.rows`
-/// is rebuilt from a fresh tree via `refresh_rows_from_tree` rather than
-/// patched: in a multi-parent tree a shared child is rendered under several
-/// parents and a surviving parent's `has_children` flag and rolled-up
-/// progress can change, so only a full re-render gets every row right.
-/// `app.error` is cleared before that refresh, so an error the refresh
-/// itself sets (e.g. the follow-up `get_tree` failing after the delete
-/// committed) is preserved; in that case the cached rows are stale, so the
-/// tasks in `DeleteOutcome::deleted` are dropped from them rather than left
-/// on screen to act on. The selection keeps its previous index, clamped
-/// to the new rows, and `app` returns to `Mode::Normal`/`Pane::List` (the
-/// deleted task's Detail view no longer makes sense). On failure
-/// `app.error` is set and `app` still returns to `Mode::Normal` — there's
-/// no in-progress input to preserve here, unlike `submit_insert`'s failure
-/// path.
+/// For `PendingAction::Delete(id)` — `dd` on a task that had no children
+/// when the prompt opened — deletes it via [`confirm_delete`] with
+/// `DeleteMode::PromoteChildren`. For a childless task that deletes just the
+/// task, same as `DeleteMode::Subtree` would; but the child check and the
+/// delete run in separate transactions, so if another writer sharing the
+/// store has since given the task children, promoting them keeps them
+/// rather than deleting a subtree the prompt never mentioned. A task with
+/// children is pending as `PendingAction::DeleteWithChildren` instead,
+/// which `y` does not answer: its prompt takes `s`/`p`
+/// (`Action::ConfirmDelete`) so the user chooses explicitly between
+/// deleting the subtree and promoting the children, and `ConfirmYes` leaves
+/// it pending.
 ///
 /// For `PendingAction::CompleteCascade(id)`, calls
 /// `Core::complete_task(id, true)`. On success every touched row's status is
 /// refreshed (same lookup-by-id loop as [`handle_toggle_complete`]'s
 /// non-cascade path) and `app` returns to `Mode::Normal`, leaving `app.pane`
-/// untouched — unlike `Delete`, completing a task doesn't invalidate its
+/// untouched — unlike a delete, completing a task doesn't invalidate its
 /// Detail view. On failure `app.error` is set and `app` returns to
 /// `Mode::Normal`.
 fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
@@ -951,34 +981,7 @@ fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
     };
 
     match *action {
-        PendingAction::Delete(id) => match core.delete_task(id, DeleteMode::Subtree) {
-            Ok(outcome) => {
-                app.error = None;
-                let previous = app.selected;
-                refresh_rows_from_tree(app, core, None);
-                if app.error.is_some() {
-                    // The delete committed but the re-fetch failed, so the
-                    // cached rows are stale: at least drop the tombstoned
-                    // tasks, which would otherwise stay on screen and fail
-                    // any action taken on them with `NotFound`.
-                    let deleted: HashSet<TaskId> =
-                        outcome.deleted.iter().map(|task| task.id).collect();
-                    app.rows.retain(|row| !deleted.contains(&row.id));
-                    app.tasks.retain(|task| !deleted.contains(&task.id));
-                }
-                app.selected = app
-                    .rows
-                    .len()
-                    .checked_sub(1)
-                    .map(|last| previous.unwrap_or(0).min(last));
-                app.pane = Pane::List;
-                app.mode = Mode::Normal;
-            }
-            Err(err) => {
-                app.mode = Mode::Normal;
-                app.error = Some(err.to_string());
-            }
-        },
+        PendingAction::Delete(id) => confirm_delete(app, core, id, DeleteMode::PromoteChildren),
         PendingAction::CompleteCascade(id) => match core.complete_task(id, true) {
             Ok(touched) => {
                 refresh_row_statuses(app, &touched);
@@ -993,6 +996,63 @@ fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
         PendingAction::InheritFromParent { child, parent } => {
             inherit_from_parent(app, core, child, parent);
             app.mode = Mode::Normal;
+        }
+        PendingAction::DeleteWithChildren(_) => {}
+    }
+}
+
+/// Deletes `id` via `Core::delete_task(id, mode)` and leaves the delete
+/// prompt. Shared by `ConfirmYes` on a `PendingAction::Delete` (always
+/// `DeleteMode::PromoteChildren`) and `ConfirmDelete(mode)` on a
+/// `PendingAction::Delete` or `PendingAction::DeleteWithChildren`.
+///
+/// With `DeleteMode::Subtree`, every descendant that has no other live
+/// parent is deleted too (a child shared with another parent just loses its
+/// edge to the deleted one and survives). With `DeleteMode::PromoteChildren`
+/// only `id` is deleted and its children are reparented to `id`'s own
+/// parents, or made top-level if it had none.
+///
+/// On success, `app.rows` is rebuilt from a fresh tree via
+/// `refresh_rows_from_tree` rather than patched: in a multi-parent tree a
+/// shared child is rendered under several parents, promoted children move
+/// to a new position, and a surviving parent's `has_children` flag and
+/// rolled-up progress can change, so only a full re-render gets every row
+/// right. `app.error` is cleared before that refresh, so an error the
+/// refresh itself sets (e.g. the follow-up `get_tree` failing after the
+/// delete committed) is preserved; in that case the cached rows are stale,
+/// so the tasks in `DeleteOutcome::deleted` are dropped from them rather
+/// than left on screen to act on. The selection keeps its previous index,
+/// clamped to the new rows, and `app` returns to `Mode::Normal`/`Pane::List`
+/// (the deleted task's Detail view no longer makes sense). On failure
+/// `app.error` is set and `app` still returns to `Mode::Normal` — there's
+/// no in-progress input to preserve here, unlike `submit_insert`'s failure
+/// path.
+fn confirm_delete<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, mode: DeleteMode) {
+    match core.delete_task(id, mode) {
+        Ok(outcome) => {
+            app.error = None;
+            let previous = app.selected;
+            refresh_rows_from_tree(app, core, None);
+            if app.error.is_some() {
+                // The delete committed but the re-fetch failed, so the
+                // cached rows are stale: at least drop the tombstoned
+                // tasks, which would otherwise stay on screen and fail
+                // any action taken on them with `NotFound`.
+                let deleted: HashSet<TaskId> = outcome.deleted.iter().map(|task| task.id).collect();
+                app.rows.retain(|row| !deleted.contains(&row.id));
+                app.tasks.retain(|task| !deleted.contains(&task.id));
+            }
+            app.selected = app
+                .rows
+                .len()
+                .checked_sub(1)
+                .map(|last| previous.unwrap_or(0).min(last));
+            app.pane = Pane::List;
+            app.mode = Mode::Normal;
+        }
+        Err(err) => {
+            app.mode = Mode::Normal;
+            app.error = Some(err.to_string());
         }
     }
 }
@@ -1341,13 +1401,13 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::ops::ControlFlow;
 
-    use bala_core::{Core, InMemoryStore, TaskId, TaskStatus, TaskType};
+    use bala_core::{Core, DeleteMode, InMemoryStore, TaskId, TaskStatus, TaskType};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{App, apply_action, handle_key};
     use crate::render::TaskRow;
     use crate::tui::keymap::Action;
-    use crate::tui::mode::{DetailField, EditableField, Mode, Pane};
+    use crate::tui::mode::{DetailField, EditableField, Mode, Pane, PendingAction};
 
     fn row(title: &str) -> TaskRow {
         TaskRow {
@@ -1972,7 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_action_confirm_yes_delete_should_keep_row_of_child_with_another_parent() {
+    fn apply_action_confirm_delete_subtree_should_keep_row_of_child_with_another_parent() {
         let mut core = core();
         let a = core.create_task(minimal_new_task("A")).expect("create");
         let b = core.create_task(minimal_new_task("B")).expect("create");
@@ -1984,7 +2044,11 @@ mod tests {
         let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
         let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
 
-        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
+        let _ = apply_action(
+            &mut app,
+            &mut core,
+            Action::ConfirmDelete(DeleteMode::Subtree),
+        );
 
         assert_eq!(app.error(), None);
         assert_eq!(titles(&app), vec!["B", "C"]);
@@ -2041,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_action_confirm_yes_delete_should_drop_deleted_rows_when_refresh_fails() {
+    fn apply_action_confirm_delete_subtree_should_drop_deleted_rows_when_refresh_fails() {
         let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
         let mut core = Core::new(FlakyStore {
             inner: InMemoryStore::default(),
@@ -2074,7 +2138,11 @@ mod tests {
         // The delete commits; the refresh's `get_tree` then fails.
         remaining.set(Some(1));
 
-        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
+        let _ = apply_action(
+            &mut app,
+            &mut core,
+            Action::ConfirmDelete(DeleteMode::Subtree),
+        );
 
         assert!(app.error().is_some());
         assert!(!app.rows().iter().any(|row| row.id == a.id));
@@ -2112,6 +2180,289 @@ mod tests {
             .get_tree(bala_core::TreeFilter::default())
             .expect("get_tree should succeed");
         assert!(tasks.iter().any(|task| task.id == id));
+    }
+
+    /// Presses `d` twice with `id`'s first row selected.
+    fn press_dd_on(app: &mut App, core: &mut Core<InMemoryStore>, id: TaskId) {
+        app.select_by_id(Some(id));
+        let _ = apply_action(app, core, Action::DKeyPressed);
+        let _ = apply_action(app, core, Action::DKeyPressed);
+    }
+
+    fn live_tasks(core: &Core<InMemoryStore>) -> Vec<bala_core::Task> {
+        core.get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed")
+    }
+
+    #[test]
+    fn dd_on_task_with_children_should_enter_confirm_not_delete_immediately() {
+        let mut core = core();
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let k1 = child_of(&mut core, "K1", p.id);
+        let k2 = child_of(&mut core, "K2", p.id);
+        let mut app = app_from_core(&mut core);
+
+        press_dd_on(&mut app, &mut core, p.id);
+
+        match app.mode() {
+            Mode::Confirm { prompt, action } => {
+                assert_eq!(
+                    prompt,
+                    "\"P\" has 2 subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?"
+                );
+                assert_eq!(*action, PendingAction::DeleteWithChildren(p.id));
+            }
+            other => panic!("expected Mode::Confirm, got {other:?}"),
+        }
+        let ids: Vec<TaskId> = live_tasks(&core).iter().map(|t| t.id).collect();
+        assert!(ids.contains(&p.id) && ids.contains(&k1.id) && ids.contains(&k2.id));
+
+        // `y` is not an answer to this prompt.
+        let _ = handle_key(
+            &mut app,
+            &mut core,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert!(matches!(app.mode(), Mode::Confirm { .. }));
+        assert!(live_tasks(&core).iter().any(|t| t.id == p.id));
+    }
+
+    #[test]
+    fn dd_on_leaf_should_enter_plain_delete_confirm() {
+        let mut core = core();
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let k = child_of(&mut core, "K", p.id);
+        let mut app = app_from_core(&mut core);
+
+        press_dd_on(&mut app, &mut core, k.id);
+
+        assert_eq!(
+            app.mode(),
+            &Mode::Confirm {
+                prompt: "Delete \"K\"? (y/n)".to_string(),
+                action: PendingAction::Delete(k.id),
+            }
+        );
+    }
+
+    #[test]
+    fn confirm_yes_on_leaf_prompt_should_keep_child_added_after_prompt_opened() {
+        let mut core = core();
+        let t = core.create_task(minimal_new_task("T")).expect("create");
+        let mut app = app_from_core(&mut core);
+        press_dd_on(&mut app, &mut core, t.id);
+        assert_eq!(
+            app.mode(),
+            &Mode::Confirm {
+                prompt: "Delete \"T\"? (y/n)".to_string(),
+                action: PendingAction::Delete(t.id),
+            }
+        );
+        // Another writer sharing the store adds a child while the prompt is open.
+        let k = child_of(&mut core, "K", t.id);
+
+        let _ = handle_key(
+            &mut app,
+            &mut core,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.error(), None);
+        let tasks = live_tasks(&core);
+        assert!(!tasks.iter().any(|task| task.id == t.id));
+        let kid = tasks
+            .iter()
+            .find(|task| task.id == k.id)
+            .expect("a child the prompt never mentioned should survive");
+        assert!(kid.parent_ids.is_empty());
+        assert!(app.rows().iter().any(|row| row.id == k.id));
+    }
+
+    #[test]
+    fn dd_on_parent_whose_children_are_filtered_out_should_still_offer_delete_mode_choice() {
+        let mut core = core();
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .expect("upsert_task_type should succeed");
+        let p = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("P")
+            })
+            .expect("create");
+        let _k = child_of(&mut core, "K", p.id);
+        let mut app = App::new(vec![])
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+        super::refresh_rows_from_tree(&mut app, &mut core, None);
+        assert_eq!(titles(&app), vec!["P"]);
+
+        press_dd_on(&mut app, &mut core, p.id);
+
+        match app.mode() {
+            Mode::Confirm { prompt, action } => {
+                assert!(prompt.contains("has 1 subtask(s)"), "prompt: {prompt}");
+                assert_eq!(*action, PendingAction::DeleteWithChildren(p.id));
+            }
+            other => panic!("expected Mode::Confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_delete_subtree_should_delete_parent_and_sole_parent_children() {
+        let mut core = core();
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let k = child_of(&mut core, "K", p.id);
+        let other = core.create_task(minimal_new_task("Other")).expect("create");
+        let mut app = app_from_core(&mut core);
+        press_dd_on(&mut app, &mut core, p.id);
+
+        let _ = apply_action(
+            &mut app,
+            &mut core,
+            Action::ConfirmDelete(DeleteMode::Subtree),
+        );
+
+        assert_eq!(app.error(), None);
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.pane(), Pane::List);
+        assert_eq!(titles(&app), vec!["Other"]);
+        let ids: Vec<TaskId> = live_tasks(&core).iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![other.id]);
+        assert!(!ids.contains(&k.id));
+    }
+
+    #[test]
+    fn confirm_delete_promote_should_reparent_children_to_deleted_tasks_parents_and_show_them() {
+        let mut core = core();
+        let g = core.create_task(minimal_new_task("G")).expect("create");
+        let p = child_of(&mut core, "P", g.id);
+        let k1 = child_of(&mut core, "K1", p.id);
+        let k2 = child_of(&mut core, "K2", p.id);
+        let mut app = app_from_core(&mut core);
+        press_dd_on(&mut app, &mut core, p.id);
+
+        let _ = apply_action(
+            &mut app,
+            &mut core,
+            Action::ConfirmDelete(DeleteMode::PromoteChildren),
+        );
+
+        assert_eq!(app.error(), None);
+        assert_eq!(app.mode(), &Mode::Normal);
+        let tasks = live_tasks(&core);
+        assert!(!tasks.iter().any(|t| t.id == p.id));
+        for kid in [k1.id, k2.id] {
+            let task = tasks.iter().find(|t| t.id == kid).expect("child survives");
+            assert_eq!(task.parent_ids, vec![g.id]);
+        }
+        assert!(!app.rows().iter().any(|r| r.id == p.id));
+        for kid in [k1.id, k2.id] {
+            let row = app
+                .rows()
+                .iter()
+                .find(|r| r.id == kid)
+                .expect("promoted child should be visible");
+            assert_eq!(row.parent_id, Some(g.id));
+            assert_eq!(row.depth, 1);
+        }
+        let mut shown = titles(&app);
+        shown.sort();
+        assert_eq!(shown, vec!["G", "K1", "K2"]);
+    }
+
+    #[test]
+    fn confirm_delete_promote_on_top_level_parent_should_make_children_top_level() {
+        let mut core = core();
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let k = child_of(&mut core, "K", p.id);
+        let mut app = app_from_core(&mut core);
+        press_dd_on(&mut app, &mut core, p.id);
+
+        let _ = apply_action(
+            &mut app,
+            &mut core,
+            Action::ConfirmDelete(DeleteMode::PromoteChildren),
+        );
+
+        assert_eq!(app.error(), None);
+        let tasks = live_tasks(&core);
+        let task = tasks.iter().find(|t| t.id == k.id).expect("child survives");
+        assert!(task.parent_ids.is_empty());
+        assert_eq!(titles(&app), vec!["K"]);
+        let row = &app.rows()[0];
+        assert_eq!(row.id, k.id);
+        assert_eq!(row.depth, 0);
+        assert_eq!(row.parent_id, None);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(k.id));
+    }
+
+    #[test]
+    fn confirm_no_on_delete_with_children_prompt_should_change_nothing() {
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut core = core();
+            let p = core.create_task(minimal_new_task("P")).expect("create");
+            let k = child_of(&mut core, "K", p.id);
+            let mut app = app_from_core(&mut core);
+            press_dd_on(&mut app, &mut core, p.id);
+            let rows_before = app.rows().to_vec();
+
+            let _ = handle_key(&mut app, &mut core, KeyEvent::new(code, KeyModifiers::NONE));
+
+            assert_eq!(app.mode(), &Mode::Normal, "{code:?}");
+            assert_eq!(app.rows(), rows_before.as_slice(), "{code:?}");
+            let tasks = live_tasks(&core);
+            assert!(tasks.iter().any(|t| t.id == p.id), "{code:?}");
+            let kid = tasks.iter().find(|t| t.id == k.id).expect("child survives");
+            assert_eq!(kid.parent_ids, vec![p.id], "{code:?}");
+        }
+    }
+
+    #[test]
+    fn dd_should_set_error_and_stay_normal_when_listing_children_fails() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let mut app = App::new(vec![row_for(&p)]);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        remaining.set(Some(0));
+
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert!(app.error().is_some());
+        remaining.set(None);
+        assert!(
+            core.get_tree(bala_core::TreeFilter::default())
+                .expect("get_tree should succeed")
+                .iter()
+                .any(|t| t.id == p.id)
+        );
+    }
+
+    #[test]
+    fn confirm_delete_outside_a_delete_prompt_should_be_noop() {
+        let mut core = core();
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let _k = child_of(&mut core, "K", p.id);
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(p.id));
+
+        let _ = apply_action(
+            &mut app,
+            &mut core,
+            Action::ConfirmDelete(DeleteMode::Subtree),
+        );
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert!(live_tasks(&core).iter().any(|t| t.id == p.id));
     }
 
     /// Builds an `App` over the full tree of `core`, as `tui::run` does.
@@ -3302,7 +3653,7 @@ mod tests {
 
     #[test]
     fn rebuild_rows_after_delete_should_not_resurrect_deleted_task() {
-        // Regression: `confirm_yes`'s `Delete` arm used to filter only
+        // Regression: the delete path (`confirm_delete`) used to filter only
         // `app.rows`, leaving the deleted task(s) in `app.tasks`. A later
         // collapse/expand action would then re-derive `rows` from the stale
         // `app.tasks` and resurrect the deleted row(s).
