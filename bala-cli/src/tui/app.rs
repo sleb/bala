@@ -699,8 +699,8 @@ fn cycle_type_filter(app: &mut App) {
 /// task); on `CoreError::IncompleteChildren`, enters `Mode::Confirm` with
 /// `PendingAction::CompleteCascade(id)` and a prompt naming the task and the
 /// incomplete-child count; on any other error sets `app.error`. For a
-/// `Complete` task, calls `Core::reopen_task(id)` and refreshes that one
-/// row on success (mirroring the same error-handling shape).
+/// `Complete` task, calls `Core::reopen_task(id)` and refreshes that task's
+/// rows on success (mirroring the same error-handling shape).
 fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
     let Some(row) = app.selected_row() else {
         return;
@@ -740,9 +740,11 @@ fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
 }
 
 /// Updates `app.rows`' `status` field for every task in `touched`, matched
-/// by id. Shared by [`handle_toggle_complete`] and [`confirm_yes`]'s
-/// `CompleteCascade` arm so both "refresh every row a `Core` call actually
-/// touched" call sites use the same lookup-by-id loop.
+/// by id. A task with several parents is rendered once per parent path, so
+/// every rendered row of the task is patched, not just the first. Shared by
+/// [`handle_toggle_complete`] and [`confirm_yes`]'s `CompleteCascade` arm so
+/// both "refresh every row a `Core` call actually touched" call sites use the
+/// same lookup-by-id loop.
 ///
 /// Also updates the matching entries in `app.tasks`, not just `app.rows`:
 /// `app.tasks` is the cache `rebuild_rows` (collapse/expand/expand-all/
@@ -753,7 +755,7 @@ fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
 /// collapsed parent.
 fn refresh_row_statuses(app: &mut App, touched: &[bala_core::Task]) {
     for task in touched {
-        if let Some(row) = app.rows.iter_mut().find(|row| row.id == task.id) {
+        for row in app.rows.iter_mut().filter(|row| row.id == task.id) {
             row.status = task.status;
         }
         if let Some(cached) = app.tasks.iter_mut().find(|cached| cached.id == task.id) {
@@ -1342,8 +1344,10 @@ fn submit_new_title<S: Store>(app: &mut App, core: &mut Core<S>, buffer: String)
 }
 
 /// `EditableField::Title(id)`: calls `Core::update_task` with `buffer` as
-/// the new title. On success refreshes the matching row's displayed title;
-/// on failure (e.g. an empty title) sets `app.error`.
+/// the new title. On success refreshes the displayed title of every
+/// rendered row of the task (a multi-parent task has one row per parent
+/// path) and the cached task; on failure (e.g. an empty title) sets
+/// `app.error`.
 fn submit_edit_title<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buffer: String) {
     let patch = TaskPatch {
         title: Field::Set(buffer),
@@ -1352,7 +1356,7 @@ fn submit_edit_title<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, bu
     match core.update_task(id, patch) {
         Ok(tasks) => {
             if let Some(updated) = tasks.iter().find(|task| task.id == id) {
-                if let Some(row) = app.rows.iter_mut().find(|row| row.id == id) {
+                for row in app.rows.iter_mut().filter(|row| row.id == id) {
                     row.title.clone_from(&updated.title);
                 }
                 if let Some(cached) = app.tasks.iter_mut().find(|cached| cached.id == id) {
@@ -1773,6 +1777,48 @@ mod tests {
         assert_eq!(app.pane(), Pane::Detail);
         assert_eq!(app.rows()[0].title, "New title");
         assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn apply_action_submit_insert_edit_title_should_update_every_row_of_multi_parent_task() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let c = child_of(&mut core, "C", a.id);
+        core.set_parents(c.id, vec![a.id, b.id])
+            .expect("set_parents should succeed");
+        let mut app = app_from_core(&mut core);
+        select_under(&mut app, c.id, Some(b.id));
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        let _ = apply_action(&mut app, &mut core, Action::StartEditTitle);
+        assert_eq!(
+            app.mode(),
+            &Mode::Insert {
+                field: EditableField::Title(c.id),
+                buffer: "C".to_string(),
+            },
+            "editing from the second copy should target C's title"
+        );
+        let _ = apply_action(&mut app, &mut core, Action::Backspace);
+        for ch in "Renamed".chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(ch));
+        }
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        let titles: Vec<&str> = app
+            .rows()
+            .iter()
+            .filter(|row| row.id == c.id)
+            .map(|row| row.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Renamed", "Renamed"],
+            "every rendered copy of C should show the new title"
+        );
     }
 
     #[test]
@@ -2757,6 +2803,63 @@ mod tests {
         assert_eq!(app.error(), None);
     }
 
+    /// Returns the status of every rendered row of `id`, asserting the task
+    /// is rendered exactly twice (once per parent).
+    fn statuses_of_two_copies(app: &App, id: TaskId) -> Vec<TaskStatus> {
+        let statuses: Vec<TaskStatus> = app
+            .rows()
+            .iter()
+            .filter(|row| row.id == id)
+            .map(|row| row.status)
+            .collect();
+        assert_eq!(statuses.len(), 2, "task should be rendered once per parent");
+        statuses
+    }
+
+    #[test]
+    fn apply_action_toggle_complete_should_update_every_row_of_multi_parent_task() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let c = child_of(&mut core, "C", a.id);
+        core.set_parents(c.id, vec![a.id, b.id])
+            .expect("set_parents should succeed");
+        let mut app = app_from_core(&mut core);
+        select_under(&mut app, c.id, Some(b.id));
+
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        assert_eq!(
+            statuses_of_two_copies(&app, c.id),
+            vec![TaskStatus::Complete, TaskStatus::Complete]
+        );
+    }
+
+    #[test]
+    fn apply_action_toggle_complete_should_reopen_every_row_of_multi_parent_task() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let c = child_of(&mut core, "C", a.id);
+        core.set_parents(c.id, vec![a.id, b.id])
+            .expect("set_parents should succeed");
+        core.complete_task(c.id, false)
+            .expect("complete_task should succeed");
+        let mut app = app_from_core(&mut core);
+        select_under(&mut app, c.id, Some(b.id));
+
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        assert_eq!(
+            statuses_of_two_copies(&app, c.id),
+            vec![TaskStatus::Incomplete, TaskStatus::Incomplete]
+        );
+    }
+
     #[test]
     fn apply_action_toggle_complete_with_incomplete_children_should_enter_confirm_mode_with_cascade_prompt()
      {
@@ -2849,6 +2952,33 @@ mod tests {
         let child_row = app.rows().iter().find(|row| row.id == child.id).unwrap();
         assert_eq!(parent_row.status, TaskStatus::Complete);
         assert_eq!(child_row.status, TaskStatus::Complete);
+    }
+
+    #[test]
+    fn apply_action_confirm_yes_complete_cascade_should_update_every_row_of_multi_parent_descendant()
+     {
+        let mut core = core();
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let c = child_of(&mut core, "C", p.id);
+        core.set_parents(c.id, vec![p.id, b.id])
+            .expect("set_parents should succeed");
+        let mut app = app_from_core(&mut core);
+        assert_eq!(titles(&app), vec!["P", "C", "B", "C"]);
+        select_under(&mut app, p.id, None);
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+        assert!(matches!(app.mode(), Mode::Confirm { .. }));
+
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        let p_row = app.rows().iter().find(|row| row.id == p.id).expect("P row");
+        assert_eq!(p_row.status, TaskStatus::Complete);
+        assert_eq!(
+            statuses_of_two_copies(&app, c.id),
+            vec![TaskStatus::Complete, TaskStatus::Complete]
+        );
     }
 
     #[test]
