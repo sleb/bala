@@ -8,6 +8,7 @@ use bala_core::{
     Parents, Placement, Store, StoreError, StoreTx, Task, TaskId, TaskType, TreeFilter, User,
     UserId,
 };
+use refinery::Runner;
 use rusqlite::Connection;
 
 use crate::{edges, schema, task, types, user};
@@ -37,10 +38,12 @@ impl SqliteStore {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the file can't be opened, or if migrations fail.
+    /// Returns `Err` if the file can't be opened, if migrations fail, or if
+    /// any stored row violates a foreign key (`PRAGMA foreign_key_check`
+    /// reports at least one violation).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path).map_err(task::sqlite_err)?;
-        Self::init(conn, true)
+        Self::init(conn, true, &schema::runner())
     }
 
     /// In-memory (`:memory:`) store — same migrations, no file. Intended
@@ -48,28 +51,102 @@ impl SqliteStore {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if migrations fail.
+    /// Returns `Err` if migrations fail, or if any stored row violates a
+    /// foreign key (`PRAGMA foreign_key_check` reports at least one
+    /// violation).
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory().map_err(task::sqlite_err)?;
-        Self::init(conn, false)
+        Self::init(conn, false, &schema::runner())
     }
 
-    /// Shared setup for both constructors: pragmas, then migrations (which
-    /// also seed the default task type — see `migrations/V1__init.sql`).
-    fn init(mut conn: Connection, wal: bool) -> Result<Self, StoreError> {
-        conn.pragma_update(None, "foreign_keys", "ON")
+    /// Shared setup for both constructors: foreign keys off, WAL if
+    /// requested, `migrations` (the constructors pass [`schema::runner`],
+    /// whose baseline also seeds the default task type — see
+    /// `migrations/V1__init.sql`), then foreign keys back on for every
+    /// transaction the store runs afterwards, then a foreign-key check of
+    /// every stored row.
+    fn init(mut conn: Connection, wal: bool, migrations: &Runner) -> Result<Self, StoreError> {
+        // Foreign keys must be off while migrations run: a table-rebuild
+        // migration (create-copy-drop-rename of a referenced table such as
+        // `tasks`) drops a table that other tables reference, which fails
+        // while any referencing row exists. Setting OFF explicitly is
+        // required because rusqlite's bundled SQLite is compiled with foreign
+        // keys on by default, and it can't live in the migration SQL because
+        // the pragma is a no-op inside a transaction and refinery wraps each
+        // migration in one.
+        conn.pragma_update(None, "foreign_keys", "OFF")
             .map_err(task::sqlite_err)?;
         if wal {
             conn.pragma_update(None, "journal_mode", "WAL")
                 .map_err(task::sqlite_err)?;
         }
-        schema::runner()
+        migrations
             .run(&mut conn)
-            .map_err(|err| StoreError::Backend(err.to_string()))?;
+            .map_err(|err| migration_err(&err))?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(task::sqlite_err)?;
+        check_foreign_keys(&conn)?;
         Ok(Self {
             conn: RefCell::new(conn),
         })
     }
+}
+
+/// Maps a refinery error to [`StoreError::Backend`].
+///
+/// An applied migration whose text differs from this build's means the
+/// database was created from an earlier version of the schema baseline,
+/// which is rewritten in place until the first release (LLD-2 §Schema,
+/// Migration policy). Such a database can't be migrated, so the message
+/// says how to recover. A migration missing from this build gets no such
+/// hint: that is an older build opening a newer database, where deleting
+/// it would be the wrong advice.
+fn migration_err(err: &refinery::Error) -> StoreError {
+    let message = match err.kind() {
+        refinery::error::Kind::DivergentVersion(..) => format!(
+            "{err}: the database was created from an earlier schema baseline; \
+             delete the database file and a new one is created on next open"
+        ),
+        _ => err.to_string(),
+    };
+    StoreError::Backend(message)
+}
+
+/// Fails if `PRAGMA foreign_key_check` reports any violation.
+///
+/// Migrations run with foreign keys off, and SQLite doesn't re-validate
+/// existing rows when they are turned back on, so a dangling reference
+/// (from a migration or from a file written with foreign keys off) would
+/// otherwise go unnoticed until some later write trips over it. The error
+/// names the violation count and the first violation's table, rowid (absent
+/// for a `WITHOUT ROWID` table) and referenced table.
+fn check_foreign_keys(conn: &Connection) -> Result<(), StoreError> {
+    let mut stmt = conn
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(task::sqlite_err)?;
+    let mut violations = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(task::sqlite_err)?;
+    // Only the first violation is reported, so the rest are counted, not kept.
+    let Some(first) = violations.next() else {
+        return Ok(());
+    };
+    let (table, rowid, parent) = first.map_err(task::sqlite_err)?;
+    let mut count = 1_usize;
+    for violation in violations {
+        violation.map_err(task::sqlite_err)?;
+        count += 1;
+    }
+    let row = rowid.map_or_else(|| "a row".to_owned(), |rowid| format!("rowid {rowid}"));
+    Err(StoreError::Backend(format!(
+        "database has {count} foreign-key violation(s); first: {table} {row} references a missing {parent} row"
+    )))
 }
 
 impl Store for SqliteStore {
@@ -163,6 +240,7 @@ mod tests {
     use super::*;
     use bala_core::TaskStatus;
     use chrono::Utc;
+    use refinery::Migration;
     use uuid::Uuid;
 
     // `User`/`UserId` are already brought in via `super::*` (this module's
@@ -544,6 +622,137 @@ mod tests {
     }
 
     #[test]
+    fn open_should_run_a_rebuild_migration_over_referenced_rows() {
+        // A child table references a parent table the same way
+        // `parent_edges` references `tasks`; the second migration rebuilds
+        // the parent (create-copy-drop-rename), which only succeeds with
+        // foreign keys off while migrations run.
+        const BASE: &str = "
+            CREATE TABLE parents (id BLOB PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE children (
+                parent_id BLOB REFERENCES parents(id),
+                child_id  BLOB NOT NULL REFERENCES parents(id)
+            );";
+        const REBUILD: &str = "
+            CREATE TABLE parents_rebuilt (id BLOB PRIMARY KEY, name TEXT NOT NULL, note TEXT);
+            INSERT INTO parents_rebuilt (id, name) SELECT id, name FROM parents;
+            DROP TABLE parents;
+            ALTER TABLE parents_rebuilt RENAME TO parents;";
+        let base = || Migration::unapplied("V1__base", BASE).unwrap();
+        let rebuild = Migration::unapplied("V2__rebuild_parents", REBUILD).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rebuild.db");
+        drop(
+            SqliteStore::init(
+                Connection::open(&path).unwrap(),
+                true,
+                &Runner::new(&[base()]),
+            )
+            .unwrap(),
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO parents (id, name) VALUES (x'01', 'parent'), (x'02', 'child');
+                 INSERT INTO children (parent_id, child_id) VALUES (x'01', x'02');",
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::init(
+            Connection::open(&path).unwrap(),
+            true,
+            &Runner::new(&[base(), rebuild]),
+        )
+        .unwrap();
+
+        let conn = store.conn.borrow();
+        let parents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parents", [], |row| row.get(0))
+            .unwrap();
+        let edge: (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT c.parent_id, c.child_id FROM children c
+                 JOIN parents p ON p.id = c.parent_id
+                 JOIN parents q ON q.id = c.child_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(parents, 2);
+        assert_eq!(edge, (vec![1], vec![2]));
+    }
+
+    #[test]
+    fn open_should_fail_when_stored_rows_violate_a_foreign_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dangling.db");
+        let blob = crate::convert::id_to_blob;
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            schema::runner().run(&mut conn).unwrap();
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            conn.execute(
+                "INSERT INTO parent_edges (parent_id, child_id, position) VALUES (?1, ?2, 0)",
+                rusqlite::params![
+                    blob(TaskId::new()).as_slice(),
+                    blob(TaskId::new()).as_slice()
+                ],
+            )
+            .unwrap();
+        }
+
+        let err = SqliteStore::open(&path).unwrap_err();
+
+        let StoreError::Backend(message) = err;
+        assert!(message.contains("parent_edges"), "message: {message}");
+        // Both the dangling parent and the dangling child are violations.
+        assert!(
+            message.contains("2 foreign-key violation(s)"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
+    fn open_should_suggest_a_reset_when_the_applied_baseline_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old-baseline.db");
+        let old_baseline =
+            Migration::unapplied("V1__init", "CREATE TABLE t (id INTEGER);").unwrap();
+        drop(
+            SqliteStore::init(
+                Connection::open(&path).unwrap(),
+                true,
+                &Runner::new(&[old_baseline]),
+            )
+            .unwrap(),
+        );
+
+        let err = SqliteStore::open(&path).unwrap_err();
+
+        let StoreError::Backend(message) = err;
+        assert!(message.contains("is different than"), "message: {message}");
+        assert!(
+            message.contains("delete the database file"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
+    fn open_should_leave_foreign_keys_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&dir.path().join("bala.db")).unwrap();
+
+        let enabled: i64 = store
+            .conn
+            .borrow()
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(enabled, 1);
+    }
+
+    #[test]
     fn put_task_type_then_get_task_types_returns_it() {
         let store = SqliteStore::open_in_memory().unwrap();
         let task_type = goal_type();
@@ -775,8 +984,8 @@ mod tests {
 
     #[test]
     fn put_task_should_fail_when_assignee_id_references_nonexistent_user() {
-        // Confirms the FK added by `migrations/V2__add_users.sql`
-        // (`assignee_id BLOB REFERENCES users(id)`) is actually enforced,
+        // Confirms the FK `tasks.assignee_id BLOB REFERENCES users(id)`
+        // (`migrations/V1__init.sql`) is actually enforced,
         // mirroring `replace_parent_edges_referencing_nonexistent_task_fails_foreign_key_check`'s
         // reasoning: `PRAGMA foreign_keys = ON` is set on every connection
         // (LLD-2 §Schema), so a task naming a user id that was never

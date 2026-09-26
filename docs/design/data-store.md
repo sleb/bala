@@ -30,7 +30,7 @@ implementation:
   index trees. `rusqlite` over `sqlx`/`diesel`: `Store` is a synchronous
   trait (matching the CLI's synchronous, single-process, single-writer
   world per Core LLD §Storage Boundary), so an async client buys nothing
-  but runtime weight; and the schema is four tables with hand-writable
+  but runtime weight; and the schema is five tables with hand-writable
   queries, not enough surface to justify an ORM's codegen ceremony.
 - **IDs: `BLOB(16)`, raw UUID bytes.** Compact, indexable, and — despite
   being opaque as raw bytes — still inspectable ad hoc via the `sqlite3`
@@ -52,9 +52,10 @@ open question it surfaces back to Core LLD (§Open Questions).
 
 `bala-store` is a single crate exposing one public type, `SqliteStore`,
 implementing Core LLD's `Store` trait. Internally it mirrors the trait's
-four concerns as modules: `schema` (DDL + migrations), `task` (task-row
+five concerns as modules: `schema` (DDL + migrations), `task` (task-row
 read/write), `edges` (parent + dependency edge queries), `types`
-(`TaskType` CRUD).
+(`TaskType` CRUD), `user` (`User` CRUD); `convert` holds the shared
+row/column conversions.
 
 ```mermaid
 flowchart TB
@@ -65,6 +66,7 @@ flowchart TB
         TaskMod["task\n(row <-> Task mapping)"]
         Edges["edges\n(parent_edges, dependency_edges)"]
         Types["types\n(task_types CRUD)"]
+        Users["user\n(users CRUD)"]
     end
     Core["bala-core\n(Core Library LLD)"] -- "Store trait" --> SqliteStore
     SqliteStore -- "opens" --> Schema
@@ -72,9 +74,11 @@ flowchart TB
     SqliteTx --> TaskMod
     SqliteTx --> Edges
     SqliteTx --> Types
+    SqliteTx --> Users
     TaskMod --> DB[("bala.db\n(single SQLite file, WAL mode)")]
     Edges --> DB
     Types --> DB
+    Users --> DB
 ```
 
 `SqliteStore` holds a single `rusqlite::Connection` wrapped in a
@@ -94,15 +98,25 @@ caller needs.
 
 ## Schema
 
-Four tables, matching the four concerns in Core LLD's `StoreTx` trait
-one-for-one. Dates are stored as ISO-8601 `TEXT` (`NaiveDate` →
-`YYYY-MM-DD`, `DateTime<Utc>` → RFC 3339) rather than integer epoch —
+Five tables (task types, users, tasks, parent edges, dependency edges),
+matching the concerns in Core LLD's `StoreTx` trait one-for-one. Dates are
+stored as ISO-8601 `TEXT` (`NaiveDate` → `YYYY-MM-DD`, `DateTime<Utc>` →
+RFC 3339) rather than integer epoch —
 sortable as plain strings, and readable directly in `sqlite3` without a
 conversion function, which matters for a local single-user app someone
 may reasonably inspect by hand.
 
+The schema is created by a single baseline migration,
+`bala-store/migrations/V1__init.sql`, reproduced here (keep the two in
+sync):
+
 ```sql
--- schema/V1__init.sql
+-- Bala schema baseline (docs/design/data-store.md §Schema).
+--
+-- Some columns and tables are not read by `bala-core` yet
+-- (`dependency_edges`; `tasks.assignee_id`, `out_of_sync`, `completed_at`,
+-- `deleted_at`). They are part of the designed schema so the features that
+-- use them need no table rebuild.
 
 CREATE TABLE task_types (
     key         TEXT PRIMARY KEY,
@@ -124,7 +138,7 @@ CREATE TABLE tasks (
     status        TEXT NOT NULL CHECK (status IN ('incomplete', 'complete')),
     start_date    TEXT,                      -- ISO-8601 date
     due_date      TEXT,
-    assignee_id   BLOB,
+    assignee_id   BLOB REFERENCES users(id),
     out_of_sync   INTEGER NOT NULL DEFAULT 0, -- 0/1
     created_at    TEXT NOT NULL,              -- RFC 3339 UTC
     updated_at    TEXT NOT NULL,
@@ -137,21 +151,28 @@ CREATE INDEX idx_tasks_type_live     ON tasks(type_key)     WHERE deleted_at IS 
 CREATE INDEX idx_tasks_status_live   ON tasks(status)       WHERE deleted_at IS NULL;
 CREATE INDEX idx_tasks_assignee_live ON tasks(assignee_id)  WHERE deleted_at IS NULL;
 
-CREATE TABLE parent_edges (          -- as of V3 (#45)
+-- Every task has at least one parent edge, and every edge a sibling position.
+--
+--  * A top-level task has exactly one edge, with `parent_id IS NULL`.
+--  * `position` (0-based, per parent; NULL parent = the root list) orders
+--    siblings.
+--  * "Exactly one NULL edge XOR one-or-more real edges" is enforced in code
+--    (`Parents` + `replace_parent_edges`), not by triggers; the schema only
+--    guarantees at most one NULL edge per child and no duplicate real edge.
+CREATE TABLE parent_edges (
     parent_id BLOB REFERENCES tasks(id),           -- NULL = top level
     child_id  BLOB NOT NULL REFERENCES tasks(id),
-    position  INTEGER NOT NULL                     -- 0-based order among the parent's children
+    position  INTEGER NOT NULL
 );
--- A top-level task has exactly one edge with parent_id IS NULL; the NULL
--- "parent" is its own sibling list (the roots). No duplicate real edge:
+
 CREATE UNIQUE INDEX idx_parent_edges_real_pair ON parent_edges(parent_id, child_id)
-    WHERE parent_id IS NOT NULL;
-CREATE UNIQUE INDEX idx_parent_edges_one_null  ON parent_edges(child_id)
-    WHERE parent_id IS NULL;
-CREATE INDEX idx_parent_edges_child ON parent_edges(child_id);                 -- "parents of X"
-                                                                                -- (hierarchy upward walk, §1)
-CREATE INDEX idx_parent_edges_parent_pos ON parent_edges(parent_id, position); -- ordered "children of X"
-                                                                                -- (rollup, subtree delete; roots when NULL)
+    WHERE parent_id IS NOT NULL;                                        -- no duplicate real edge
+CREATE UNIQUE INDEX idx_parent_edges_one_null ON parent_edges(child_id)
+    WHERE parent_id IS NULL;                                            -- at most one NULL edge
+CREATE INDEX idx_parent_edges_child ON parent_edges(child_id);            -- parents of X
+                                                                          -- (hierarchy upward walk, Core LLD §Algorithm 1)
+CREATE INDEX idx_parent_edges_parent_pos ON parent_edges(parent_id, position); -- ordered children of X
+                                                                          -- (rollup, subtree delete)
 
 CREATE TABLE dependency_edges (
     predecessor_id BLOB NOT NULL REFERENCES tasks(id),
@@ -163,47 +184,79 @@ CREATE TABLE dependency_edges (
                                                  -- add_dependency_edge upserts, doesn't duplicate
 );
 -- PK's leading column (predecessor_id) indexes "what depends on X"
--- (cascade forward-propagation, §3; list_successor_edges). Reverse needs
--- its own index:
+-- (cascade forward-propagation, Core LLD §Algorithm 3; list_successor_edges).
+-- Reverse needs its own index:
 CREATE INDEX idx_dependency_edges_successor ON dependency_edges(successor_id); -- "what does X depend on"
-                                                                                -- (dependency validity walk, §2;
+                                                                                -- (dependency validity walk, Core LLD §Algorithm 2;
                                                                                 -- list_dependency_edges)
+
+-- Seed the default "task" TaskType every `Core` expects to exist.
+-- `bala-core`'s `Core::new` also seeds it idempotently, but seeding it here
+-- keeps a fresh store usable standalone (e.g. from `sqlite3`). `INSERT OR
+-- IGNORE` keeps this compatible with `Core::new`'s own check.
+INSERT OR IGNORE INTO task_types (key, label, color, sort_order)
+VALUES ('task', 'Task', NULL, 0);
 ```
 
-`PRAGMA foreign_keys = ON` and `PRAGMA journal_mode = WAL` are set on
-every connection open — `WAL` for better read/write interleaving even
-though writes are already single-threaded (readers, e.g. a future `get_tree`
-call mid-transaction from the same process, don't block on it), and
-`foreign_keys` as a free, always-on defense-in-depth check that no edge
-or task row can reference a nonexistent id — invariants Core LLD already
-enforces in Rust before writing, but a DB-level constraint catches a
-`bala-store` bug (not a `bala-core` caller bug) that skips the trait.
+`PRAGMA journal_mode = WAL` is set on every file-backed connection open,
+for better read/write interleaving even though writes are already
+single-threaded (readers, e.g. a future `get_tree` call mid-transaction from
+the same process, don't block on it). `PRAGMA foreign_keys = ON` is in force
+for every transaction the store runs after open, as a free, always-on
+defense-in-depth check that no edge or task row can reference a nonexistent
+id — invariants Core LLD already enforces in Rust before writing, but a
+DB-level constraint catches a `bala-store` bug (not a `bala-core` caller bug)
+that skips the trait. Turning foreign keys on doesn't re-validate rows
+already stored, so on every open (not only when a migration was applied),
+after migrating and re-enabling foreign keys, `open` runs `PRAGMA
+foreign_key_check` and fails with `StoreError::Backend` on any violation,
+naming the violation count and the first one's table, rowid and referenced
+table. A dangling reference, whether left by a migration or written by
+another client with foreign keys off, is reported at open rather than
+surfacing later as a confusing failure on some unrelated write.
 
-**`migrations/V2__add_users.sql` ([#9](https://github.com/sleb/bala/issues/9)).** SQLite can't
-`ALTER TABLE ... ADD COLUMN ... REFERENCES ...` — a `REFERENCES` clause
-can only be declared when a column is first created, and `tasks.assignee_id`
-already exists (untyped `BLOB`, no FK) from V1. Giving it the FK the
-Core LLD's user-validation invariant now depends on means the standard
-SQLite "add a constraint to an existing column" rebuild: create the new
-`users` table; rename `tasks` out of the way; create a new `tasks` table
-identical to V1's except `assignee_id BLOB REFERENCES users(id)`; copy
-every row across with a plain `INSERT INTO tasks SELECT ... FROM
-tasks_old`; drop `tasks_old`; and recreate `idx_tasks_type_live`,
-`idx_tasks_status_live`, and `idx_tasks_assignee_live` against the new
-table, since `DROP TABLE` takes its indexes with it. No existing row can
-violate the new FK (V1 never populated `assignee_id`), so the copy step
-needs no data migration beyond the straight copy.
+Migrations, however, run with foreign keys **off**: `SqliteStore` sets
+`foreign_keys = OFF`, then WAL, runs the migrations, and only then sets
+`foreign_keys = ON`. A table-rebuild migration (SQLite's
+create-copy-drop-rename recipe for changes `ALTER TABLE` can't make, such as
+adding a `REFERENCES` clause to an existing column) drops a table and renames
+a replacement into its place. Rebuilding a referenced table such as `tasks`
+drops it while `parent_edges`/`dependency_edges` rows still reference it,
+which fails with `FOREIGN KEY constraint failed` if foreign keys are on. (The
+order matters too: create the replacement under a temporary name, drop the
+original, then rename the replacement into the freed name. Renaming the
+original out of the way first would make SQLite rewrite the referencing
+tables' `REFERENCES` clauses to the temporary name.) The `OFF` must be
+explicit because rusqlite's `bundled` SQLite is compiled with
+`SQLITE_DEFAULT_FOREIGN_KEYS=1`, so a new connection starts with them on. It
+can't live in the migration SQL either: the pragma is a no-op inside a
+transaction, and refinery runs each migration in its own.
 
-**`migrations/V3__parent_edge_positions.sql` ([#45](https://github.com/sleb/bala/issues/45)).** Table rebuild
-like V2 (nothing references `parent_edges`, so create-copy-drop-rename):
-`parent_id` becomes nullable, `position` is added, and the primary key is
-replaced by the two partial unique indexes above. Backfill numbers each
-parent's children 0.. by the child's `created_at`, tie-broken by `id`, and
-gives every task with no edge (live or tombstoned) a NULL edge, numbered the
-same way among the roots. The invariant "exactly one NULL edge XOR one or
-more real edges per task" is **not** a DB constraint (no triggers): it holds
-because `Parents` cannot express a mix and `replace_parent_edges` is the only
-writer; the schema only forbids a second NULL edge or a duplicate real edge.
+**Migration policy.** Until the first release, `V1__init.sql` is a moving
+baseline: schema changes edit it in place rather than adding a migration,
+and an existing database is reset (delete `bala.db`; see
+[`docs/config.md`](../config.md) for its location) rather than migrated. At
+the first release the baseline is frozen. From then on migrations are only
+added, never edited, because refinery checksums each applied migration's
+full text, comments included, and refuses to open a database whose applied
+migration differs from the embedded file. `SqliteStore` adds a
+"delete the database file" hint to that error (and only that one: a
+migration missing from the build means an older build is opening a newer
+database, where deleting it would be wrong); the hint goes when the baseline
+is frozen.
+
+**`users` and `tasks.assignee_id`.** `tasks.assignee_id` references
+`users(id)`, so a task can only name a user that was stored with `put_user`;
+the Core LLD's user-validation invariant relies on this FK.
+
+**`parent_edges` invariant.** Every task has parent edges: a top-level task
+has exactly one edge with `parent_id IS NULL` (the NULL "parent" is the root
+sibling list), and a subtask has one or more real edges. `position` orders a
+parent's children 0.. (the roots when the parent is NULL). The invariant
+"exactly one NULL edge XOR one or more real edges per task" is **not** a DB
+constraint (no triggers): it holds because `Parents` cannot express a mix and
+`replace_parent_edges` is the only writer; the schema only forbids a second
+NULL edge or a duplicate real edge, via the two partial unique indexes.
 
 Deletion is soft-delete only (Core LLD §Context, resolved there): `DELETE
 FROM tasks` is never issued by this crate outside of the (unused today)
@@ -380,9 +433,11 @@ fine at hundreds of rows.
 
 ## Testing Strategy
 
-- Every test opens a fresh `SqliteStore::open_in_memory()` (migrations
-  applied, no filesystem I/O) — fast enough to run one store per test
-  rather than sharing state.
+- Every test opens a fresh store — fast enough to run one store per test
+  rather than sharing state. Most use `SqliteStore::open_in_memory()`
+  (migrations applied, no filesystem I/O); tests of the open path itself
+  (pragmas, migrations over existing rows, `foreign_key_check`) use a
+  `tempfile` database, since they need to reopen the same file.
 - `StoreTx` methods are tested directly against `SqliteStore`, one test
   module per table group (`task`, `edges`, `types`), named for behavior
   per the repo's existing convention (LLD-core-library.md §Testing
@@ -411,6 +466,15 @@ fine at hundreds of rows.
 foreign_keys` constraint, confirming it's actually enabled per
   connection (a common `rusqlite` footgun — the pragma must be set on
   every new connection, it isn't a database-file-level setting).
+- **Migrations against populated databases**: open-time migration handling
+  is tested against a file-backed database that already contains rows, not
+  only an empty one — `open_should_run_a_rebuild_migration_over_referenced_rows`
+  hands `SqliteStore`'s setup a synthetic two-migration runner (a parent
+  table and a child table referencing it, rows inserted between the two,
+  then a create-copy-drop-rename rebuild of the parent) and checks the rows
+  and the reference survive. An empty database can't exercise failures that
+  depend on existing data, such as a table rebuild dropping a table other
+  rows still reference.
 - A perf smoke test seeding 200+ tasks with a realistic edge density and
   asserting `list_tasks`/`get_tree`'s query count stays at the fixed
   small number in §Query Strategy regardless of `N` (not a query-plan

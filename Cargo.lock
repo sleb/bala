@@ -145,6 +145,7 @@ dependencies = [
  "chrono",
  "refinery",
  "rusqlite",
+ "tempfile",
  "uuid",
 ]
 

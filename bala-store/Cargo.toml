@@ -13,3 +13,6 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 refinery = { version = "0.9", features = ["rusqlite"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
