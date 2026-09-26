@@ -124,7 +124,7 @@ fn check_foreign_keys(conn: &Connection) -> Result<(), StoreError> {
     let mut stmt = conn
         .prepare("PRAGMA foreign_key_check")
         .map_err(task::sqlite_err)?;
-    let violations = stmt
+    let mut violations = stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -132,16 +132,20 @@ fn check_foreign_keys(conn: &Connection) -> Result<(), StoreError> {
                 row.get::<_, String>(2)?,
             ))
         })
-        .map_err(task::sqlite_err)?
-        .collect::<Result<Vec<_>, _>>()
         .map_err(task::sqlite_err)?;
-    let Some((table, rowid, parent)) = violations.first() else {
+    // Only the first violation is reported, so the rest are counted, not kept.
+    let Some(first) = violations.next() else {
         return Ok(());
     };
+    let (table, rowid, parent) = first.map_err(task::sqlite_err)?;
+    let mut count = 1_usize;
+    for violation in violations {
+        violation.map_err(task::sqlite_err)?;
+        count += 1;
+    }
     let row = rowid.map_or_else(|| "a row".to_owned(), |rowid| format!("rowid {rowid}"));
     Err(StoreError::Backend(format!(
-        "database has {count} foreign-key violation(s); first: {table} {row} references a missing {parent} row",
-        count = violations.len(),
+        "database has {count} foreign-key violation(s); first: {table} {row} references a missing {parent} row"
     )))
 }
 
@@ -702,6 +706,11 @@ mod tests {
 
         let StoreError::Backend(message) = err;
         assert!(message.contains("parent_edges"), "message: {message}");
+        // Both the dangling parent and the dangling child are violations.
+        assert!(
+            message.contains("2 foreign-key violation(s)"),
+            "message: {message}"
+        );
     }
 
     #[test]
