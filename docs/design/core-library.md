@@ -259,7 +259,7 @@ impl<S: Store> Core<S> {
     pub fn list_users(&self) -> Result<Vec<User>, CoreError>;
     pub fn create_task(&mut self, new: NewTask) -> Result<Task, CoreError>;
     pub fn update_task(&mut self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError>;
-    pub fn delete_task(&mut self, id: TaskId, mode: DeleteMode) -> Result<Vec<Task>, CoreError>;
+    pub fn delete_task(&mut self, id: TaskId, mode: DeleteMode) -> Result<DeleteOutcome, CoreError>;
     pub fn restore_task(&mut self, id: TaskId) -> Result<Task, CoreError>;
     pub fn set_parents(&mut self, id: TaskId, new_parents: Vec<TaskId>) -> Result<Task, CoreError>;
     pub fn move_sibling(&mut self, parent: Option<TaskId>, id: TaskId, direction: Direction) -> Result<bool, CoreError>;
@@ -284,6 +284,11 @@ impl<S: Store> Core<S> {
 }
 
 pub enum DeleteMode { Subtree, PromoteChildren }
+
+pub struct DeleteOutcome {
+    pub deleted: Vec<Task>, // tombstoned by this call
+    pub updated: Vec<Task>, // survived, but its own fields changed
+}
 ```
 
 `DeleteMode` and `complete_task`'s `cascade: bool` are the two places this
@@ -296,13 +301,26 @@ With multiple parents, `DeleteMode::Subtree` only ever removes
 edge for every child X, and X itself is only soft-deleted (tombstoned)
 once that leaves it with an empty `parent_ids` — i.e. A was its only
 parent. A child still reachable through another live parent (e.g. it's
-also under Goal B) stays untouched, just with one less parent, so
-deleting a goal can never silently delete a task that another goal still
-needs. `PromoteChildren` follows the same rule in reverse: A's parent
-edge on each child is replaced with an edge to A's own parents (or
-dropped, making the child top-level, if A had none) — for a child with
-other parents besides A, that's one more edge added alongside the ones
-it already keeps.
+also under Goal B) keeps existing (not tombstoned), just with one less
+parent edge, so deleting a goal can never silently delete a task that
+another goal still needs. `PromoteChildren` follows the same rule in
+reverse: A's parent edge on each child is replaced with an edge to A's
+own parents (or dropped, making the child top-level, if A had none) —
+for a child with other parents besides A, that's one more edge added
+alongside the ones it already keeps.
+
+`delete_task` reports what it changed as a `DeleteOutcome` rather than
+one mixed list, so no caller has to partition on `deleted_at` itself:
+`deleted` holds every task the call tombstoned, `updated` every task that
+survived but whose own fields changed — a `Subtree` child that lost the
+A→X edge but is still under another parent, or a `PromoteChildren` child
+reparented onto A's parents. Both lists hold only tasks whose own stored
+row changed, each at most once and at its final value, and no id is in
+both: a child that first survives one dropped edge and is later left
+parentless by the same walk (e.g. A→X, A→D, D→X) is reported only in
+`deleted`. A parent whose rolled-up `progress` changed only because its
+children changed (e.g. B, once the shared X loses A) is in neither list;
+a caller showing it re-fetches it.
 
 `move_sibling(parent, id, Direction::{Up,Down})` reorders `id` by one
 place within `parent`'s children (`None` = top level) in a single

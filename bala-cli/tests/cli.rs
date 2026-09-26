@@ -434,6 +434,55 @@ fn task_delete_task_with_subtasks_and_promote_children_should_keep_child_visible
 }
 
 #[test]
+fn task_delete_cascade_should_print_only_deleted_ids_not_a_surviving_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a_id = add_task(&db_path, &["--title", "Goal A"]);
+    let b_id = add_task(&db_path, &["--title", "Goal B"]);
+    add_task(
+        &db_path,
+        &[
+            "--title",
+            "Shared child",
+            "--parent",
+            &a_id,
+            "--parent",
+            &b_id,
+        ],
+    );
+
+    let output = bala_cmd(&db_path)
+        .args(["task", "delete", &a_id, "--cascade", "--yes"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(String::from_utf8(output).unwrap(), format!("{a_id}\n"));
+}
+
+#[test]
+fn task_delete_promote_children_should_print_only_the_deleted_task_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+
+    let output = bala_cmd(&db_path)
+        .args(["task", "delete", &parent_id, "--promote-children", "--yes"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(String::from_utf8(output).unwrap(), format!("{parent_id}\n"));
+}
+
+#[test]
 fn task_restore_should_bring_task_back_into_ls() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("bala.db");

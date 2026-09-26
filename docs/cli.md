@@ -274,6 +274,7 @@ If the task has subtasks and neither `--cascade` nor `--promote-children` is
 given, the command fails and lists the subtasks so you can choose a mode.
 
 Prints the id of each deleted task, one per line, on success.
+Subtasks that survive (another parent, or `--promote-children`) are not listed.
 
 ### `bala task restore`
 

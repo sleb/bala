@@ -467,8 +467,8 @@ fn run_task_delete(db_path: &Path, args: &DeleteArgs) -> Result<(), CliError> {
         return Ok(());
     }
 
-    let deleted = core.delete_task(target_id, mode)?;
-    for task in &deleted {
+    let outcome = core.delete_task(target_id, mode)?;
+    for task in &outcome.deleted {
         println!("{}", Uuid::from(task.id));
     }
     Ok(())
