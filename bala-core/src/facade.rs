@@ -115,7 +115,17 @@ impl<S: Store> Core<S> {
     /// - [`CoreError::UnknownUser`] if `new.assignee_id` is `Some` and
     ///   names no existing [`User`].
     /// - [`CoreError::Store`] if the backend fails.
+    ///
+    /// A duplicate id in `new.parent_ids` (e.g. a CLI/TUI caller passing
+    /// the same parent twice) is deduplicated up front, keeping the first
+    /// occurrence's position: it is existence-checked once, and
+    /// `task.parent_ids` and the written edges never contain a duplicate,
+    /// which matters because `render::task_rows` builds its child index
+    /// straight off `parent_ids` and would otherwise render the task twice
+    /// under the same parent.
     pub fn create_task(&mut self, new: NewTask) -> Result<Task, CoreError> {
+        let parent_ids = dedupe_parent_ids(new.parent_ids);
+
         if new.title.trim().is_empty() {
             return Err(CoreError::EmptyTitle);
         }
@@ -132,7 +142,7 @@ impl<S: Store> Core<S> {
             return Err(CoreError::InvalidDateRange { start, due });
         }
 
-        for &parent_id in &new.parent_ids {
+        for &parent_id in &parent_ids {
             let parent_exists = self
                 .store
                 .transaction(|tx| tx.get_task(parent_id))?
@@ -157,7 +167,7 @@ impl<S: Store> Core<S> {
             id: TaskId::new(),
             title: new.title,
             description: new.description,
-            parent_ids: new.parent_ids,
+            parent_ids,
             type_key,
             status: TaskStatus::Incomplete,
             progress: 0.0,
@@ -706,11 +716,7 @@ impl<S: Store> Core<S> {
     /// builds its child index straight off `parent_ids` and would otherwise
     /// render the task twice under the same parent.
     pub fn set_parents(&mut self, id: TaskId, new_parents: Vec<TaskId>) -> Result<Task, CoreError> {
-        let mut seen = std::collections::HashSet::new();
-        let new_parents: Vec<TaskId> = new_parents
-            .into_iter()
-            .filter(|parent| seen.insert(*parent))
-            .collect();
+        let new_parents = dedupe_parent_ids(new_parents);
 
         let task = self.store.transaction(|tx| {
             let Some(mut task) = tx.get_task(id)? else {
@@ -920,6 +926,16 @@ fn without(parents: &[TaskId], removed: Option<TaskId>) -> Vec<TaskId> {
         .iter()
         .copied()
         .filter(|p| Some(*p) != removed)
+        .collect()
+}
+
+/// `parent_ids` with every repeated id removed, keeping each id at its
+/// first occurrence's position.
+fn dedupe_parent_ids(parent_ids: Vec<TaskId>) -> Vec<TaskId> {
+    let mut seen = HashSet::with_capacity(parent_ids.len());
+    parent_ids
+        .into_iter()
+        .filter(|parent| seen.insert(*parent))
         .collect()
 }
 
@@ -1382,6 +1398,27 @@ mod tests {
         let deep_calls = calls.get() - before_deep;
 
         assert_eq!(deep_calls, shallow_calls);
+    }
+
+    #[test]
+    fn create_task_should_deduplicate_repeated_parent_ids_preserving_first_occurrence_order() {
+        let mut core = new_core();
+        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
+        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
+
+        let child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent_a.id, parent_b.id, parent_a.id],
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+
+        assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
+        let stored_parents = core
+            .store
+            .transaction(|tx| tx.list_parent_edges(child.id))
+            .unwrap();
+        assert_eq!(stored_parents, vec![parent_a.id, parent_b.id]);
     }
 
     #[test]
