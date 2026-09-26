@@ -315,11 +315,27 @@ Ask it to work through, and report on, each of:
    future story) against the plan's "out of scope" list — flag any
    that's a silent narrowing rather than something the plan already
    sanctioned.
-6. **Adversarial correctness/efficiency pass.** A green test suite only
-   proves the plan's own named tests pass — it says nothing about bug
-   classes nobody wrote a test for yet. Re-read every changed method
-   the way a reviewer looking for trouble would, not the way the author
-   who just made it pass would. Ask, for each one:
+6. **Adversarial correctness/efficiency pass, via `/code-review`.** A
+   green test suite only proves the plan's own named tests pass — it
+   says nothing about bug classes nobody wrote a test for yet. Invoke
+   `/code-review` (the `Skill` tool, name `code-review`, args `high`)
+   and follow it. Always pass the level explicitly — with none, it
+   reuses whatever level was typed last. With no target it reviews the
+   current diff, which is where the whole story lives, since nothing is
+   committed until Phase 5; if this is a resume and the branch already
+   carries commits from an earlier session, make sure those are reviewed
+   too (also run it with the branch as the target). Do **not** pass
+   `--fix` or `--comment`: every finding goes through the fix-vs-flag
+   triage below instead of being applied wholesale, and there's no PR
+   to comment on yet. Include every finding it reports, verbatim, in
+   the report back — its findings UI isn't visible to the parent.
+
+   `/code-review` is generic; it doesn't know which bug shapes have
+   slipped through *this* process before. So after it finishes, re-read
+   every changed method once more with the questions below (skip any a
+   `/code-review` finding already covered), the way a reviewer looking
+   for trouble would, not the way the author who just made it pass
+   would. Ask, for each one:
    - **Could two of its `Store` calls interleave with someone else's
      write?** Any method that reads state, decides something from it,
      and then writes needs that whole sequence atomic — one
@@ -366,9 +382,10 @@ Ask it to work through, and report on, each of:
    author under a slightly different input, trust that instinct and dig
    in rather than waiting for it to match a named category.
 
-For anything it's confident is a genuine, narrowly-scoped bug (matching
-the shapes in step 6, or an outright contradiction between two
-checkpoints), tell it to fix it directly — write the regression test
+For anything it's confident is a genuine, narrowly-scoped bug (a
+`/code-review` finding it has verified, one matching the shapes in step
+6, or an outright contradiction between two checkpoints), tell it to
+fix it directly — write the regression test
 first, then the fix, then re-run the full suite — the same discipline
 a checkpoint sub-agent follows. For anything that's a judgment call
 about design intent (a real behavioral discrepancy between what two
@@ -379,9 +396,10 @@ clearly in its report instead.
 
 Tell it explicitly: do NOT commit or push. Ask it to report back: the
 full suite's pass/fail, every acceptance criterion's status, the
-demo's actual transcript, every fix it made (file, what, why, the
-regression test's name), and every judgment-call item it left flagged
-rather than deciding.
+demo's actual transcript, every `/code-review` finding and what it did
+with each (fixed, flagged, or dismissed as a false positive, and why),
+every fix it made (file, what, why, the regression test's name), and
+every judgment-call item it left flagged rather than deciding.
 
 ### 4b. Minimal check, yourself, before moving on
 
@@ -392,6 +410,8 @@ review agent's report on faith just because it was thorough.
   --all-targets -- -D warnings`, and `cargo fmt --check` yourself.
 - Spot-check at least one of its fixes against the diff, and re-run the
   demo command(s) yourself rather than trusting its transcript alone.
+- Skim the `/code-review` findings it dismissed as false positives; a
+  dismissal with no reason, or a thin one, goes back to it.
 - Read its list of flagged judgment calls; for each, decide whether
   it's actually a story-blocking issue or a documented, in-scope
   deferral it simply flagged out of caution.
