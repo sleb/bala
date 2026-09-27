@@ -99,8 +99,11 @@ impl<S: Store> Core<S> {
     }
 
     /// Creates a task per LLD §Algorithm: validates the
-    /// title, type key, date range, and each given parent, then persists
-    /// the new task and its parent edges.
+    /// title, type key, date range, each given parent, and the assignee,
+    /// then persists the new task and its parent edges. Everything after
+    /// the title check, validation and writes alike, runs in a single
+    /// store transaction, and the validation errors below are checked in
+    /// the order listed ([`CoreError::Store`] can surface from any step).
     ///
     /// # Errors
     ///
@@ -130,45 +133,13 @@ impl<S: Store> Core<S> {
             return Err(CoreError::EmptyTitle);
         }
 
-        let type_key = new.type_key.unwrap_or_else(|| DEFAULT_TYPE_KEY.to_owned());
-        let types = self.store.transaction(|tx| tx.get_task_types())?;
-        if !types.iter().any(|t| t.key == type_key) {
-            return Err(CoreError::UnknownTaskType(type_key));
-        }
-
-        if let (Some(start), Some(due)) = (new.start_date, new.due_date)
-            && due < start
-        {
-            return Err(CoreError::InvalidDateRange { start, due });
-        }
-
-        for &parent_id in &parent_ids {
-            let parent_exists = self
-                .store
-                .transaction(|tx| tx.get_task(parent_id))?
-                .is_some();
-            if !parent_exists {
-                return Err(CoreError::NotFound(parent_id));
-            }
-        }
-
-        if let Some(assignee_id) = new.assignee_id {
-            let assignee_exists = self
-                .store
-                .transaction(|tx| tx.get_user(assignee_id))?
-                .is_some();
-            if !assignee_exists {
-                return Err(CoreError::UnknownUser(assignee_id));
-            }
-        }
-
         let now = Utc::now();
         let mut task = Task {
             id: TaskId::new(),
             title: new.title,
             description: new.description,
             parent_ids,
-            type_key,
+            type_key: new.type_key.unwrap_or_else(|| DEFAULT_TYPE_KEY.to_owned()),
             status: TaskStatus::Incomplete,
             progress: 0.0,
             start_date: new.start_date,
@@ -180,10 +151,42 @@ impl<S: Store> Core<S> {
             completed_at: None,
         };
 
+        // Every check past the title runs inside the same
+        // `Store::transaction` closure as the writes, so the whole create
+        // is one transaction and, e.g., a parent soft-deleted by a
+        // concurrent writer can't have the new task attached under it
+        // after passing a check in an earlier transaction (a backend that
+        // detects the conflict fails the create with a store error
+        // instead, e.g. SQLite's `SQLITE_BUSY`). The date check
+        // reads no store state but sits between the type and parent checks
+        // to keep the documented error order. Every check precedes
+        // `put_task`, since a `Store` need not roll back a closure that
+        // returns early. Rejections are threaded out as `Ok(Err(_))`,
+        // distinct from backend failures, and unwrapped by the two `?`s
+        // below.
         let progress = self.store.transaction(|tx| {
+            if !tx.get_task_types()?.iter().any(|t| t.key == task.type_key) {
+                return Ok(Err(CoreError::UnknownTaskType(task.type_key.clone())));
+            }
+            if let (Some(start), Some(due)) = (task.start_date, task.due_date)
+                && due < start
+            {
+                return Ok(Err(CoreError::InvalidDateRange { start, due }));
+            }
+            for &parent_id in &task.parent_ids {
+                if tx.get_task(parent_id)?.is_none() {
+                    return Ok(Err(CoreError::NotFound(parent_id)));
+                }
+            }
+            if let Some(assignee_id) = task.assignee_id
+                && tx.get_user(assignee_id)?.is_none()
+            {
+                return Ok(Err(CoreError::UnknownUser(assignee_id)));
+            }
+
             // No cycle check: a new id has no descendants, so it cannot be
             // an ancestor of any of its parents, and every parent's
-            // existence was checked above.
+            // existence was checked just above.
             tx.put_task(&task)?;
             tx.replace_parent_edges(
                 task.id,
@@ -196,8 +199,8 @@ impl<S: Store> Core<S> {
             // give — but it's computed via the shared helper, after
             // `put_task`, for consistency with every other `Task`-returning
             // method rather than assumed.
-            compute_progress(tx, task.id, task.status)
-        })?;
+            Ok(Ok(compute_progress(tx, task.id, task.status)?))
+        })??;
         task.progress = progress;
 
         Ok(task)
@@ -1365,9 +1368,61 @@ mod tests {
         ));
     }
 
+    /// A `NewTask` that fails every check past the title: unknown type,
+    /// backwards dates, a missing parent, and an unknown assignee.
+    fn new_task_failing_every_check() -> NewTask {
+        NewTask {
+            type_key: Some("bogus".to_owned()),
+            start_date: NaiveDate::from_ymd_opt(2026, 1, 31),
+            due_date: NaiveDate::from_ymd_opt(2026, 1, 1),
+            parent_ids: vec![TaskId::new()],
+            assignee_id: Some(UserId::new()),
+            ..minimal_new_task("Everything wrong")
+        }
+    }
+
+    #[test]
+    fn create_task_should_report_unknown_type_before_invalid_date_range() {
+        let mut core = new_core();
+
+        let result = core.create_task(new_task_failing_every_check());
+
+        assert!(matches!(result, Err(CoreError::UnknownTaskType(key)) if key == "bogus"));
+    }
+
+    #[test]
+    fn create_task_should_report_invalid_date_range_before_missing_parent() {
+        let mut core = new_core();
+
+        let result = core.create_task(NewTask {
+            type_key: None,
+            ..new_task_failing_every_check()
+        });
+
+        assert!(matches!(result, Err(CoreError::InvalidDateRange { .. })));
+    }
+
+    #[test]
+    fn create_task_should_report_missing_parent_before_unknown_assignee() {
+        let mut core = new_core();
+        let failing = NewTask {
+            type_key: None,
+            start_date: None,
+            due_date: None,
+            ..new_task_failing_every_check()
+        };
+        let missing = failing.parent_ids[0];
+
+        let result = core.create_task(failing);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
     #[test]
     fn create_task_should_make_the_same_store_calls_at_any_parent_depth() {
-        let (store, calls) = CountingStore::new();
+        let store = CountingStore::new();
+        let log = store.log();
+        let calls = || log.borrow().len();
         let mut core = Core::new(store).unwrap();
         let top = core.create_task(minimal_new_task("Top")).unwrap();
         let mut deepest = top.id;
@@ -1381,23 +1436,157 @@ mod tests {
                 .id;
         }
 
-        let before_shallow = calls.get();
+        let before_shallow = calls();
         core.create_task(NewTask {
             parent_ids: vec![top.id],
             ..minimal_new_task("Under top")
         })
         .unwrap();
-        let shallow_calls = calls.get() - before_shallow;
+        let shallow_calls = calls() - before_shallow;
 
-        let before_deep = calls.get();
+        let before_deep = calls();
         core.create_task(NewTask {
             parent_ids: vec![deepest],
             ..minimal_new_task("Under deepest")
         })
         .unwrap();
-        let deep_calls = calls.get() - before_deep;
+        let deep_calls = calls() - before_deep;
 
         assert_eq!(deep_calls, shallow_calls);
+    }
+
+    #[test]
+    fn create_task_should_check_parents_in_the_same_transaction_that_writes_the_task() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
+        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
+        let start = log.borrow().len();
+
+        core.create_task(NewTask {
+            parent_ids: vec![parent_a.id, parent_b.id],
+            ..minimal_new_task("Child")
+        })
+        .unwrap();
+
+        let calls = log.borrow()[start..].to_vec();
+        let tx_of = |method| {
+            calls
+                .iter()
+                .filter(|(_, m)| *m == method)
+                .map(|&(tx, _)| tx)
+                .collect::<Vec<_>>()
+        };
+        let put_task_txs = tx_of("put_task");
+        assert_eq!(put_task_txs.len(), 1, "calls: {calls:?}");
+        let get_task_txs = tx_of("get_task");
+        assert_eq!(get_task_txs.len(), 2, "calls: {calls:?}");
+        assert!(
+            get_task_txs.iter().all(|&tx| tx == put_task_txs[0]),
+            "calls: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_task_should_reject_soft_deleted_parent() {
+        let mut core = new_core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        core.delete_task(parent.id, DeleteMode::Subtree).unwrap();
+
+        let result = core.create_task(NewTask {
+            parent_ids: vec![parent.id],
+            ..minimal_new_task("Child")
+        });
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == parent.id));
+    }
+
+    /// Every task (deleted included) and every parent edge in `core`'s
+    /// store, for asserting that a rejected call wrote nothing.
+    fn store_snapshot(core: &Core<InMemoryStore>) -> (Vec<Task>, Vec<(Option<TaskId>, TaskId)>) {
+        let all = TreeFilter {
+            include_deleted: true,
+            ..TreeFilter::default()
+        };
+        core.store
+            .transaction(|tx| Ok((tx.list_tasks(&all)?, tx.list_all_child_edges()?)))
+            .unwrap()
+    }
+
+    #[test]
+    fn create_task_should_write_nothing_when_a_later_parent_is_missing() {
+        let mut core = new_core();
+        let live = core.create_task(minimal_new_task("Live")).unwrap();
+        let missing = TaskId::new();
+        let before = store_snapshot(&core);
+
+        let result = core.create_task(NewTask {
+            parent_ids: vec![live.id, missing],
+            ..minimal_new_task("Child")
+        });
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+        assert_eq!(store_snapshot(&core), before);
+    }
+
+    #[test]
+    fn create_task_should_write_nothing_when_type_key_unknown() {
+        let mut core = new_core();
+        let before = store_snapshot(&core);
+
+        let result = core.create_task(NewTask {
+            type_key: Some("bogus".to_owned()),
+            ..minimal_new_task("Mistyped")
+        });
+
+        assert!(matches!(result, Err(CoreError::UnknownTaskType(key)) if key == "bogus"));
+        assert_eq!(store_snapshot(&core), before);
+    }
+
+    #[test]
+    fn create_task_should_write_nothing_when_assignee_unknown() {
+        let mut core = new_core();
+        let unknown_assignee = UserId::new();
+        let before = store_snapshot(&core);
+
+        let result = core.create_task(NewTask {
+            assignee_id: Some(unknown_assignee),
+            ..minimal_new_task("Orphan assignee")
+        });
+
+        assert!(matches!(result, Err(CoreError::UnknownUser(id)) if id == unknown_assignee));
+        assert_eq!(store_snapshot(&core), before);
+    }
+
+    #[test]
+    fn create_task_should_run_in_a_single_transaction() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        core.upsert_task_type(TaskType {
+            key: "goal".to_owned(),
+            label: "Goal".to_owned(),
+            color: None,
+            sort_order: 1,
+        })
+        .unwrap();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let assignee = core.create_user("Ada".to_owned()).unwrap();
+        let start = log.borrow().len();
+
+        core.create_task(NewTask {
+            type_key: Some("goal".to_owned()),
+            parent_ids: vec![parent.id],
+            assignee_id: Some(assignee.id),
+            ..minimal_new_task("Child")
+        })
+        .unwrap();
+
+        let calls = log.borrow()[start..].to_vec();
+        let mut txs: Vec<usize> = calls.iter().map(|&(tx, _)| tx).collect();
+        txs.dedup();
+        assert_eq!(txs.len(), 1, "calls: {calls:?}");
     }
 
     #[test]
