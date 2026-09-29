@@ -1381,6 +1381,7 @@ mod tests {
         }
     }
 
+    /// An unknown type key wins over every later failure.
     #[test]
     fn create_task_should_report_unknown_type_before_invalid_date_range() {
         let mut core = new_core();
@@ -1390,6 +1391,7 @@ mod tests {
         assert!(matches!(result, Err(CoreError::UnknownTaskType(key)) if key == "bogus"));
     }
 
+    /// A backwards date range wins over a missing parent or assignee.
     #[test]
     fn create_task_should_report_invalid_date_range_before_missing_parent() {
         let mut core = new_core();
@@ -1402,6 +1404,7 @@ mod tests {
         assert!(matches!(result, Err(CoreError::InvalidDateRange { .. })));
     }
 
+    /// A missing parent wins over an unknown assignee.
     #[test]
     fn create_task_should_report_missing_parent_before_unknown_assignee() {
         let mut core = new_core();
@@ -1455,6 +1458,8 @@ mod tests {
         assert_eq!(deep_calls, shallow_calls);
     }
 
+    /// Every parent `get_task` runs in the transaction that `put_task`s
+    /// the new task, so a concurrent delete can't slip in between.
     #[test]
     fn create_task_should_check_parents_in_the_same_transaction_that_writes_the_task() {
         let store = CountingStore::new();
@@ -1488,6 +1493,7 @@ mod tests {
         );
     }
 
+    /// A soft-deleted parent is reported as `NotFound`, like a missing one.
     #[test]
     fn create_task_should_reject_soft_deleted_parent() {
         let mut core = new_core();
@@ -1514,6 +1520,7 @@ mod tests {
             .unwrap()
     }
 
+    /// A missing second parent leaves no task and no edge to the first.
     #[test]
     fn create_task_should_write_nothing_when_a_later_parent_is_missing() {
         let mut core = new_core();
@@ -1530,6 +1537,7 @@ mod tests {
         assert_eq!(store_snapshot(&core), before);
     }
 
+    /// An unknown type key leaves the store untouched.
     #[test]
     fn create_task_should_write_nothing_when_type_key_unknown() {
         let mut core = new_core();
@@ -1544,6 +1552,7 @@ mod tests {
         assert_eq!(store_snapshot(&core), before);
     }
 
+    /// An unknown assignee leaves the store untouched.
     #[test]
     fn create_task_should_write_nothing_when_assignee_unknown() {
         let mut core = new_core();
@@ -1559,6 +1568,8 @@ mod tests {
         assert_eq!(store_snapshot(&core), before);
     }
 
+    /// A create with a type, a parent, and an assignee makes every store
+    /// call in one transaction.
     #[test]
     fn create_task_should_run_in_a_single_transaction() {
         let store = CountingStore::new();

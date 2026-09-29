@@ -97,6 +97,8 @@ struct CountingTx<'a> {
 }
 
 impl CountingTx<'_> {
+    /// Logs a call to `method` under this transaction's index and returns
+    /// the wrapped transaction to forward the call to.
     fn tick(&mut self, method: &'static str) -> &mut dyn StoreTx {
         self.log.borrow_mut().push((self.tx_index, method));
         &mut *self.inner
