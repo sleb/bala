@@ -384,7 +384,8 @@ single-chain walk since `visited` bounds the work to each ancestor node
 once regardless of how many paths reach it. `create_task` skips the
 check and writes the new task's edges directly: a freshly minted id has no
 descendants, so it cannot be an ancestor of any entry in
-`NewTask.parent_ids`, and each parent's existence is already validated.
+`NewTask.parent_ids`, and each parent's existence is validated in the
+same transaction that writes the task and its edges.
 Running the walk anyway would cost one `list_parent_edges` per ancestor,
 making every create under a deep chain O(depth) for a check that can never
 fail. Every write that adds a parent to an *existing* task still goes
