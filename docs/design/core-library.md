@@ -224,6 +224,9 @@ pub enum CoreError {
     #[error("{task:?} is not a child of {parent}")] // parent: id, or "the top level" for None
     NotUnderParent { task: TaskId, parent: Option<TaskId> },
 
+    #[error("a task cannot depend on itself: {0:?}")]
+    SelfDependency(TaskId),
+
     #[error("{task:?} cannot depend on {other:?}: it is an ancestor/descendant of it")]
     DependsOnRelative { task: TaskId, other: TaskId },
 
@@ -397,30 +400,51 @@ any check or write, keeping each id's first occurrence.
 ### 2. Dependency invariants ([#60](https://github.com/sleb/bala/issues/60) AC2–3)
 
 `add_dependency(id, predecessor, dep_type)`:
-1. Reject if `id == predecessor` (self-dependency).
-2. Walk `id`'s ancestor *set* and descendant subtree in the hierarchy
-   graph — with multiple parents this is DAG reachability (§1's
-   memoized walk) rather than a single chain, in both directions: upward
-   from each of `id`'s `parent_ids`, and downward through everything
-   reachable as a descendant of `id`. Reject with `DependsOnRelative` if
-   `predecessor` appears in either set — this is the one place a
+1. Reject with `SelfDependency(id)` if `id == predecessor`.
+2. Reject with `DependsOnRelative` if `predecessor` is an ancestor or a
+   descendant of `id` in the hierarchy graph — this is the one place a
    dependency check must cross into the hierarchy graph, per HLD §4.
+   With multiple parents this is DAG reachability (§1's memoized walk)
+   rather than a single chain, and both directions are checked by
+   walking *upward* through every parent of every task: from `id`
+   looking for `predecessor` (an ancestor), then from `predecessor`
+   looking for `id` (a descendant). A descendant of `id` is exactly a
+   task from which `id` is reachable upward, so there is no need to scan
+   `id`'s whole subtree; each walk visits only the ancestors of where it
+   starts.
 3. Cycle check on the dependency graph itself: before adding the edge
-   `predecessor → id`, DFS from `id` following existing `depends_on`
-   edges outward (i.e., walk what `id` already (transitively) depends
-   on). If `predecessor` is reachable, the new edge would close a cycle
-   — reject with `CircularDependency { cycle }`, where `cycle` is the
-   path found. This is a plain reachability check, not a full
+   `predecessor → id`, walk from `predecessor` following existing
+   `depends_on` edges (i.e., walk what `predecessor` already
+   (transitively) depends on). If `id` is reachable, `predecessor`
+   already depends on `id`, so making `id` depend on `predecessor` would
+   close a cycle — reject with `CircularDependency { cycle }`. The walk
+   must start at `predecessor`, not `id`: what `id` already depends on
+   says nothing about the new edge, so walking from `id` would accept
+   A→B→A (B depends on A, then A on B) and reject a redundant edge that
+   closes no cycle (C depends on B depends on A, then C on A).
+   `cycle` is the path `[id, predecessor, …, id]`, each entry depending
+   on the next: it starts with the new edge and follows existing edges
+   back to `id`. The walk records, for each task, the task it was first
+   discovered from, and rebuilds the path from those steps. It is an
+   iterative work-stack with a `visited` set (no recursion, since
+   dependency chains are unbounded; a task reachable by several paths is
+   walked once), so this is a plain reachability check, not a full
    topological sort, and runs in O(edges) per call. The check doesn't
    depend on `dep_type` — a cycle is a cycle regardless of which of the
-   four types closes it.
+   four types closes it — and, as soft-deleted tasks keep their
+   dependency edges, it walks through them.
 4. If an edge already exists between `predecessor` and `id` (of any
    type), it is replaced by the new one rather than adding a second edge
    — see §Data Model, `Dependency` — so `add_dependency` is also how a
-   caller changes an existing edge's type.
+   caller changes an existing edge's type. Re-adding an edge with the
+   type it already has is a true no-op: no write, and `updated_at` is
+   unchanged.
 
 `remove_dependency` has no invariant to check — removing an edge can
-never introduce a cycle or a relative-dependency violation.
+never introduce a cycle or a relative-dependency violation. Only the
+dependent task (`id`) must be live; the predecessor may be soft-deleted.
+Removing an edge that doesn't exist is a true no-op: no write, and
+`updated_at` is unchanged.
 
 ### 3. Cascade scheduling ([#61](https://github.com/sleb/bala/issues/61) AC1–4)
 

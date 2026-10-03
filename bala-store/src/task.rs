@@ -4,6 +4,10 @@
 //! docs) and is written with a fixed default (`0`) on every `put_task`,
 //! never read back into a `Task`, since `Task` has nowhere to put it yet.
 //! `assignee_id`, `deleted_at`, and `completed_at` *are* read/written.
+//!
+//! `parent_ids` and `depends_on` are not columns: reads fill them from the
+//! `parent_edges` and `dependency_edges` tables, and `put_task` writes
+//! neither, so the edge tables are their only source.
 
 use bala_core::{StoreError, Task, TaskId, TreeFilter};
 use rusqlite::{OptionalExtension, Row, ToSql, Transaction, params};
@@ -18,8 +22,8 @@ const SELECT_COLUMNS: &str = "id, title, description, type_key, status, start_da
     assignee_id, created_at, updated_at, completed_at, deleted_at";
 
 /// Builds a [`Task`] from a row of [`SELECT_COLUMNS`], leaving `parent_ids`
-/// empty — callers fill it in from `parent_edges` separately (edges are a
-/// distinct table, not embedded in the row).
+/// and `depends_on` empty — callers fill them in with [`fill_edges`] (edges
+/// live in distinct tables, not embedded in the row).
 fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
     let id_blob: Vec<u8> = row.get(0)?;
     let title: String = row.get(1)?;
@@ -48,6 +52,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
             start_date: start_date.map(|s| date_from_text(&s)).transpose()?,
             due_date: due_date.map(|s| date_from_text(&s)).transpose()?,
             assignee_id: assignee_id.map(|b| blob_to_user_id(&b)).transpose()?,
+            depends_on: Vec::new(),
             created_at: timestamp_from_text(&created_at)?,
             updated_at: timestamp_from_text(&updated_at)?,
             completed_at: completed_at.map(|s| timestamp_from_text(&s)).transpose()?,
@@ -56,9 +61,17 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
     })())
 }
 
+/// Fills `task`'s edge-backed fields: `parent_ids` from `parent_edges` and
+/// `depends_on` from `dependency_edges`.
+fn fill_edges(tx: &Transaction, task: &mut Task) -> Result<(), StoreError> {
+    task.parent_ids = edges::list_parent_edges(tx, task.id)?;
+    task.depends_on = edges::list_dependency_edges(tx, task.id)?;
+    Ok(())
+}
+
 /// Shared implementation for [`get_task`] and [`get_task_including_deleted`]:
 /// runs `sql` (expected to select [`SELECT_COLUMNS`] and filter on `id`),
-/// maps the row, and fills in `parent_ids`.
+/// maps the row, and fills in its edges.
 fn get_task_with_sql(tx: &Transaction, sql: &str, id: TaskId) -> Result<Option<Task>, StoreError> {
     let id_blob = id_to_blob(id);
     let found = tx
@@ -68,7 +81,7 @@ fn get_task_with_sql(tx: &Transaction, sql: &str, id: TaskId) -> Result<Option<T
     let Some(mut task) = found.transpose()? else {
         return Ok(None);
     };
-    task.parent_ids = edges::list_parent_edges(tx, id)?;
+    fill_edges(tx, &mut task)?;
     Ok(Some(task))
 }
 
@@ -154,7 +167,7 @@ pub(crate) fn list_tasks(tx: &Transaction, filter: &TreeFilter) -> Result<Vec<Ta
     let mut tasks = Vec::new();
     for row in rows {
         let mut task = row.map_err(sqlite_err)??;
-        task.parent_ids = edges::list_parent_edges(tx, task.id)?;
+        fill_edges(tx, &mut task)?;
         tasks.push(task);
     }
     Ok(tasks)

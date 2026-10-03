@@ -422,7 +422,7 @@ rendering rule, shared by the TUI status bar and CLI subcommand stderr:
 | ----------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------- |
 | `EmptyTitle`, `InvalidDateRange`          | inline message under the `Insert` field, blocks submit                                | stderr, nonzero exit, no partial write      |
 | `CircularHierarchy`                       | inline in `Insert{parent list}` (reparent)                                            | stderr, nonzero exit                        |
-| `DependsOnRelative`, `CircularDependency` | inline in `Insert{predecessor}`                                                       | stderr, nonzero exit                        |
+| `SelfDependency`, `DependsOnRelative`, `CircularDependency` | inline in `Insert{predecessor}`                                     | stderr, nonzero exit                        |
 | `IncompleteChildren`                      | routes to `Confirm` offering cascade (§Modes)                                         | stderr suggesting `--cascade`, nonzero exit |
 | `NotFound`, `UnknownTaskType`             | status-bar message (defensive — shouldn't normally be reachable from a rendered list) | stderr, nonzero exit                        |
 | `Store(_)`                                | status-bar "storage error", task list unchanged                                       | stderr, nonzero exit                        |

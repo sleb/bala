@@ -281,6 +281,22 @@ bala task delete <task-id> [--yes] [--cascade | --promote-children]
 If the task has subtasks and neither `--cascade` nor `--promote-children` is
 given, the command fails and lists the subtasks so you can choose a mode.
 
+If other live tasks depend on what the delete covers, their ids and titles
+are printed to stderr before the confirmation prompt (and also with `--yes`):
+
+```text
+2 task(s) depend on what this deletes:
+  <task-id> <title>
+  <task-id> <title>
+```
+
+With `--cascade` (or a task with no subtasks) this covers the task and every
+subtask the delete removes; a subtask still under another parent survives, so
+it isn't covered, and it is named itself if it depends on a subtask that is
+removed. With `--promote-children` it covers the task alone. Nothing is
+printed when no task depends on them. The delete itself is unaffected: the
+dependency edges stay, and `bala task restore` brings them back.
+
 Prints the id of each deleted task, one per line, on success.
 Subtasks that survive (another parent, or `--promote-children`) are not listed.
 
@@ -318,6 +334,71 @@ bala task reopen <task-id>
 ```
 
 Prints the reopened task, in the same format as `task ls`.
+
+## `bala dep`
+
+A dependency links a task to a *predecessor*: another task whose schedule
+constrains it. A task may depend on any number of predecessors.
+
+### `bala dep add`
+
+Makes a task depend on a predecessor.
+
+```sh
+bala dep add <task-id> --on <predecessor-id> [--type fs|ss|ff|sf]
+```
+
+| Flag | Required | Description |
+| --- | --- | --- |
+| `--on` | yes | Id of the predecessor task. |
+| `--type` | no | How the two tasks are linked. Defaults to `fs`. |
+
+`--type` takes one of:
+
+| Value | Meaning |
+| --- | --- |
+| `fs` | Finish-to-start (the default): the predecessor finishes before this task starts. |
+| `ss` | Start-to-start: the predecessor starts before this task starts. |
+| `ff` | Finish-to-finish: the predecessor finishes before this task finishes. |
+| `sf` | Start-to-finish: the predecessor starts before this task finishes. |
+
+Any other `--type` value is a usage error. Running `dep add` again on a pair
+that is already linked replaces the dependency's type rather than adding a
+second one; running it again with the same type changes nothing and still
+prints the task.
+
+Prints the task in the same format as `task ls`, followed by one line per
+predecessor it now depends on:
+
+```text
+  depends on: <predecessor-id> (<fs|ss|ff|sf>)
+```
+
+The command fails with a nonzero exit and an error message if:
+
+- the task id or predecessor id doesn't exist (or names a deleted task);
+- the task would depend on itself;
+- the predecessor is one of the task's own ancestors or descendants;
+- the new dependency would close a dependency cycle (the message names the
+  tasks in the cycle).
+
+### `bala dep rm`
+
+Removes a task's dependency on a predecessor.
+
+```sh
+bala dep rm <task-id> --on <predecessor-id>
+```
+
+| Flag | Required | Description |
+| --- | --- | --- |
+| `--on` | yes | Id of the predecessor task. |
+
+Prints the task and its remaining predecessors, in the same format as
+`dep add`. Removing a dependency that doesn't exist is a no-op that still
+prints the task. The predecessor may be a deleted task, so a dependency on
+a task that has since been deleted can still be removed. Fails with a
+nonzero exit if the task id doesn't exist or names a deleted task.
 
 ## `bala type`
 

@@ -4,7 +4,10 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::in_memory_store::InMemoryStore;
-use crate::model::{Parents, Placement, Task, TaskId, TaskType, TreeFilter, User, UserId};
+use crate::model::{
+    Dependency, DependencyType, Parents, Placement, Task, TaskId, TaskType, TreeFilter, User,
+    UserId,
+};
 use crate::store::{Store, StoreError, StoreTx};
 
 /// Asserts the parent-edge invariant over every task in `store`, live or
@@ -160,6 +163,33 @@ impl StoreTx for CountingTx<'_> {
 
     fn list_all_child_edges(&mut self) -> Result<Vec<(Option<TaskId>, TaskId)>, StoreError> {
         self.tick("list_all_child_edges").list_all_child_edges()
+    }
+
+    fn list_dependency_edges(&mut self, id: TaskId) -> Result<Vec<Dependency>, StoreError> {
+        self.tick("list_dependency_edges").list_dependency_edges(id)
+    }
+
+    fn list_successor_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+        self.tick("list_successor_edges").list_successor_edges(id)
+    }
+
+    fn add_dependency_edge(
+        &mut self,
+        predecessor: TaskId,
+        successor: TaskId,
+        dep_type: DependencyType,
+    ) -> Result<(), StoreError> {
+        self.tick("add_dependency_edge")
+            .add_dependency_edge(predecessor, successor, dep_type)
+    }
+
+    fn remove_dependency_edge(
+        &mut self,
+        predecessor: TaskId,
+        successor: TaskId,
+    ) -> Result<(), StoreError> {
+        self.tick("remove_dependency_edge")
+            .remove_dependency_edge(predecessor, successor)
     }
 
     fn get_task_including_deleted(&mut self, id: TaskId) -> Result<Option<Task>, StoreError> {

@@ -11,7 +11,9 @@
 //! `tests` module for those); it is scoped strictly to the `Core` facade's
 //! behavior over a SQLite-backed store.
 
-use bala_core::{Core, CoreError, NewTask, TaskId, TaskStatus, TaskType, TreeFilter};
+use bala_core::{
+    Core, CoreError, Dependency, DependencyType, NewTask, TaskId, TaskStatus, TaskType, TreeFilter,
+};
 use bala_store::SqliteStore;
 use chrono::NaiveDate;
 
@@ -274,4 +276,45 @@ fn create_task_uses_status_incomplete() {
     let task = core.create_task(minimal_new_task("New")).unwrap();
 
     assert_eq!(task.status, TaskStatus::Incomplete);
+}
+
+#[test]
+fn add_dependency_should_record_predecessor_on_the_task() {
+    let mut core = new_core();
+    let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+    let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+    let updated = core
+        .add_dependency(task.id, predecessor.id, DependencyType::FinishToStart)
+        .unwrap();
+
+    let expected = vec![Dependency {
+        predecessor_id: predecessor.id,
+        dep_type: DependencyType::FinishToStart,
+    }];
+    assert_eq!(updated.id, task.id);
+    assert_eq!(updated.depends_on, expected);
+    let stored = core.get_task(task.id).unwrap().unwrap();
+    assert_eq!(stored.depends_on, expected);
+    let stored_predecessor = core.get_task(predecessor.id).unwrap().unwrap();
+    assert!(stored_predecessor.depends_on.is_empty());
+}
+
+#[test]
+fn remove_dependency_should_drop_predecessor_from_depends_on() {
+    let mut core = new_core();
+    let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+    let task = core.create_task(minimal_new_task("Task")).unwrap();
+    let with_edge = core
+        .add_dependency(task.id, predecessor.id, DependencyType::FinishToStart)
+        .unwrap();
+
+    let updated = core.remove_dependency(task.id, predecessor.id).unwrap();
+
+    assert_eq!(updated.id, task.id);
+    assert!(updated.depends_on.is_empty());
+    assert!(updated.updated_at >= with_edge.updated_at);
+    let stored = core.get_task(task.id).unwrap().unwrap();
+    assert!(stored.depends_on.is_empty());
+    assert_eq!(stored.updated_at, updated.updated_at);
 }

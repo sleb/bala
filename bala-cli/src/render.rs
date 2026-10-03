@@ -5,6 +5,10 @@
 //! I/O and never touches `Core` itself — the TUI's `app` and `screens`
 //! modules call it after fetching data through `Core`, which
 //! keeps this projection unit-testable without a terminal or a database.
+//!
+//! `subtree_ids`, `subtree_delete_ids` and `dependents_of` are pure scans over the same
+//! `Core::get_tree()` result, used by `bala task delete` to name the tasks
+//! that depend on what it deletes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -265,6 +269,92 @@ fn mark_hidden(
     }
 }
 
+/// Returns `id` and the id of every task below it at any depth, each once,
+/// found through `tasks`' `parent_ids` (a `Core::get_tree` result).
+///
+/// A descendant reachable through more than one parent is listed once.
+/// Iterative, with a `visited` guard, matching `visit`'s convention:
+/// hierarchy depth is unbounded, and a cycle (which should never occur)
+/// can't loop forever.
+#[must_use]
+pub(crate) fn subtree_ids(id: TaskId, tasks: &[Task]) -> Vec<TaskId> {
+    let mut children_by_parent: HashMap<TaskId, Vec<TaskId>> = HashMap::new();
+    for task in tasks {
+        for parent in &task.parent_ids {
+            children_by_parent.entry(*parent).or_default().push(task.id);
+        }
+    }
+
+    let mut visited = HashSet::new();
+    let mut ids = Vec::new();
+    let mut pending = vec![id];
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        ids.push(current);
+        if let Some(children) = children_by_parent.get(&current) {
+            pending.extend(children.iter().copied());
+        }
+    }
+    ids
+}
+
+/// Returns the ids a `DeleteMode::Subtree` delete of `id` tombstones, found
+/// through `tasks`' `parent_ids` (a `Core::get_tree` result): `id` itself,
+/// then every descendant all of whose parents are tombstoned too. A
+/// descendant still under a parent outside that set survives, and so does
+/// everything below it that the set doesn't otherwise reach.
+///
+/// Repeats a pass over `subtree_ids(id, tasks)` until nothing changes, so
+/// it never loops more times than that subtree has tasks.
+#[must_use]
+pub(crate) fn subtree_delete_ids(id: TaskId, tasks: &[Task]) -> Vec<TaskId> {
+    let parents_of: HashMap<TaskId, &[TaskId]> = tasks
+        .iter()
+        .map(|task| (task.id, task.parent_ids.as_slice()))
+        .collect();
+    let candidates = subtree_ids(id, tasks);
+
+    let mut deleted = HashSet::from([id]);
+    let mut ids = vec![id];
+    loop {
+        let before = ids.len();
+        for &candidate in &candidates {
+            let parents = parents_of.get(&candidate).copied().unwrap_or_default();
+            if !parents.is_empty()
+                && !deleted.contains(&candidate)
+                && parents.iter().all(|parent| deleted.contains(parent))
+            {
+                deleted.insert(candidate);
+                ids.push(candidate);
+            }
+        }
+        if ids.len() == before {
+            return ids;
+        }
+    }
+}
+
+/// Returns the tasks in `tasks` whose `depends_on` names any of `ids`,
+/// excluding tasks that are themselves in `ids`, in `tasks`' order.
+///
+/// This is the successor scan CLI/TUI LLD §Task Detail View describes for
+/// "blocks", generalised to a set of predecessors.
+#[must_use]
+pub(crate) fn dependents_of<'a>(ids: &[TaskId], tasks: &'a [Task]) -> Vec<&'a Task> {
+    let ids: HashSet<TaskId> = ids.iter().copied().collect();
+    tasks
+        .iter()
+        .filter(|task| !ids.contains(&task.id))
+        .filter(|task| {
+            task.depends_on
+                .iter()
+                .any(|dependency| ids.contains(&dependency.predecessor_id))
+        })
+        .collect()
+}
+
 /// Test helper: a `SiblingOrder` following `tasks`' input order (roots under
 /// `None`, each parent's children in input order).
 #[cfg(test)]
@@ -284,6 +374,7 @@ pub(crate) fn order_of(tasks: &[Task]) -> SiblingOrder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bala_core::{Dependency, DependencyType};
     use chrono::Utc;
 
     /// Minimal `Task` fixture: fills required fields with dummy values so
@@ -301,6 +392,7 @@ mod tests {
             start_date: None,
             due_date: None,
             assignee_id: None,
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -840,5 +932,108 @@ mod tests {
             "CLI direct_summary ({complete}/{total} = {cli_progress}) disagreed with \
              Core::Task::progress ({core_progress})"
         );
+    }
+
+    /// A finish-to-start dependency on `predecessor_id`.
+    fn on(predecessor_id: TaskId) -> Dependency {
+        Dependency {
+            predecessor_id,
+            dep_type: DependencyType::FinishToStart,
+        }
+    }
+
+    #[test]
+    fn dependents_of_should_return_tasks_depending_on_any_given_id() {
+        let a = task(TaskId::new(), "A", vec![]);
+        let b = task(TaskId::new(), "B", vec![]);
+        let mut on_a = task(TaskId::new(), "On A", vec![]);
+        on_a.depends_on = vec![on(a.id)];
+        let mut on_both = task(TaskId::new(), "On both", vec![]);
+        on_both.depends_on = vec![on(a.id), on(b.id)];
+        let mut on_b = task(TaskId::new(), "On B", vec![]);
+        on_b.depends_on = vec![on(b.id)];
+        let unrelated = task(TaskId::new(), "Unrelated", vec![]);
+        let tasks = vec![
+            a.clone(),
+            b.clone(),
+            on_a.clone(),
+            on_both.clone(),
+            unrelated,
+            on_b.clone(),
+        ];
+
+        let ids: Vec<_> = dependents_of(&[a.id, b.id], &tasks)
+            .iter()
+            .map(|t| t.id)
+            .collect();
+
+        assert_eq!(ids, vec![on_a.id, on_both.id, on_b.id]);
+    }
+
+    #[test]
+    fn dependents_of_should_skip_tasks_inside_the_given_set() {
+        let a = task(TaskId::new(), "A", vec![]);
+        let mut inside = task(TaskId::new(), "Inside", vec![]);
+        inside.depends_on = vec![on(a.id)];
+        let mut outside = task(TaskId::new(), "Outside", vec![]);
+        outside.depends_on = vec![on(a.id)];
+        let tasks = vec![a.clone(), inside.clone(), outside.clone()];
+
+        let ids: Vec<_> = dependents_of(&[a.id, inside.id], &tasks)
+            .iter()
+            .map(|t| t.id)
+            .collect();
+
+        assert_eq!(ids, vec![outside.id]);
+    }
+
+    #[test]
+    fn subtree_ids_should_collect_every_depth_once() {
+        let root = task(TaskId::new(), "Root", vec![]);
+        let left = task(TaskId::new(), "Left", vec![root.id]);
+        let right = task(TaskId::new(), "Right", vec![root.id]);
+        let shared = task(TaskId::new(), "Shared", vec![left.id, right.id]);
+        let grandchild = task(TaskId::new(), "Grandchild", vec![shared.id]);
+        let outside = task(TaskId::new(), "Outside", vec![]);
+        let tasks = vec![
+            root.clone(),
+            left.clone(),
+            right.clone(),
+            shared.clone(),
+            grandchild.clone(),
+            outside,
+        ];
+
+        let ids = subtree_ids(root.id, &tasks);
+
+        assert_eq!(ids.len(), 5, "each task appears once: {ids:?}");
+        let expected: HashSet<_> = [root.id, left.id, right.id, shared.id, grandchild.id]
+            .into_iter()
+            .collect();
+        assert_eq!(ids.into_iter().collect::<HashSet<_>>(), expected);
+    }
+
+    #[test]
+    fn subtree_delete_ids_should_keep_descendant_with_a_parent_outside_the_subtree() {
+        let root = task(TaskId::new(), "Root", vec![]);
+        let other = task(TaskId::new(), "Other", vec![]);
+        let doomed = task(TaskId::new(), "Doomed", vec![root.id]);
+        let survivor = task(TaskId::new(), "Survivor", vec![root.id, other.id]);
+        let survivor_child = task(TaskId::new(), "Survivor child", vec![survivor.id]);
+        let shared = task(TaskId::new(), "Shared", vec![doomed.id, root.id]);
+        let tasks = vec![
+            root.clone(),
+            other,
+            doomed.clone(),
+            survivor,
+            survivor_child,
+            shared.clone(),
+        ];
+
+        let ids = subtree_delete_ids(root.id, &tasks);
+
+        let expected: HashSet<_> = [root.id, doomed.id, shared.id].into_iter().collect();
+        assert_eq!(ids.len(), expected.len(), "each task appears once: {ids:?}");
+        assert_eq!(ids.into_iter().collect::<HashSet<_>>(), expected);
     }
 }

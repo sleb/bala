@@ -1,10 +1,9 @@
 //! The persistence trait boundary (LLD §Storage Boundary).
-//!
-//! The full LLD contract also has dependency-edge methods; they are not
-//! declared yet and get added alongside the dependency features that call
-//! them.
 
-use crate::model::{Parents, Placement, Task, TaskId, TaskType, TreeFilter, User, UserId};
+use crate::model::{
+    Dependency, DependencyType, Parents, Placement, Task, TaskId, TaskType, TreeFilter, User,
+    UserId,
+};
 
 /// Errors from the storage boundary.
 ///
@@ -146,6 +145,54 @@ pub trait StoreTx {
     ///
     /// Returns `Err` if the backend fails.
     fn list_all_child_edges(&mut self) -> Result<Vec<(Option<TaskId>, TaskId)>, StoreError>;
+
+    /// Lists `id`'s dependencies — the tasks it depends on, each with the
+    /// edge's type — in the order the edges were first added. Soft-deleted
+    /// tasks keep their edges and are included.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails. Returns an empty `Vec`, not
+    /// `Err`, when `id` depends on nothing.
+    fn list_dependency_edges(&mut self, id: TaskId) -> Result<Vec<Dependency>, StoreError>;
+
+    /// Lists the ids of the tasks that depend on `id` — the reverse of
+    /// [`list_dependency_edges`](StoreTx::list_dependency_edges) — in the
+    /// order the edges were first added. Soft-deleted tasks keep their edges
+    /// and are included.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails. Returns an empty `Vec`, not
+    /// `Err`, when nothing depends on `id`.
+    fn list_successor_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
+
+    /// Makes `successor` depend on `predecessor` with `dep_type`. There is
+    /// one edge per (predecessor, successor) pair: if the pair is already
+    /// linked, the edge's type is replaced and it keeps its place in both
+    /// lists; otherwise the new edge goes at the end of both.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    fn add_dependency_edge(
+        &mut self,
+        predecessor: TaskId,
+        successor: TaskId,
+        dep_type: DependencyType,
+    ) -> Result<(), StoreError>;
+
+    /// Removes the edge that makes `successor` depend on `predecessor`.
+    /// Does nothing if the pair is not linked.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    fn remove_dependency_edge(
+        &mut self,
+        predecessor: TaskId,
+        successor: TaskId,
+    ) -> Result<(), StoreError>;
 
     /// Looks up a task by id, including soft-deleted ones that
     /// [`get_task`](StoreTx::get_task) would filter out.
