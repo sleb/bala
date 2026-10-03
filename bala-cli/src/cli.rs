@@ -21,7 +21,7 @@ use crate::render;
 #[derive(Debug, Parser)]
 #[command(name = "bala", about = "A task tracker")]
 pub struct Cli {
-    /// Overrides the default SQLite database path. Mainly for tests; the
+    /// Overrides the default `SQLite` database path. Mainly for tests; the
     /// default lives in the OS-standard data directory (see `config`).
     #[arg(long, global = true)]
     pub db_path: Option<PathBuf>,

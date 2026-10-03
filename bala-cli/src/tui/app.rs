@@ -4257,7 +4257,7 @@ mod tests {
                 .unwrap();
         }
         let mut app = app_from_core(&mut core);
-        assert!(app.blockers().is_empty());
+        assert_eq!(app.blockers(), []);
 
         let _ = apply_action(&mut app, &mut core, Action::MoveDown);
         let _ = apply_action(&mut app, &mut core, Action::MoveDown);
@@ -4435,7 +4435,7 @@ mod tests {
         core.complete_task(blocker, false).unwrap();
         super::refresh_rows_from_tree(&mut app, &mut core, None);
 
-        assert!(app.rows().is_empty());
+        assert_eq!(app.rows(), []);
         assert_eq!(app.blocked_view(), super::BlockedView::Blocked);
     }
 }

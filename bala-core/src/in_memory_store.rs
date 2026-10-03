@@ -5,12 +5,12 @@
 //! this module's own put/get/list/edge round-trip tests) can run
 //! without a real database.
 //!
-//! Parent edges are kept in two maps mirroring the SQLite `parent_edges`
+//! Parent edges are kept in two maps mirroring the `SQLite` `parent_edges`
 //! table: child -> its one parent (`None` = the NULL top-level edge) and
 //! parent -> children in position order (`None` = the root list). A child's
 //! position is its index in the parent's list.
 //!
-//! Dependency edges are likewise kept in two maps mirroring the SQLite
+//! Dependency edges are likewise kept in two maps mirroring the `SQLite`
 //! `dependency_edges` table: successor -> its predecessors (each with the
 //! edge's type) and predecessor -> its successors, both in the order the
 //! edges were first added.

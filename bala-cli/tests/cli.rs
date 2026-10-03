@@ -1,5 +1,5 @@
 //! Integration tests for the `bala` binary, driven end-to-end via
-//! `assert_cmd`. Each test points the CLI at its own temp-file SQLite
+//! `assert_cmd`. Each test points the CLI at its own temp-file `SQLite`
 //! database via the `--db-path` flag, so tests never touch the real
 //! default OS data dir and never interfere with each other.
 

@@ -1,7 +1,7 @@
 //! SQLite-backed persistence for Bala tasks.
 //!
 //! Implements `bala-core`'s `Store`/`StoreTx` trait pair (see
-//! `docs/design/data-store.md`) against a single SQLite database, opened
+//! `docs/design/data-store.md`) against a single `SQLite` database, opened
 //! via [`SqliteStore::open`]/[`SqliteStore::open_in_memory`].
 //!
 //! ## Schema

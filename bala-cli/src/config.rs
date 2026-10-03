@@ -1,4 +1,4 @@
-//! Configuration: resolving the default SQLite database path, and
+//! Configuration: resolving the default `SQLite` database path, and
 //! loading/saving the persisted TUI `ViewState` (`view.toml`).
 
 use std::collections::HashSet;
@@ -37,7 +37,7 @@ fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("", "", "bala")
 }
 
-/// Resolves the default SQLite database path (per-OS data dir + `bala.db`),
+/// Resolves the default `SQLite` database path (per-OS data dir + `bala.db`),
 /// creating the containing directory if it doesn't already exist.
 ///
 /// # Errors
