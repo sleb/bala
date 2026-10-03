@@ -124,11 +124,11 @@ pub enum DependencyType {
     StartToFinish,
 }
 
-/// A task as stored and returned by the core library.
+/// A task as stored and returned by the core library (LLD §Data Model).
 ///
-/// Deliberately narrower than the full LLD shape (LLD §Data Model):
-/// `out_of_sync` is omitted, since nothing cascades dates along dependencies
-/// yet and so no task can fall out of sync with its predecessors.
+/// `progress` and `out_of_sync` are computed by `Core` on every read and
+/// never stored; `parent_id` and `depends_on` are filled by the store from
+/// its edges. `StoreTx::put_task` ignores all four.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: TaskId,
@@ -152,6 +152,20 @@ pub struct Task {
     pub progress: f32,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
+    /// How long the task takes, in whole calendar days, so that
+    /// `due = start + duration_days`; `Some(0)` is a milestone. Only
+    /// scheduling reads it, and only for a floating task (LLD
+    /// §Algorithm 3): to place the due date when it moves the start, and
+    /// to fill whichever of the two dates is unset from the other. It is
+    /// never checked against `start_date`/`due_date`, and never applied
+    /// to a task with fixed dates.
+    pub duration_days: Option<u32>,
+    /// `true` when the task's dates were set by a caller rather than left
+    /// to be computed (a floating task). `Core::create_task` and
+    /// `Core::update_task` fix a task whenever they are given a date,
+    /// unless [`TaskPatch::dates_fixed`] says otherwise. Always `false`
+    /// for a task with neither date.
+    pub dates_fixed: bool,
     /// `None` means unassigned. `Core::create_task` validates a `Some`
     /// value against `Store::get_user` before persisting.
     pub assignee_id: Option<UserId>,
@@ -161,6 +175,15 @@ pub struct Task {
     /// its only source. May name a soft-deleted predecessor, since a
     /// soft-deleted task keeps its dependency edges.
     pub depends_on: Vec<Dependency>,
+    /// `true` when this task's dates break at least one of its dependencies
+    /// right now (LLD §Algorithm 3), whether or not its dates are fixed and
+    /// whichever task's dates moved. Computed by the library on every read
+    /// (never set by callers, never persisted): a store always reads it
+    /// back `false` and `StoreTx::put_task` ignores it. A dependency
+    /// constrains nothing while a date it reads on either side is unset or
+    /// its predecessor is soft-deleted, and a soft-deleted task is never
+    /// out of sync.
+    pub out_of_sync: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `Some` means the task is soft-deleted; `None` means live.
@@ -171,6 +194,34 @@ pub struct Task {
     /// `Some` when `status` transitioned to [`TaskStatus::Complete`] via
     /// `Core::complete_task`; `None` for an incomplete task.
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// A schedule computed from the dependency graph (LLD §Algorithm 3): the
+/// dates every live task would have once each floating task is moved late
+/// enough to respect its dependencies. It is a proposal: computing one
+/// writes nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Schedule {
+    /// One entry per task whose `start_date` or `due_date` would change,
+    /// predecessors before their successors.
+    pub moved: Vec<Rescheduled>,
+    /// Every live task that would still break at least one dependency with
+    /// the moves applied, at the dates it would then have and with
+    /// [`Task::out_of_sync`] `true`. Scheduling never moves a task with
+    /// fixed dates or a completed one, so these are the tasks it could not
+    /// bring into line. In the order the tasks were listed.
+    pub out_of_sync: Vec<Task>,
+}
+
+/// One task a [`Schedule`] would move.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rescheduled {
+    /// The task as it is now.
+    pub before: Task,
+    /// The task as scheduled. Differs from `before` only in `start_date`
+    /// and `due_date`, and in `out_of_sync`, which reflects the scheduled
+    /// dates of the task and its predecessors.
+    pub after: Task,
 }
 
 /// How `Core::delete_task` should treat a deleted task's children (LLD
@@ -216,6 +267,8 @@ pub struct NewTask {
     pub type_key: Option<String>,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
+    /// See [`Task::duration_days`].
+    pub duration_days: Option<u32>,
     /// `None` means unassigned; `Some` must name an existing [`User`].
     pub assignee_id: Option<UserId>,
 }
@@ -277,6 +330,14 @@ pub struct TaskPatch {
     pub start_date: Field<NaiveDate>,
     /// `Clear` maps to `None`.
     pub due_date: Field<NaiveDate>,
+    /// `Clear` maps to `None`.
+    pub duration_days: Field<u32>,
+    /// Overrides the fixed flag `Core::update_task` would otherwise leave
+    /// on the task (see [`Task::dates_fixed`]): `Set(false)` floats the
+    /// dates, even ones set by the same patch; `Set(true)` fixes them.
+    /// `Clear` behaves as `Keep`. A task with neither date ends up not
+    /// fixed whatever is asked.
+    pub dates_fixed: Field<bool>,
     /// `Clear` unassigns the task.
     pub assignee_id: Field<UserId>,
     pub type_key: Field<String>,
@@ -402,8 +463,11 @@ mod tests {
             progress: 0.0,
             start_date: None,
             due_date: None,
+            duration_days: None,
+            dates_fixed: false,
             assignee_id: None,
             depends_on: Vec::new(),
+            out_of_sync: false,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -429,8 +493,11 @@ mod tests {
             progress: 1.0,
             start_date: None,
             due_date: None,
+            duration_days: None,
+            dates_fixed: false,
             assignee_id: None,
             depends_on: Vec::new(),
+            out_of_sync: false,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -449,6 +516,7 @@ mod tests {
             type_key: None,
             start_date: None,
             due_date: None,
+            duration_days: None,
             assignee_id: None,
         };
         assert_eq!(new_task.type_key, None);
@@ -502,6 +570,8 @@ mod tests {
         assert_eq!(patch.description, Field::Keep);
         assert_eq!(patch.start_date, Field::Keep);
         assert_eq!(patch.due_date, Field::Keep);
+        assert_eq!(patch.duration_days, Field::Keep);
+        assert_eq!(patch.dates_fixed, Field::Keep);
         assert_eq!(patch.assignee_id, Field::Keep);
         assert_eq!(patch.type_key, Field::Keep);
     }

@@ -1262,6 +1262,7 @@ fn submit_new_subtask<S: Store>(
         type_key: None,
         start_date: None,
         due_date: None,
+        duration_days: None,
         assignee_id: None,
     };
 
@@ -1316,6 +1317,7 @@ fn submit_new_title<S: Store>(app: &mut App, core: &mut Core<S>, buffer: String)
         type_key: None,
         start_date: None,
         due_date: None,
+        duration_days: None,
         assignee_id: None,
     };
 
@@ -1744,6 +1746,7 @@ mod tests {
                 type_key: None,
                 start_date: None,
                 due_date: None,
+                duration_days: None,
                 assignee_id: None,
             })
             .expect("create_task should succeed");
@@ -1777,6 +1780,7 @@ mod tests {
                 type_key: None,
                 start_date: None,
                 due_date: None,
+                duration_days: None,
                 assignee_id: None,
             })
             .expect("create_task should succeed");
@@ -1813,6 +1817,7 @@ mod tests {
                 type_key: None,
                 start_date: None,
                 due_date: None,
+                duration_days: None,
                 assignee_id: None,
             })
             .expect("create_task should succeed");
@@ -1851,6 +1856,7 @@ mod tests {
                 type_key: None,
                 start_date: None,
                 due_date: None,
+                duration_days: None,
                 assignee_id: None,
             })
             .expect("create_task should succeed");
@@ -2002,6 +2008,7 @@ mod tests {
                 type_key: None,
                 start_date: None,
                 due_date: None,
+                duration_days: None,
                 assignee_id: None,
             })
             .expect("create_task should succeed");
@@ -2125,6 +2132,7 @@ mod tests {
                 type_key: None,
                 start_date: None,
                 due_date: None,
+                duration_days: None,
                 assignee_id: None,
             })
             .expect("create_task should succeed");
@@ -2717,6 +2725,7 @@ mod tests {
             type_key: None,
             start_date: None,
             due_date: None,
+            duration_days: None,
             assignee_id: None,
         }
     }
@@ -3049,6 +3058,8 @@ mod tests {
         assert_eq!(child.assignee_id, Some(user.id));
         assert_eq!(child.start_date, Some(start));
         assert_eq!(child.due_date, Some(due));
+        // Dates copied from the parent are entered dates like any other.
+        assert!(child.dates_fixed);
     }
 
     #[test]

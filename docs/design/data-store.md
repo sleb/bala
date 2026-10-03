@@ -13,7 +13,7 @@ deferred here. LLD-core-library.md has since gone further and fixed the
 actual boundary this component must satisfy: a synchronous `Store`/`StoreTx`
 Rust trait pair (not a network contract), with hierarchy and dependency
 edges stored as distinct edge sets rather than folded into the task row,
-and every multi-task write (cascade, subtree delete/complete) wrapped in
+and every multi-task write (reschedule, subtree delete/complete) wrapped in
 one `Store::transaction` call that must commit atomically or not at all.
 The hierarchy is a tree (HLD §Product Assumptions): a task has at most one
 parent, so it has one hierarchy edge, and the schema enforces that with a
@@ -116,10 +116,8 @@ sync):
 ```sql
 -- Bala schema baseline (docs/design/data-store.md §Schema).
 --
--- Some columns and tables are not read by `bala-core` yet
--- (`dependency_edges`; `tasks.assignee_id`, `out_of_sync`, `completed_at`,
--- `deleted_at`). They are part of the designed schema so the features that
--- use them need no table rebuild.
+-- Every table and column here is read and written through `bala-core`'s
+-- `Store`/`StoreTx` traits.
 
 CREATE TABLE task_types (
     key         TEXT PRIMARY KEY,
@@ -141,14 +139,16 @@ CREATE TABLE tasks (
     status        TEXT NOT NULL CHECK (status IN ('incomplete', 'complete')),
     start_date    TEXT,                      -- ISO-8601 date
     due_date      TEXT,
+    duration_days INTEGER,                   -- whole calendar days; 0 = milestone
+    dates_fixed   INTEGER NOT NULL DEFAULT 0, -- 0/1; 0 = the dates float
     assignee_id   BLOB REFERENCES users(id),
-    out_of_sync   INTEGER NOT NULL DEFAULT 0, -- 0/1
     created_at    TEXT NOT NULL,              -- RFC 3339 UTC
     updated_at    TEXT NOT NULL,
     completed_at  TEXT,
     deleted_at    TEXT                        -- soft-delete tombstone; NULL = live
 );
 -- progress is library-computed on read (Core LLD §Algorithm 4) — no column.
+-- out_of_sync likewise (Core LLD §Algorithm 3) — no column.
 
 CREATE INDEX idx_tasks_type_live     ON tasks(type_key)     WHERE deleted_at IS NULL;
 CREATE INDEX idx_tasks_status_live   ON tasks(status)       WHERE deleted_at IS NULL;
@@ -186,7 +186,7 @@ CREATE TABLE dependency_edges (
                                                  -- add_dependency_edge upserts, doesn't duplicate
 );
 -- PK's leading column (predecessor_id) indexes "what depends on X"
--- (cascade forward-propagation, Core LLD §Algorithm 3; list_successor_edges).
+-- (list_successor_edges).
 -- Reverse needs its own index:
 CREATE INDEX idx_dependency_edges_successor ON dependency_edges(successor_id); -- "what does X depend on"
                                                                                 -- (dependency validity walk, Core LLD §Algorithm 2;
@@ -460,7 +460,7 @@ fine at hundreds of rows.
 - **Transaction atomicity**: a test that runs a `transaction` closure
   which writes several tasks/edges then returns `Err`, asserting nothing
   committed (`get_task` on any of them still returns the pre-transaction
-  state) — this is the one property Core LLD's cascade/subtree-delete
+  state) — this is the one property Core LLD's reschedule/subtree-delete
   guarantees depend on entirely at this layer.
 - **Single-parent correctness**: `parent_edges_should_reject_a_second_edge_for_a_child`
   inserts a second edge row for a task with raw SQL, bypassing the trait,
@@ -510,8 +510,9 @@ back to Core LLD in review and now fixed there:
    directions: `get_parent_edge`/`list_dependency_edges` (the parent of
    `id` / predecessors of `id`, as this LLD already assumed) alongside
    `list_child_edges`/`list_successor_edges` (children of `id` /
-   successors of `id`) for §Algorithm 3's cascade and §Algorithm 4's
-   rollup. No schema change was needed — both directions were already
+   successors of `id`); §Algorithm 4's rollup uses the first, while
+   §Algorithm 3's scheduling pass builds the successor direction itself
+   from each task's `depends_on`. No schema change was needed — both directions were already
    indexed (the unique `idx_parent_edges_child` and
    `idx_parent_edges_parent_pos`; `idx_dependency_edges_successor` and
    the `dependency_edges` PK, see §Schema); this only added the two

@@ -86,7 +86,7 @@ flowchart LR
 |---|---|---|
 | **CLI/TUI Client (v1)** | Terminal rendering (tree/list, task detail, text-based Gantt), keyboard-driven interaction including rescheduling, client-local view state (collapse/expand, zoom — a local config file, not a server-side setting) | Any business rule; calls the Core Library and trusts its answers |
 | **Web Client (future)** | Browser rendering equivalent, mouse drag-to-reschedule, PNG/PDF export | Same — no business logic; talks only to the Web API, never the library directly |
-| **Core Library** | The entire domain layer: task CRUD, hierarchy invariants (one parent per task, no circular nesting), dependency invariants (no self/ancestor deps, cycle detection, typed constraints), typed cascade scheduling (finish-to-start default, plus start-to-start/finish-to-finish/start-to-finish), progress rollup, task-type/label config. Every rule lives here exactly once, exposed as a set of methods any caller — in-process today, wrapped over HTTP later — uses the same way | Rendering, transport, serialization, HTTP concerns |
+| **Core Library** | The entire domain layer: task CRUD, hierarchy invariants (one parent per task, no circular nesting), dependency invariants (no self/ancestor deps, cycle detection, typed constraints), typed dependency scheduling (finish-to-start default, plus start-to-start/finish-to-finish/start-to-finish), progress rollup, task-type/label config. Every rule lives here exactly once, exposed as a set of methods any caller — in-process today, wrapped over HTTP later — uses the same way | Rendering, transport, serialization, HTTP concerns |
 | **Web API (future)** | Pure translation: HTTP routing + JSON (de)serialization + (eventually) auth — ideally ~one endpoint per Core Library method | Any domain logic. If a rule can't be phrased as "call this library method," it doesn't belong in this layer |
 | **Data Store** | Durable persistence of tasks, hierarchy edges (one parent per task), dependency edges, task types, and their timestamps, and minimal user identity rows (`id`, `name`) for task assignment | Any business rules — invariants are enforced by the Core Library before writes |
 
@@ -117,7 +117,9 @@ Task {
   dependsOn: [{predecessorId, type}], // type = finish-to-start (default),
                                        // start-to-start, finish-to-finish,
                                        // or start-to-finish
-  outOfSync: boolean,       // true if manually overridden past a dependency constraint
+  outOfSync: boolean,       // true while the task's dates break one of its
+                             // dependencies; computed on read from them,
+                             // never stored
   progress,                 // rollup %, library-computed, read-only
   createdAt, updatedAt, completedAt
 }
@@ -136,7 +138,8 @@ delete_task(id, mode: Subtree | PromoteChildren) -> DeleteOutcome   // deleted +
 set_parent(id, parentId | null)                -> Task
 add_dependency(id, predecessorId, type)        -> Task
 remove_dependency(id, predecessorId)           -> Task
-preview_cascade(id, TaskPatch)                 -> Vec<Task>     // #61 AC3, no commit
+preview_schedule()                             -> Schedule      // #61 AC5, no commit
+reschedule()                                   -> Schedule      // commits what preview_schedule reports
 get_tree(filter)                               -> Vec<Task>     // progress pre-computed
 list_task_types() / upsert_task_type(...)
 ```
@@ -147,8 +150,12 @@ them consistently rather than parsing strings.
 
 **Contract behaviors the library guarantees** (so no caller reimplements
 them): rejects circular nesting and circular/invalid dependencies;
-cascades a predecessor's date change through successors and returns
-*every* task whose own stored fields it changed from one call, so a
+never moves another task when one is edited — a task whose dates break a
+dependency is flagged `outOfSync` instead, and `preview_schedule`
+computes, without writing it, the schedule that would move every
+floating task late enough to respect its dependencies (which tasks would
+move, before and after, and which would still be out of sync); returns
+*every* task whose own stored fields a call changed, so a
 caller can refresh those rows without re-querying (a delete splits them
 into `deleted` and `updated`, so no caller has to infer which is which;
 a parent whose rolled-up `progress` moved only because its children
@@ -169,7 +176,7 @@ LLD):**
   stories rather than one drag-oriented story: [#65](https://github.com/sleb/bala/issues/65) (TUI, keyboard —
   select a bar, nudge dates with keys/numeric input, same as an editor
   "insert mode") targets v1 and [#66](https://github.com/sleb/bala/issues/66) (Web/GUI, mouse drag) targets
-  the future Web Client. Both call the same `update_task`/`preview_cascade`
+  the future Web Client. Both call the same `update_task`/`preview_schedule`
   methods — only the input mechanism differs, so no new library surface
   is needed for either.
 - [#67](https://github.com/sleb/bala/issues/67) (PNG/PDF export) has no natural terminal output. Options:
@@ -210,7 +217,7 @@ indexing, and transaction boundaries are also deferred there.
 ## Deferred to LLDs
 
 - **CLI/TUI Client LLD (v1):** terminal view components, text-based Gantt rendering/zoom/pan, keyboard-driven rescheduling (replacing drag), export mechanism decision ([#67](https://github.com/sleb/bala/issues/67)), local config file format for view state.
-- **Core Library LLD:** method/error signatures, hierarchy invariant enforcement, dependency cycle detection algorithm, cascade scheduling algorithm (and its "preview before committing" UX per [#61](https://github.com/sleb/bala/issues/61) AC3), progress rollup computation, task-type config storage.
+- **Core Library LLD:** method/error signatures, hierarchy invariant enforcement, dependency cycle detection algorithm, scheduling algorithm (and its "preview before committing" UX per [#61](https://github.com/sleb/bala/issues/61) AC5), progress rollup computation, task-type config storage.
 - **Data Store LLD:** engine choice (embedded, e.g. SQLite, given v1 runs locally in-process), schema, indexing strategy for tree + graph queries at 200+ tasks. Soft- vs. hard-delete for [#12](https://github.com/sleb/bala/issues/12) AC5 is resolved (soft-delete, per Core Library LLD §Context) — the Data Store LLD implements the `deletedAt` tombstone, it doesn't re-decide the question.
 - **Web Client LLD / Web API LLD:** deferred until that phase starts; the Web API LLD should mostly fall out of the Core Library LLD's method list.
 

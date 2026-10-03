@@ -476,6 +476,7 @@ mod tests {
                 type_key: None,
                 start_date: None,
                 due_date: None,
+                duration_days: None,
                 assignee_id: None,
             })
             .expect("create_task should succeed");

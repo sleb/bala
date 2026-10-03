@@ -2,12 +2,13 @@
 //! and drives it from parsed CLI arguments.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use bala_core::{
-    Core, CoreError, DeleteMode, DependencyType, Field, NewTask, StoreError, Task, TaskId,
-    TaskPatch, TaskStatus, TaskType, TreeFilter, UserId,
+    Core, CoreError, DeleteMode, DependencyType, Field, NewTask, Schedule, StoreError, Task,
+    TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, UserId,
 };
 use bala_store::SqliteStore;
 use chrono::NaiveDate;
@@ -40,6 +41,9 @@ pub enum Commands {
     Type(TypeArgs),
     /// Task dependency operations: `add`, `rm`.
     Dep(DepArgs),
+    /// Move floating tasks to the dates their dependencies require, after
+    /// previewing the moves.
+    Schedule(ScheduleArgs),
 }
 
 #[derive(Debug, Args)]
@@ -88,6 +92,10 @@ pub struct AddArgs {
     #[arg(long)]
     pub due: Option<NaiveDate>,
 
+    /// Duration in whole calendar days; `0` is a milestone.
+    #[arg(long, value_name = "DAYS", allow_negative_numbers = true)]
+    pub duration: Option<u32>,
+
     /// Id of the user to assign the new task to.
     #[arg(long)]
     pub assignee: Option<Uuid>,
@@ -109,9 +117,10 @@ pub struct LsArgs {
     pub type_key: Option<String>,
 }
 
-// The four `clear_*` flags below are independent boolean switches (one per
-// clearable field), not overlapping state — a state machine or enum
-// wouldn't fit clap's derive-based flag model any better.
+// The `clear_*` flags below are independent boolean switches (one per
+// clearable field), and `fix`/`float` are a pair clap keeps mutually
+// exclusive — a state machine or enum wouldn't fit clap's derive-based flag
+// model any better.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 pub struct EditArgs {
@@ -141,6 +150,28 @@ pub struct EditArgs {
     /// Clear the task's due date.
     #[arg(long)]
     pub clear_due: bool,
+
+    /// Duration in whole calendar days; `0` is a milestone.
+    #[arg(
+        long,
+        value_name = "DAYS",
+        allow_negative_numbers = true,
+        conflicts_with = "clear_duration"
+    )]
+    pub duration: Option<u32>,
+
+    /// Clear the task's duration.
+    #[arg(long)]
+    pub clear_duration: bool,
+
+    /// Fix the task's dates. A task with no dates is never fixed.
+    #[arg(long, conflicts_with = "float")]
+    pub fix: bool,
+
+    /// Float the task's dates, including any set by this same command
+    /// (setting a date otherwise fixes the task).
+    #[arg(long)]
+    pub float: bool,
 
     /// Id of the user to assign the task to.
     #[arg(long, conflicts_with = "clear_assignee")]
@@ -330,6 +361,13 @@ fn dep_type_abbrev(dep_type: DependencyType) -> &'static str {
     }
 }
 
+#[derive(Debug, Args)]
+pub struct ScheduleArgs {
+    /// Apply the previewed moves without prompting for confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
 /// Errors that can surface while dispatching a command, distinct from
 /// `CoreError` only in that it also covers opening the store itself.
 #[derive(Debug, thiserror::Error)]
@@ -443,6 +481,7 @@ fn run_task_add(db_path: &Path, args: AddArgs) -> Result<(), CliError> {
         type_key: args.type_key,
         start_date,
         due_date,
+        duration_days: args.duration,
         assignee_id,
     };
     let task = core.create_task(new_task)?;
@@ -464,14 +503,15 @@ fn run_task_ls(db_path: &Path, args: &LsArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Renders the one-line summary shared by `task ls`/`edit`/`delete`/
-/// `restore`/`complete`/`reopen`:
-/// `"{indent}[{marker}] {id} {title}{assignee_suffix}"`, where `marker` is
-/// `x` for a completed task and a space otherwise, and `indent` nests one
-/// level under a task's parent (if any) so a child visibly nests
-/// under it — full recursive tree layout is the TUI's job later. Indent is
-/// derived from the task itself rather than taken as a parameter so every
-/// call site computes it the same way.
+/// Renders the one-line summary shared by `task ls`/`edit`/`mv`/`restore`/
+/// `complete`/`reopen`, `dep add`/`rm` and `schedule`:
+/// `"{indent}[{marker}] {id} {title} (type: {type}){assignee}{schedule}"`,
+/// where `marker` is `x` for a completed task and a space otherwise,
+/// `schedule` is [`schedule_suffix`], and `indent` nests one level under a
+/// task's parent (if any) so a child visibly nests under it — full
+/// recursive tree layout is the TUI's job later. Indent is derived from the
+/// task itself rather than taken as a parameter so every call site computes
+/// it the same way.
 fn format_task_line(task: &Task, names: &HashMap<UserId, String>) -> String {
     let indent = if task.parent_id.is_none() { "" } else { "  " };
     let assignee = task
@@ -485,11 +525,42 @@ fn format_task_line(task: &Task, names: &HashMap<UserId, String>) -> String {
         ' '
     };
     format!(
-        "{indent}[{marker}] {} {} (type: {}){assignee}",
+        "{indent}[{marker}] {} {} (type: {}){assignee}{}",
         Uuid::from(task.id),
         task.title,
-        task.type_key
+        task.type_key,
+        schedule_suffix(task)
     )
+}
+
+/// The scheduling part of [`format_task_line`], each piece present only
+/// when it applies: `" {start}..{due}"` when either date is set (ISO
+/// dates, an unset side printed as `?`), `" ({n}d)"` when the task has a
+/// duration, `" (fixed)"` when its dates are fixed, and `" (out of sync)"`
+/// when its dates break one of its dependencies. Empty for a task with none
+/// of them.
+fn schedule_suffix(task: &Task) -> String {
+    let mut suffix = String::new();
+    if task.start_date.is_some() || task.due_date.is_some() {
+        let _ = write!(suffix, " {}", date_range(task));
+    }
+    if let Some(days) = task.duration_days {
+        let _ = write!(suffix, " ({days}d)");
+    }
+    if task.dates_fixed {
+        suffix.push_str(" (fixed)");
+    }
+    if task.out_of_sync {
+        suffix.push_str(" (out of sync)");
+    }
+    suffix
+}
+
+/// `task`'s dates as `"{start}..{due}"`: ISO dates, an unset side printed
+/// as `?`.
+fn date_range(task: &Task) -> String {
+    let side = |date: Option<NaiveDate>| date.map_or_else(|| "?".to_owned(), |d| d.to_string());
+    format!("{}..{}", side(task.start_date), side(task.due_date))
 }
 
 fn run_task_edit(db_path: &Path, args: EditArgs) -> Result<(), CliError> {
@@ -499,6 +570,12 @@ fn run_task_edit(db_path: &Path, args: EditArgs) -> Result<(), CliError> {
         description: field_from(args.description, args.clear_description),
         start_date: field_from(args.start, args.clear_start),
         due_date: field_from(args.due, args.clear_due),
+        duration_days: field_from(args.duration, args.clear_duration),
+        dates_fixed: match (args.fix, args.float) {
+            (true, _) => Field::Set(true),
+            (false, true) => Field::Set(false),
+            (false, false) => Field::Keep,
+        },
         assignee_id: field_from(args.assignee.map(UserId::from), args.clear_assignee),
         type_key: field_from(args.type_key, false),
     };
@@ -654,6 +731,73 @@ fn run_dep_rm(db_path: &Path, args: &DepRmArgs) -> Result<(), CliError> {
     print_task_with_dependencies(&core, &task)
 }
 
+/// Previews the moves a reschedule would make, then, once confirmed (or
+/// with `--yes`), applies them and prints each moved task. With nothing to
+/// move it says so and exits without prompting.
+///
+/// The preview and the reschedule are separate `Core` calls, so a
+/// concurrent change between them can make the preview stale; what is
+/// printed after applying is what the reschedule itself moved.
+///
+/// # Errors
+///
+/// Returns `Err` if the store can't be opened, the confirmation can't be
+/// read from stdin, or an underlying `Core` call fails.
+pub fn run_schedule_command(db_path: &Path, args: &ScheduleArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+
+    let preview = core.preview_schedule()?;
+    print_schedule_preview(&preview);
+    if preview.moved.is_empty() {
+        return Ok(());
+    }
+
+    if !args.yes && !confirm("Apply? [y/N] ")? {
+        println!("Aborted: nothing was moved.");
+        return Ok(());
+    }
+
+    let applied = core.reschedule()?;
+    let names = user_names(&core)?;
+    for rescheduled in &applied.moved {
+        println!("{}", format_task_line(&rescheduled.after, &names));
+    }
+    Ok(())
+}
+
+/// Prints what a reschedule would do: `"N task(s) would move:"` and one
+/// `"  {id} {title}: {old dates} -> {new dates}"` line per move (each side
+/// a [`date_range`]), or `"Nothing to move."` when there are none; then,
+/// only when some task would still break a dependency afterwards,
+/// `"N task(s) would stay out of sync:"` and one `"  {id} {title}"` line
+/// each.
+fn print_schedule_preview(schedule: &Schedule) {
+    if schedule.moved.is_empty() {
+        println!("Nothing to move.");
+    } else {
+        println!("{} task(s) would move:", schedule.moved.len());
+        for rescheduled in &schedule.moved {
+            println!(
+                "  {} {}: {} -> {}",
+                Uuid::from(rescheduled.before.id),
+                rescheduled.before.title,
+                date_range(&rescheduled.before),
+                date_range(&rescheduled.after)
+            );
+        }
+    }
+
+    if !schedule.out_of_sync.is_empty() {
+        println!(
+            "{} task(s) would stay out of sync:",
+            schedule.out_of_sync.len()
+        );
+        for task in &schedule.out_of_sync {
+            println!("  {} {}", Uuid::from(task.id), task.title);
+        }
+    }
+}
+
 /// Every user's name keyed by id, for resolving the assignee column of
 /// [`format_task_line`].
 fn user_names(core: &Core<SqliteStore>) -> Result<HashMap<UserId, String>, CliError> {
@@ -782,11 +926,7 @@ mod tests {
 
     /// Regression test for `task add --inherit`'s date-copying half.
     ///
-    /// `format_task_line` (the only thing `bala task ls`/`task mv`/etc.
-    /// print to stdout) never renders `start_date`/`due_date`, so the
-    /// black-box integration tests in `tests/cli.rs` can only observe the
-    /// assignee half of inheritance via stdout. This test calls
-    /// `run_task_add` in-process instead and reads the result back through
+    /// Calls `run_task_add` in-process and reads the result back through
     /// `Core::list_children` (bypassing stdout entirely) to directly assert
     /// the date fields were actually copied — not just the assignee.
     #[test]
@@ -805,6 +945,7 @@ mod tests {
                 type_key: None,
                 start_date: Some(start),
                 due_date: Some(due),
+                duration_days: None,
                 assignee_id: None,
             })
             .unwrap();
@@ -818,6 +959,7 @@ mod tests {
                 parent: Some(Uuid::from(parent.id)),
                 start: None,
                 due: None,
+                duration: None,
                 assignee: None,
                 inherit: true,
                 type_key: None,
@@ -830,5 +972,7 @@ mod tests {
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].start_date, Some(start));
         assert_eq!(children[0].due_date, Some(due));
+        // Dates copied from the parent are entered dates like any other.
+        assert!(children[0].dates_fixed);
     }
 }

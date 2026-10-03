@@ -58,7 +58,8 @@ impl Store for InMemoryStore {
 impl State {
     /// Clones a stored task as a read returns it: `parent_id` is taken from
     /// the parent edge and `depends_on` from the dependency edges, whatever
-    /// values `put_task` was handed.
+    /// values `put_task` was handed. `progress` and `out_of_sync` come back
+    /// as the `0.0` and `false` that `put_task` stored.
     fn read_task(&self, task: &Task) -> Task {
         let mut task = task.clone();
         task.parent_id = self.parent_of.get(&task.id).copied().flatten();
@@ -94,15 +95,17 @@ impl StoreTx for State {
     }
 
     fn put_task(&mut self, task: &Task) -> Result<(), StoreError> {
-        // `progress` is library-computed, never persisted (`bala-store`'s
-        // SQLite backend has no column for it and always reconstructs
-        // `0.0` on read) — reset it here too, so a caller driving
-        // `StoreTx` directly sees the same non-persistence behavior
-        // regardless of which `Store` backend is live. `Core` always
-        // recomputes the real value before returning a `Task` to its own
-        // callers, so this only matters to a caller bypassing `Core`.
+        // `progress` and `out_of_sync` are library-computed, never
+        // persisted (`bala-store`'s SQLite backend has no column for either
+        // and always reconstructs `0.0` and `false` on read) — reset them
+        // here too, so a caller driving `StoreTx` directly sees the same
+        // non-persistence behavior regardless of which `Store` backend is
+        // live. `Core` always recomputes the real values before returning a
+        // `Task` to its own callers, so this only matters to a caller
+        // bypassing `Core`.
         let mut task = task.clone();
         task.progress = 0.0;
+        task.out_of_sync = false;
         self.tasks.insert(task.id, task);
         Ok(())
     }
@@ -275,8 +278,11 @@ mod tests {
             progress: 0.0,
             start_date: None,
             due_date: None,
+            duration_days: None,
+            dates_fixed: false,
             assignee_id: None,
             depends_on: Vec::new(),
+            out_of_sync: false,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -298,6 +304,42 @@ mod tests {
 
         let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
         assert_eq!(fetched, Some(task));
+    }
+
+    #[test]
+    fn put_task_then_get_task_round_trips_duration_and_dates_fixed() {
+        let store = InMemoryStore::default();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.start_date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1);
+        task.duration_days = Some(3);
+        task.dates_fixed = true;
+        let mut milestone = sample_task("task", TaskStatus::Incomplete);
+        milestone.duration_days = Some(0);
+
+        store
+            .transaction(|tx| {
+                tx.put_task(&task)?;
+                tx.put_task(&milestone)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert_eq!(fetched, Some(task));
+        let fetched = store.transaction(|tx| tx.get_task(milestone.id)).unwrap();
+        assert_eq!(fetched, Some(milestone));
+    }
+
+    #[test]
+    fn put_task_should_not_persist_out_of_sync() {
+        let store = InMemoryStore::default();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.out_of_sync = true;
+
+        store.transaction(|tx| tx.put_task(&task)).unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert!(!fetched.unwrap().out_of_sync);
     }
 
     #[test]

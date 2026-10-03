@@ -172,6 +172,7 @@ bala task add --title "Write docs" \
   --parent <parent-task-id> \
   --start 2026-09-15 \
   --due 2026-09-20 \
+  --duration 5 \
   --assignee <user-id> \
   --type task
 ```
@@ -183,6 +184,7 @@ bala task add --title "Write docs" \
 | `--parent` | no | Id of the task to nest the new task under. A task has at most one parent: giving `--parent` more than once is a usage error and creates nothing. |
 | `--start` | no | Start date, `YYYY-MM-DD`. |
 | `--due` | no | Due date, `YYYY-MM-DD`. |
+| `--duration` | no | Duration in whole calendar days (`due = start + duration`); `0` is a milestone. A negative or non-numeric value is a usage error. It is not checked against `--start`/`--due`; [`bala schedule`](#bala-schedule) uses it to place a floating task's dates. |
 | `--assignee` | no | Id of the user to assign the task to. |
 | `--inherit` | no | Copy assignee/start/due from the `--parent` task for any of those fields not explicitly given. Only meaningful alongside `--parent`; passing it without `--parent` is a usage error. |
 | `--type` | no | Task type key. Defaults to the seeded `task` type when omitted. Fails with a nonzero exit if the key doesn't name a configured task type. |
@@ -190,6 +192,11 @@ bala task add --title "Write docs" \
 `--inherit` fills in `--assignee`/`--start`/`--due` from the new task's
 `--parent` wherever the corresponding flag wasn't given explicitly — an
 explicit flag always wins.
+
+A task created with a start or due date (given explicitly or inherited) has
+its dates fixed; a task created with neither is not. `--duration` alone does
+not fix a task. Use [`bala task edit`](#bala-task-edit)'s `--float` to
+release a task's dates afterwards.
 
 Work that more than one goal needs still has a single parent: nest it under
 one goal and make the others depend on it with [`bala dep add`](#bala-dep-add).
@@ -212,9 +219,21 @@ bala task ls --type task
 | `--type` | no | Only show tasks with this type key. Filtering by a key no task currently has (including one that isn't configured) simply shows no tasks — it's a plain filter, not an existence check. |
 
 Output is one task per line: `[<marker>] <id> <title> (type: <type-key>)`,
-plus ` (assigned: <name>)` when the task has an assignee. `<marker>` is `x`
-for a completed task and a space otherwise. Every task is printed on exactly
-one line. A task with a parent is indented one level; this is a minimal visual cue, not a full recursive
+followed, in this order, by each of these that applies:
+
+- ` (assigned: <name>)` when the task has an assignee;
+- ` <start>..<due>` when either date is set, as `YYYY-MM-DD`, with an unset
+  side printed as `?` (`2026-10-05..?`);
+- ` (<n>d)` when the task has a duration;
+- ` (fixed)` when the task's dates are fixed;
+- ` (out of sync)` when the task's dates break one of its dependencies —
+  for the default `fs` type, when it starts before a task it depends on is
+  due. Starting on that very day is fine. A dependency is not checked while
+  a date it compares is unset or its predecessor is deleted.
+
+A task with no dates and no duration prints none of the last four.
+`<marker>` is `x` for a completed task and a space otherwise. Every task is
+printed on exactly one line. A task with a parent is indented one level; this is a minimal visual cue, not a full recursive
 tree layout (that's planned for the TUI).
 
 ### `bala task edit`
@@ -228,6 +247,7 @@ bala task edit <task-id> \
   --description "Document the CLI commands" \
   --start 2026-09-15 \
   --due 2026-09-20 \
+  --duration 5 \
   --assignee <user-id> \
   --type <type-key>
 ```
@@ -241,12 +261,25 @@ bala task edit <task-id> \
 | `--clear-start` | Clear the start date. Conflicts with `--start`. |
 | `--due` | New due date, `YYYY-MM-DD`. |
 | `--clear-due` | Clear the due date. Conflicts with `--due`. |
+| `--duration` | New duration in whole calendar days; `0` is a milestone. A negative or non-numeric value is a usage error. |
+| `--clear-duration` | Clear the duration. Conflicts with `--duration`. |
+| `--fix` | Fix the task's dates. Conflicts with `--float`. |
+| `--float` | Float the task's dates. Conflicts with `--fix`. |
 | `--assignee` | Id of the user to assign the task to. |
 | `--clear-assignee` | Unassign the task. Conflicts with `--assignee`. |
 | `--type` | New task type key. |
 
-Prints the edited task (and any other tasks affected by the change), one
-per line in the same format as `task ls`.
+Setting `--start` or `--due` fixes the task's dates. `--float` in the same
+command overrides that, so `--start 2026-10-05 --float` records a start date
+the task is not held to; `--fix` and `--float` on their own change only
+whether the existing dates are fixed. A task with no dates is never fixed:
+`--fix` on one has no effect, and clearing a task's last date floats it.
+Changing the duration never fixes or floats a task.
+
+Prints the edited task in the same format as `task ls`. Editing a task
+never changes another one: a task left breaking a dependency by the edit
+prints as ` (out of sync)` until [`bala schedule`](#bala-schedule) moves it
+or its dates are changed by hand.
 
 ### `bala task mv`
 
@@ -374,6 +407,11 @@ that is already linked replaces the dependency's type rather than adding a
 second one; running it again with the same type changes nothing and still
 prints the task.
 
+Adding a dependency never moves either task's dates. If the dependent
+task's dates already break the new dependency, it is still added, and the
+task prints as ` (out of sync)` until its dates or its predecessor's are
+changed to fit.
+
 Prints the task in the same format as `task ls`, followed by one line per
 predecessor it now depends on:
 
@@ -406,6 +444,62 @@ Prints the task and its remaining predecessors, in the same format as
 prints the task. The predecessor may be a deleted task, so a dependency on
 a task that has since been deleted can still be removed. Fails with a
 nonzero exit if the task id doesn't exist or names a deleted task.
+
+## `bala schedule`
+
+Moves floating tasks to the dates their dependencies require, after showing
+what would move and asking for confirmation.
+
+```sh
+bala schedule [--yes]
+```
+
+| Flag | Required | Description |
+| --- | --- | --- |
+| `--yes` | no | Apply the previewed moves without prompting. |
+
+Only a *floating* task moves: one whose dates are not fixed (see `--float`
+under [`bala task edit`](#bala-task-edit)). A task with fixed dates is never
+changed, whatever its predecessors do, and neither is a completed one. Tasks
+move predecessors first, so a chain of floating tasks is carried along in
+one run.
+
+A floating task that starts too early for a dependency moves later, just far
+enough. Its due date follows: at start + duration if it has a duration,
+otherwise keeping the length it had. A floating task with a duration also
+has a missing date filled in, dependency or not: a start with no due date
+gets `due = start + duration`, and a due date with no start gets
+`start = due - duration`. A task with a duration and no dates at all waits
+for a predecessor to give it one.
+
+A start date that is set never moves earlier. A due date can: it follows the
+duration, so a task whose duration is shorter than the span between its
+dates comes out shorter when its start is moved.
+
+The command first prints a preview, changing nothing:
+
+```text
+1 task(s) would move:
+  <task-id> <title>: <start>..<due> -> <start>..<due>
+1 task(s) would stay out of sync:
+  <task-id> <title>
+Apply? [y/N]
+```
+
+Each move line shows the task's current dates, then the dates it would move
+to; an unset date prints as `?`, as in `task ls`. The "would stay out of
+sync" section lists the tasks that would still break a dependency after the
+moves (a fixed task that starts before its predecessor finishes, say) and
+is printed only when there are any.
+
+Answering `y` or `yes` applies the moves and prints each moved task, in the
+same format as `task ls`. Any other answer prints `Aborted: nothing was
+moved.` and changes nothing; the exit code is still zero. With `--yes` the
+preview is still printed, then applied without the prompt.
+
+When no task would move, the command prints `Nothing to move.` (followed by
+the "would stay out of sync" section, if any task is out of sync), does not
+prompt, and exits zero.
 
 ## `bala type`
 

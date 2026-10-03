@@ -12,7 +12,8 @@
 //! behavior over a SQLite-backed store.
 
 use bala_core::{
-    Core, CoreError, Dependency, DependencyType, NewTask, TaskId, TaskStatus, TaskType, TreeFilter,
+    Core, CoreError, Dependency, DependencyType, Field, NewTask, Task, TaskId, TaskPatch,
+    TaskStatus, TaskType, TreeFilter,
 };
 use bala_store::SqliteStore;
 use chrono::NaiveDate;
@@ -29,6 +30,7 @@ fn minimal_new_task(title: &str) -> NewTask {
         type_key: None,
         start_date: None,
         due_date: None,
+        duration_days: None,
         assignee_id: None,
     }
 }
@@ -278,4 +280,70 @@ fn remove_dependency_should_drop_predecessor_from_depends_on() {
     let stored = core.get_task(task.id).unwrap().unwrap();
     assert_eq!(stored.depends_on, []);
     assert_eq!(stored.updated_at, updated.updated_at);
+}
+
+fn day(day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 3, day).unwrap()
+}
+
+/// A task running from `start` to `due`, both days of March 2026.
+fn dated_task(core: &mut Core<SqliteStore>, title: &str, start: u32, due: u32) -> Task {
+    core.create_task(NewTask {
+        start_date: Some(day(start)),
+        due_date: Some(day(due)),
+        ..minimal_new_task(title)
+    })
+    .unwrap()
+}
+
+/// A task with those dates, then floated, so a schedule may move it.
+fn floating_task(core: &mut Core<SqliteStore>, title: &str, start: u32, due: u32) -> Task {
+    let task = dated_task(core, title, start, due);
+    core.update_task(
+        task.id,
+        TaskPatch {
+            dates_fixed: Field::Set(false),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .remove(0)
+}
+
+#[test]
+fn reschedule_should_write_exactly_what_preview_schedule_reported() {
+    let mut core = new_core();
+    let predecessor = dated_task(&mut core, "Predecessor", 1, 10);
+    let floating = floating_task(&mut core, "Floating", 5, 12);
+    let downstream = floating_task(&mut core, "Downstream", 6, 7);
+    let fixed = dated_task(&mut core, "Fixed", 3, 9);
+    for (id, on) in [
+        (floating.id, predecessor.id),
+        (fixed.id, predecessor.id),
+        (downstream.id, floating.id),
+    ] {
+        core.add_dependency(id, on, DependencyType::FinishToStart)
+            .unwrap();
+    }
+    let preview = core.preview_schedule().unwrap();
+
+    let committed = core.reschedule().unwrap();
+
+    let moved_ids: Vec<TaskId> = committed.moved.iter().map(|m| m.after.id).collect();
+    assert_eq!(moved_ids, [floating.id, downstream.id]);
+    for moved in &committed.moved {
+        let stored = core.get_task(moved.after.id).unwrap().unwrap();
+        assert_eq!(stored, moved.after);
+        assert!(!stored.dates_fixed);
+    }
+    // Apart from the `updated_at` bump on each moved task, the committed
+    // schedule is the previewed one.
+    let mut unbumped = committed;
+    for moved in &mut unbumped.moved {
+        moved.after.updated_at = moved.before.updated_at;
+    }
+    assert_eq!(unbumped, preview);
+    let stored = core.get_task(floating.id).unwrap().unwrap();
+    assert_eq!(stored.start_date, Some(day(10)));
+    assert_eq!(stored.due_date, Some(day(17)));
 }

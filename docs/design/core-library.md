@@ -8,7 +8,7 @@
 ## Context
 
 HLD.md fixed the Core Library as the single home for task CRUD, hierarchy
-invariants, dependency invariants, cascade scheduling, and progress rollup,
+invariants, dependency invariants, scheduling, and progress rollup,
 exposed as one method contract that the CLI/TUI calls in-process today and
 a future Web API wraps unchanged. It deliberately left language, exact
 signatures, and algorithms to this LLD. Three decisions from that list
@@ -35,7 +35,7 @@ surface itself rather than just its implementation:
 
 This LLD covers the `bala-core` crate: its module layout, data types,
 error taxonomy, method contract, and the three algorithms (hierarchy
-invariant enforcement, dependency cycle detection, cascade scheduling)
+invariant enforcement, dependency cycle detection, scheduling)
 that carry the real complexity per HLD's consequences section.
 
 ## Decision
@@ -51,7 +51,7 @@ flowchart TB
     subgraph "bala-core crate"
         Facade["Core (facade struct)"]
         Hierarchy["hierarchy\n(reparent, subtree walk, no-cycle check)"]
-        Scheduling["scheduling\n(dependency graph, cascade, out-of-sync)"]
+        Scheduling["scheduling\n(dependency graph, schedule, out-of-sync)"]
         Rollup["rollup\n(progress computation)"]
         Types["types\n(TaskType config)"]
         Model["model\n(Task, TaskPatch, TaskId, errors)"]
@@ -105,9 +105,15 @@ pub struct Task {
     pub status: TaskStatus,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
+    pub duration_days: Option<u32>, // whole calendar days, due = start +
+                                     // duration_days; Some(0) = milestone
+    pub dates_fixed: bool,          // true = dates set by a caller, not
+                                     // computed; false when it has no dates
     pub assignee_id: Option<UserId>,
     pub depends_on: Vec<Dependency>, // predecessors, each typed
-    pub out_of_sync: bool,
+    pub out_of_sync: bool,          // true while its dates break one of
+                                     // its dependencies; computed on read
+                                     // (§Algorithm 3), never stored
     pub progress: f32,              // 0.0..=1.0, library-computed, read-only
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -181,6 +187,10 @@ pub struct TaskPatch {
     pub description: Field<String>,   // Clear -> None
     pub start_date: Field<NaiveDate>, // Clear -> None
     pub due_date: Field<NaiveDate>,   // Clear -> None
+    pub duration_days: Field<u32>,    // Clear -> None
+    pub dates_fixed: Field<bool>,     // overrides the flag update_task
+                                      // would leave (a Set date fixes the
+                                      // task); Clear behaves as Keep
     pub assignee_id: Field<UserId>,   // Clear -> unassign
     pub type_key: Field<String>,
     // parent_id and depends_on are intentionally NOT here — reparenting
@@ -268,7 +278,8 @@ impl<S: Store> Core<S> {
     pub fn remove_dependency(&mut self, id: TaskId, predecessor: TaskId) -> Result<Task, CoreError>;
     pub fn complete_task(&mut self, id: TaskId, cascade: bool) -> Result<Vec<Task>, CoreError>;
     pub fn reopen_task(&mut self, id: TaskId) -> Result<Task, CoreError>;
-    pub fn preview_cascade(&self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError>;
+    pub fn preview_schedule(&self) -> Result<Schedule, CoreError>;
+    pub fn reschedule(&mut self) -> Result<Schedule, CoreError>;
     pub fn get_tree(&self, filter: TreeFilter) -> Result<Vec<Task>, CoreError>;
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>, CoreError>;
     pub fn list_children(&self, id: TaskId) -> Result<Vec<Task>, CoreError>;
@@ -286,6 +297,16 @@ pub enum DeleteMode { Subtree, PromoteChildren }
 pub struct DeleteOutcome {
     pub deleted: Vec<Task>, // tombstoned by this call
     pub updated: Vec<Task>, // survived, but its own fields changed
+}
+
+pub struct Schedule {
+    pub moved: Vec<Rescheduled>, // tasks whose dates change, predecessors first
+    pub out_of_sync: Vec<Task>,  // tasks that still break a dependency afterwards
+}
+
+pub struct Rescheduled {
+    pub before: Task, // as it is now
+    pub after: Task,  // as scheduled
 }
 ```
 
@@ -346,6 +367,33 @@ refreshes `parent_id`. Both fail with `NotFound` for a missing/deleted
   its old parent (`Placement::After(old_parent)`); when the old parent is
   top level, so is `id` afterwards. A task with no parent (already top
   level) is a no-op.
+
+`preview_schedule()` computes a schedule (§Algorithm 3) over every live
+task and returns it without writing anything: `moved` holds each task
+whose `start_date` or `due_date` would change, as it is now and as
+scheduled, and `out_of_sync` each task that would still break a
+dependency with those moves applied. It reads the tasks with one
+`list_tasks` in one transaction; each task already carries its
+dependencies in `depends_on`, so no edge is fetched separately. The
+tasks are handed to the pass in `get_tree`'s order, so the result is the
+same on every call: `out_of_sync` is in that order, and `moved` has
+predecessors before successors, unrelated tasks in that order. Every
+`Task` in the result has `progress` and `out_of_sync` filled like any
+other task `Core` returns, `out_of_sync` against the dates of the state
+it describes: current for `before`, scheduled for `after` and for the
+`out_of_sync` list.
+
+`reschedule()` commits that schedule and returns it. The read, the pass
+and every write run in one transaction, and the pass is the one
+`preview_schedule` runs (`scheduling::plan`, §Algorithm 3), so on the
+same state the two return the same `moved` and `out_of_sync`, in the
+same order. Only the tasks in `moved` are written, each with one
+`put_task` of its scheduled dates: `updated_at` is bumped on those tasks
+alone, and `after` carries the bumped value, so it equals what
+`get_task` then reads. A moved task keeps `dates_fixed = false`, so it
+stays floating and a later schedule may move it again. When nothing
+moves, nothing is written, and a second call straight after the first
+moves nothing.
 
 `set_parent(id, parent)` moves `id` under `parent`; `None` promotes it to
 the top level. The whole read-check-write is one transaction: `id` and
@@ -433,7 +481,7 @@ dependent task (`id`) must be live; the predecessor may be soft-deleted.
 Removing an edge that doesn't exist is a true no-op: no write, and
 `updated_at` is unchanged.
 
-### 3. Cascade scheduling ([#61](https://github.com/sleb/bala/issues/61) AC1–4)
+### 3. Scheduling ([#61](https://github.com/sleb/bala/issues/61) AC1–7)
 
 Each `DependencyType` anchors a different field of the predecessor to a
 different field of the successor:
@@ -445,67 +493,125 @@ different field of the successor:
 | Finish-to-Finish (FF) | `successor.due ≥ predecessor.due` | `due_date` | `due_date` |
 | Start-to-Finish (SF) | `successor.due ≥ predecessor.start` | `start_date` | `due_date` |
 
-`constraint_ok(edge, pred, succ)` and `anchor_date(edge, pred)` are the
-two small per-type functions everything below is built from — the rest
-of the algorithm is type-agnostic once those exist.
+`constraint_ok(dep_type, pred, succ)` and `anchor_date(dep_type, pred)`
+are the two small per-type functions everything below is built from — the
+rest of the algorithm is type-agnostic once those exist. Equality
+satisfies a constraint: a successor may start on the day its predecessor
+is due.
 
-Two distinct triggers, kept separate because they have different
-observable outcomes:
+Editing a task and adding a dependency never move another task; a broken
+dependency is reported, not corrected:
 
-- **A task's own dates are edited directly** (`update_task` on a task
-  that itself has predecessors): for each predecessor edge, if
-  `constraint_ok` is now violated, the edit is **allowed but flags
-  `out_of_sync = true`** on that task (AC4 — manual override, not an
-  auto-correction). A task with multiple predecessor edges (possibly of
-  different types) is out-of-sync if *any* edge is violated.
-- **A predecessor's `start_date` or `due_date` changes, forward
-  propagation to successors** (AC1–2): for every outgoing edge whose
-  constraint is now violated, the successor's *constrained field* shifts
-  forward by the same delta (duration preserved — the other field moves
-  with it), and that shift is *not* flagged out-of-sync — it's the
-  system doing its job, not an override. Because FS/SS constrain the
-  successor's `start_date` while FF/SF constrain its `due_date`, a
-  single predecessor change is checked against all outgoing edges
-  regardless of type — an SS edge can fire off a `start_date` change the
-  same way an FS edge fires off a `due_date` change.
+- **An edit or a new dependency never moves another task.** `update_task`
+  writes only the task it was given, and `add_dependency` writes no date
+  at all. A date entered by hand that breaks a dependency is allowed —
+  a manual override, not an error and not an auto-correction — and so is
+  a dependency added between two tasks whose dates already break it.
+- **A task whose dates break any of its dependency edges is out of
+  sync**, whoever's dates changed: the task's own, or a predecessor's.
+  The flag sits on the successor, whether its dates are fixed or not. A
+  task with several predecessor edges (possibly of different types) is
+  out of sync if *any* one of them is violated.
+- **The flag is computed on read, never stored.** `Core` fills
+  `out_of_sync` on every `Task` it returns (`get_task`, `get_tree`,
+  `list_children`, and each task a mutation returns) by checking
+  `constraint_ok` over the task's `depends_on`, inside the same
+  transaction as the read. Moving dates back into line, or removing the
+  broken dependency, therefore clears it with nothing further to write.
+  `Store::put_task` ignores the field.
+- **Some edges constrain nothing.** An edge whose anchor date or
+  constrained date is unset is satisfied whatever the other is, and so is
+  an edge whose predecessor is soft-deleted (the edge itself is kept, and
+  constrains again once the predecessor is restored). A soft-deleted task
+  is never out of sync.
 
-Cascade algorithm (used by both `update_task`'s forward-propagation step
-and `preview_cascade`):
+A schedule is computed in one pass, `scheduling::plan`, over a list of
+tasks that carry their own dependencies in `depends_on`. It is a pure
+function: it reads no store and writes nothing. `preview_schedule` returns
+its result unwritten and `reschedule` writes it; neither computes a
+schedule any other way.
 
 ```
-fn cascade(changed: TaskId, graph) -> Vec<Task> {
-    let mut touched = HashMap::new();       // TaskId -> Task, dedup + latest value
-    let mut queue = VecDeque::from([changed]);
-    while let Some(current) = queue.pop_front() {
-        let current_task = touched.get(&current).unwrap_or_else(|| graph.task(current));
-        for (successor, edge) in graph.successor_edges_of(current) {  // (task, DependencyType)
-            let succ_task = touched.get(&successor.id).unwrap_or(&successor);
-            if !constraint_ok(edge, current_task, succ_task) {
-                let anchor = anchor_date(edge, current_task);
-                let delta = anchor - constrained_field(edge, succ_task);
-                let shifted = succ_task.shift_by(delta);  // preserves duration; shifts both start and due
-                touched.insert(successor.id, shifted);
-                queue.push_back(successor.id);            // re-examine its own successors
-            }
+fn plan(tasks) -> Schedule {
+    // live tasks only; an edge to a soft-deleted or unlisted task is dropped
+    let mut waiting_for = count of live predecessors, per task;
+    let mut ready = queue of tasks with waiting_for == 0, in list order;
+    while let Some(task) = ready.pop_front() {
+        place(task);                        // against predecessors' planned dates
+        for successor in successors_of(task) {
+            waiting_for[successor] -= 1;
+            if waiting_for[successor] == 0 { ready.push_back(successor); }
         }
     }
-    touched.into_values().collect()
+    Schedule { moved, out_of_sync }
 }
 ```
 
-Because the dependency graph is acyclic by construction (§2 rejects
-cycles at edge-add time, independent of edge type), this queue drains in
-finite steps — a task can be re-pushed if a later relaxation shifts it
-further out (multiple incoming edges), but each push strictly increases
-its constrained field, so the loop terminates. `preview_cascade` runs
-this against an in-memory copy of the affected subgraph and returns the
-result **without** calling `Store::put_task` — same computation, no
-commit, satisfying [#61](https://github.com/sleb/bala/issues/61) AC3's "preview before committing".
+- **Order.** Tasks are placed in topological order of the dependency
+  graph: each task once, after all of its predecessors, against the
+  dates those were just given, so a move carries on down a chain. Tasks
+  that become ready together are placed in list order.
+- **What moves.** Only a live, incomplete task with floating dates
+  (`dates_fixed == false`). A task with fixed dates and a completed task
+  keep their dates exactly as they are, an unset one included, and their
+  successors are placed from those actual dates. A soft-deleted task is
+  ignored: it is not placed, not reported, and its edges constrain
+  nothing.
+- **What is guaranteed.** A `start` that is set never moves earlier.
+  `due` has no such guarantee: it follows the duration (below), so it
+  can end up earlier than it was.
+- **Placement** of a task that can move, whether or not it has
+  predecessors:
+  1. Let S be the latest FS/SS anchor among its predecessors that have
+     that date set. If `start` is unset or earlier than S, `start = S`
+     and `due` follows at `start + length`, where length is
+     `duration_days` if set, else the span the task had (`due − start`)
+     if it had both dates. With neither, only `start` is set. If `start`
+     is already on or after S, this step changes nothing: slack is kept
+     and the task is not pulled earlier.
+  2. If `start` is now set, `due` is unset and the task has a duration,
+     `due = start + duration_days`.
+  3. Let F be the latest FF/SF anchor. If `due` is still unset,
+     `due = F`. If `due` is earlier than F, `start` (if set) and `due`
+     both move later by the difference.
+  4. If `due` is now set, `start` is unset and the task has a duration,
+     `start = due − duration_days`. `start` is only still unset here when
+     step 1 had no S to give it, so this cannot put it before an FS/SS
+     anchor.
+  5. If that leaves `due` before `start`, `due = start`. This happens
+     when a task with no duration and only a due date is given a later
+     start, or one with only a start date is given an earlier due.
 
-`update_task` calls `cascade` whenever `start_date` or `due_date` moves,
-then persists `[changed_task] + touched` inside one `Store::transaction`,
-and returns the full `Vec<Task>` so a caller can refresh every affected
-view without re-querying (HLD §Interfaces guarantee).
+  Steps 2 and 4 only fill a date that is unset and never move one that
+  is set. They need no dependency: a floating task with a start, a
+  duration and no due gets its due date from any schedule, and its
+  successors are then placed against that due date in the same pass. A
+  task with a duration and neither date is left alone until a
+  predecessor gives it one. Date arithmetic stops at the first and last
+  dates the date type can hold rather than overflowing.
+
+  `duration_days` is read here and nowhere else. When step 1 applies it,
+  it replaces the span the task had, so a duration shorter than that span
+  brings `due` earlier than it was; that is the one way a date that was
+  set moves earlier.
+- **Result.** `moved` lists each task whose dates changed (a date filled
+  by step 2 or 4 counts), in placement
+  order (a predecessor before its successors), as `before` and `after`;
+  `after` differs only in the two dates and in `out_of_sync`. A moved
+  task stays floating and its `updated_at` is untouched. `out_of_sync`
+  lists, in list order, each live task that still breaks a dependency at
+  the planned dates: tasks with fixed dates and completed tasks, which
+  the pass may not move.
+- **Idempotence.** Every task that can move ends with `start ≥ S` and
+  `due ≥ F`, and with no date left for its duration to fill, so running
+  `plan` on its own result moves nothing.
+- **Termination.** The walk is a queue of ready tasks, not a recursion,
+  so a chain thousands deep cannot overflow the stack. A task enters the
+  queue at most once, when its last predecessor is placed, so the pass
+  is O(tasks + edges). The graph is acyclic by construction (§2 rejects
+  cycles when an edge is added). Handed a cycle anyway, the tasks on it
+  and everything downstream of it never become ready: they keep their
+  dates and are reported in `out_of_sync` if those break a dependency.
 
 ### 4. Progress rollup ([#39](https://github.com/sleb/bala/issues/39) AC1–5)
 
@@ -639,16 +745,16 @@ pub trait StoreTx {
 `list_child_edges`/`list_successor_edges` are the reverse of
 `get_parent_edge`/`list_dependency_edges` — resolving Data Store LLD's
 §Open Questions item 1 as named trait methods rather than something
-`Core` reconstructs in memory from a bulk `list_tasks`. §Algorithm 3's
-cascade (`graph.successor_edges_of(current)`) calls `list_successor_edges`
-per task walked, and §Algorithm 4's rollup ("children" = reverse lookup
-of `parent_id`) calls `list_child_edges` per task in its post-order
-traversal — both were already relying on this direction existing, just
-without a named method to call.
+`Core` reconstructs in memory from a bulk `list_tasks`. §Algorithm 4's
+rollup ("children" = reverse lookup of `parent_id`) calls
+`list_child_edges` per task. §Algorithm 3's scheduling pass is the
+exception: it already holds every live task, so it builds the successor
+direction itself from their `depends_on` rather than calling
+`list_successor_edges` once per task.
 
-Every `Core` method that touches more than one task (cascade, subtree
-delete/complete) wraps its writes in one `Store::transaction` call, so a
-cascade either commits as a whole or not at all — the Data Store LLD's
+Every `Core` method that touches more than one task (subtree
+delete/complete) wraps its writes in one `Store::transaction` call, so it
+either commits as a whole or not at all — the Data Store LLD's
 job is to make `transaction` atomic for whatever engine it picks, not to
 redesign this boundary.
 
@@ -667,15 +773,22 @@ flagged at the HLD level, not solved by adding locking here.
   `complete_task_should_block_when_children_incomplete_and_cascade_false`,
   `set_parent_should_reject_missing_parent`,
   `delete_task_subtree_should_tombstone_every_descendant`.
-- Cascade tests per `DependencyType`: one predecessor/successor pair for
-  each of FS/SS/FF/SF confirming the right field pair (start↔start,
-  due↔start, due↔due, start↔due) is checked and shifted; plus a mixed
-  case where the same predecessor has both an FS and an SS successor to
-  confirm each is evaluated by its own edge's rule independently.
-- Property-style tests for cascade: random small DAGs (with a random mix
-  of dependency types), assert the post-cascade graph satisfies each
-  edge's own type-specific constraint and that `preview_cascade` and
-  `update_task` agree on the touched set before the latter commits.
+- Scheduling tests call `plan` on plain task lists, with no store: one
+  predecessor/successor pair for each of FS/SS/FF/SF confirming the
+  right pair of dates (due↔start, start↔start, due↔due, start↔due) is
+  read and moved; a predecessor with both an FS and an SS successor,
+  each placed by its own edge's rule; span versus `duration_days`;
+  a duration filling an unset due or start, with and without
+  predecessors, and a successor placed against a due date filled in the
+  same pass; tasks with one date or none; what never moves (fixed, completed,
+  soft-deleted, already late enough); a chain; several predecessors;
+  a second run over the result moving nothing; a chain thousands deep;
+  and a cyclic input. `preview_schedule` is tested through the facade
+  for its before/after values and for writing nothing; `reschedule` for
+  writing exactly what a preview reported, leaving moved tasks floating,
+  bumping `updated_at` on moved tasks only, writing nothing when nothing
+  moves, moving nothing on a second call, and running in one
+  transaction.
 - Delete over a tree: a `Subtree` delete of a branching, several-level
   subtree tombstones every descendant, leaves the tasks around it
   untouched and reports an empty `updated`; a `PromoteChildren` delete
@@ -693,8 +806,8 @@ flagged at the HLD level, not solved by adding locking here.
   two open questions back to this LLD — reverse-edge trait methods and
   `TreeFilter`'s fields — are now resolved above: `list_child_edges`/
   `list_successor_edges` and §Data Model's `TreeFilter`.)
-- **CLI/TUI Client LLD:** how `preview_cascade`'s result is rendered as a
-  confirmation prompt ([#61](https://github.com/sleb/bala/issues/61) AC3) and how `IncompleteChildren`/
+- **CLI/TUI Client LLD:** how `preview_schedule`'s result is rendered as a
+  confirmation prompt ([#61](https://github.com/sleb/bala/issues/61) AC5) and how `IncompleteChildren`/
   `CircularHierarchy`/etc. map to on-screen messages.
 - **Web API LLD:** near-mechanical mapping of this method contract onto
   routes; `CoreError` variants map onto HTTP status + JSON error body.
@@ -710,10 +823,11 @@ flagged at the HLD level, not solved by adding locking here.
   worth revisiting only if a second concrete `Store` impl (e.g. a test
   double shipped in the same binary as production) ever needs to coexist
   at runtime rather than at compile time.
-- `preview_cascade` and the committing path in `update_task` share the
-  same `cascade()` function by construction — there's no way for preview
-  to drift from what actually commits, which is the whole point of
-  [#61](https://github.com/sleb/bala/issues/61) AC3.
+- A schedule is computed by one pure function, `scheduling::plan`, and
+  `preview_schedule` returns its result unwritten. `reschedule` writes
+  `plan`'s result rather than computing its own, so that a preview cannot
+  drift from what is committed
+  ([#61](https://github.com/sleb/bala/issues/61) AC5).
 - The hierarchy is a tree (HLD §Product Assumptions): `parent_id` is an
   `Option<TaskId>` across the model, the facade and the store trait, so
   §1's invariant check and §2's ancestor/descendant walk are loops up one
@@ -721,7 +835,7 @@ flagged at the HLD level, not solved by adding locking here.
   between them, not a second parent, so a task counts toward the rolled-up
   progress of its one parent only. Allowing a second parent later would
   be a breaking change to every caller, including the future Web API.
-- Typed dependencies are similarly load-bearing on §3's cascade algorithm:
+- Typed dependencies are similarly load-bearing on §3's scheduling pass:
   starting with FS-only usage in practice doesn't defer any of this
   complexity, since the constraint/anchor abstraction had to exist from
   the start to keep FS a special case of the general rule rather than a
@@ -731,7 +845,7 @@ flagged at the HLD level, not solved by adding locking here.
 1. [ ] Scaffold `bala-core` crate with the module layout in §Decision
 2. [ ] Implement `model`, `CoreError`, `Field<T>`/`TaskPatch` (no logic yet)
 3. [ ] Implement `hierarchy` module + tests (§Algorithm 1)
-4. [ ] Implement `scheduling` module + tests (§Algorithms 2–3), including `preview_cascade`
+4. [ ] Implement `scheduling` module + tests (§Algorithms 2–3), including `preview_schedule` and `reschedule`
 5. [ ] Implement `rollup` module + tests (§Algorithm 4)
 6. [ ] Implement `complete_task` + `delete_task`/`restore_task` (§Algorithm 5, soft-delete)
 7. [ ] Define in-memory fake `Store` for tests; hand the `Store`/`StoreTx` traits to the Data Store LLD

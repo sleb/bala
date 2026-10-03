@@ -289,8 +289,11 @@ mod tests {
             progress: 0.0,
             start_date: None,
             due_date: None,
+            duration_days: None,
+            dates_fixed: false,
             assignee_id: None,
             depends_on: Vec::new(),
+            out_of_sync: false,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -335,6 +338,30 @@ mod tests {
 
         let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
         assert_eq!(fetched, Some(task));
+    }
+
+    #[test]
+    fn put_task_then_get_task_round_trips_duration_and_dates_fixed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.start_date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1);
+        task.duration_days = Some(3);
+        task.dates_fixed = true;
+        let mut milestone = sample_task("task", TaskStatus::Incomplete);
+        milestone.duration_days = Some(0);
+
+        store
+            .transaction(|tx| {
+                tx.put_task(&task)?;
+                tx.put_task(&milestone)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let fetched = store.transaction(|tx| tx.get_task(task.id)).unwrap();
+        assert_eq!(fetched, Some(task));
+        let fetched = store.transaction(|tx| tx.get_task(milestone.id)).unwrap();
+        assert_eq!(fetched, Some(milestone));
     }
 
     #[test]
