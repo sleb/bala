@@ -15,13 +15,16 @@ Rust trait pair (not a network contract), with hierarchy and dependency
 edges stored as distinct edge sets rather than folded into the task row,
 and every multi-task write (cascade, subtree delete/complete) wrapped in
 one `Store::transaction` call that must commit atomically or not at all.
+The hierarchy is a tree (HLD §Product Assumptions): a task has at most one
+parent, so it has one hierarchy edge, and the schema enforces that with a
+unique index (§Schema).
 
 Three decisions are resolved here rather than left open, since — like
 Core LLD's three — they shape the schema and index design, not just its
 implementation:
 
 - **Engine: SQLite via `rusqlite`.** The trait boundary already commits to
-  a relational edge-table shape (`list_parent_edges`, `add_dependency_edge`,
+  a relational edge-table shape (`get_parent_edge`, `add_dependency_edge`,
   etc., not "mutate an array embedded in a task document"), and that shape
   needs indexed reverse lookups (children-of, successors-of) and
   multi-row atomic transactions — both of which a relational engine gives
@@ -151,25 +154,24 @@ CREATE INDEX idx_tasks_type_live     ON tasks(type_key)     WHERE deleted_at IS 
 CREATE INDEX idx_tasks_status_live   ON tasks(status)       WHERE deleted_at IS NULL;
 CREATE INDEX idx_tasks_assignee_live ON tasks(assignee_id)  WHERE deleted_at IS NULL;
 
--- Every task has at least one parent edge, and every edge a sibling position.
+-- Every task has exactly one parent edge, and every edge a sibling position.
 --
---  * A top-level task has exactly one edge, with `parent_id IS NULL`.
+--  * The edge names the task's one parent; `parent_id IS NULL` means the
+--    task is at the top level.
 --  * `position` (0-based, per parent; NULL parent = the root list) orders
 --    siblings.
---  * "Exactly one NULL edge XOR one-or-more real edges" is enforced in code
---    (`Parents` + `replace_parent_edges`), not by triggers; the schema only
---    guarantees at most one NULL edge per child and no duplicate real edge.
+--  * "At most one edge per task" is enforced by the unique index on
+--    `child_id`, so a task cannot have two parents, nor be both top level
+--    and under a parent. "At least one" is not a constraint: it holds
+--    because `set_parent_edge` writes a new task's edge in the transaction
+--    that creates it and only ever replaces that edge afterwards.
 CREATE TABLE parent_edges (
     parent_id BLOB REFERENCES tasks(id),           -- NULL = top level
     child_id  BLOB NOT NULL REFERENCES tasks(id),
     position  INTEGER NOT NULL
 );
 
-CREATE UNIQUE INDEX idx_parent_edges_real_pair ON parent_edges(parent_id, child_id)
-    WHERE parent_id IS NOT NULL;                                        -- no duplicate real edge
-CREATE UNIQUE INDEX idx_parent_edges_one_null ON parent_edges(child_id)
-    WHERE parent_id IS NULL;                                            -- at most one NULL edge
-CREATE INDEX idx_parent_edges_child ON parent_edges(child_id);            -- parents of X
+CREATE UNIQUE INDEX idx_parent_edges_child ON parent_edges(child_id);     -- one parent per task; parent of X
                                                                           -- (hierarchy upward walk, Core LLD §Algorithm 1)
 CREATE INDEX idx_parent_edges_parent_pos ON parent_edges(parent_id, position); -- ordered children of X
                                                                           -- (rollup, subtree delete)
@@ -249,28 +251,28 @@ is frozen.
 `users(id)`, so a task can only name a user that was stored with `put_user`;
 the Core LLD's user-validation invariant relies on this FK.
 
-**`parent_edges` invariant.** Every task has parent edges: a top-level task
-has exactly one edge with `parent_id IS NULL` (the NULL "parent" is the root
-sibling list), and a subtask has one or more real edges. `position` orders a
-parent's children 0.. (the roots when the parent is NULL). The invariant
-"exactly one NULL edge XOR one or more real edges per task" is **not** a DB
-constraint (no triggers): it holds because `Parents` cannot express a mix and
-`replace_parent_edges` is the only writer; the schema only forbids a second
-NULL edge or a duplicate real edge, via the two partial unique indexes.
+**`parent_edges` invariant.** Every task has exactly one parent edge row. A
+subtask's row names its one parent; a top-level task's row has `parent_id IS
+NULL` (the NULL "parent" is the root sibling list). `position` orders a
+parent's children 0.. (the roots when the parent is NULL). The "at most one"
+half is a DB constraint: the unique index `idx_parent_edges_child` on
+`child_id` rejects a second row for a task whatever parent it names, so a
+task can neither have two parents nor be both top level and under a parent.
+The "at least one" half is **not** a DB constraint (no triggers): `put_task`
+writes no edge, and the invariant holds because Core calls `set_parent_edge`
+in the transaction that creates a task and `set_parent_edge`, the only
+writer, replaces the row (delete, then insert) rather than removing it.
 
 Deletion is soft-delete only (Core LLD §Context, resolved there): `DELETE
 FROM tasks` is never issued by this crate outside of the (unused today)
 possibility of a future hard-purge job; `delete_task` maps to `UPDATE
 tasks SET deleted_at = ?`. Edge rows for a tombstoned task are **not**
-cascade-deleted — Core LLD's delete algorithm (§Method Contract) already
-computes which specific parent/child edges to drop before the tombstone
-ever gets written, so `bala-store` only ever removes the edges `bala-core`
-explicitly asks it to via `replace_parent_edges`/`remove_dependency_edge`.
-Consequently a tombstoned task keeps its own parent edges (or NULL edge), and
-appears in `list_child_edges` of its parents and, if top level, of `None`;
+cascade-deleted: `bala-store` only ever changes the edges `bala-core`
+explicitly asks it to via `set_parent_edge`/`remove_dependency_edge`.
+Consequently a tombstoned task keeps its own parent edge (real or NULL), and
+appears in `list_child_edges` of its parent or, if top level, of `None`;
 every task row, live or tombstoned, satisfies the edge invariant, and readers
-skip tombstoned ids via `get_task`. (A child orphaned by a subtree delete is
-written as `TopLevel`, so it gets a NULL edge before being tombstoned.)
+skip tombstoned ids via `get_task`.
 
 ## Error Taxonomy
 
@@ -348,20 +350,21 @@ impl<'a> StoreTx for SqliteTx<'a> {
     fn put_task(&mut self, task: &Task) -> Result<(), StoreError> { /* INSERT ... ON CONFLICT(id) DO UPDATE */ }
     fn list_tasks(&mut self, filter: &TreeFilter) -> Result<Vec<Task>, StoreError> { /* see §Query Strategy */ }
 
-    fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+    fn get_parent_edge(&mut self, id: TaskId) -> Result<Option<TaskId>, StoreError> {
         // SELECT parent_id FROM parent_edges WHERE child_id = ? AND parent_id IS NOT NULL
-        // (idx_parent_edges_child; the NULL top-level edge is not a parent)
+        // (idx_parent_edges_child; the NULL top-level edge is not a parent, so a
+        // top-level task and an unknown id both read as `None`)
     }
     fn list_child_edges(&mut self, parent: Option<TaskId>) -> Result<Vec<TaskId>, StoreError> {
         // SELECT child_id FROM parent_edges WHERE parent_id IS ? ORDER BY position
         // (idx_parent_edges_parent_pos). `None` lists the roots. Tombstoned tasks are
         // included: callers filter through `get_task`.
     }
-    fn replace_parent_edges(&mut self, child: TaskId, parents: &Parents, placement: Placement) -> Result<(), StoreError> {
-        // DELETE the child's edges not in `parents`, then INSERT the missing ones per
-        // `placement`: End = MAX(position)+1 under their parent (0 if none);
-        // After(s) = right after sibling `s`, shifting later siblings. Edges already
-        // present keep their position. TopLevel = the single NULL-parent edge.
+    fn set_parent_edge(&mut self, child: TaskId, parent: Option<TaskId>, placement: Placement) -> Result<(), StoreError> {
+        // If the child already has an edge WHERE parent_id IS `parent`, do nothing (it
+        // keeps its position). Otherwise DELETE the child's edge and INSERT the new one
+        // per `placement`: End = MAX(position)+1 under `parent` (0 if none); After(s) =
+        // right after sibling `s`, shifting later siblings. `None` = the NULL-parent edge.
     }
     fn swap_child_positions(&mut self, parent: Option<TaskId>, a: TaskId, b: TaskId) -> Result<(), StoreError> {
         // Read both edges' position WHERE parent_id IS ? AND child_id = ?, then UPDATE each
@@ -388,11 +391,12 @@ impl<'a> StoreTx for SqliteTx<'a> {
 }
 ```
 
-`replace_parent_edges` and `add_dependency_edge` are both **idempotent**, not
-plain inserts: `replace_parent_edges` skips parent ids that already have an edge
-and deduplicates repeated ids in Rust before inserting (the partial unique
-indexes are a backstop, not the mechanism), so a duplicate parent id is a silent
-no-op rather than a constraint-violation error, and a
+`set_parent_edge` and `add_dependency_edge` are both **idempotent**, not
+plain inserts: `set_parent_edge` checks in Rust for the edge it is asked to
+write and leaves it alone if it is already there (the unique index on
+`child_id` is a backstop, not the mechanism), so setting the parent a child
+already has is a silent no-op rather than a constraint-violation error or
+a move to the end of its siblings, and a
 repeated `add_dependency_edge` on an existing pair _replaces_ the type
 rather than erroring — this is what makes that call double as "change an
 existing edge's type" per Core LLD §Algorithm 2 step 4, with no special
@@ -400,7 +404,7 @@ existing edge's type" per Core LLD §Algorithm 2 step 4, with no special
 
 ## Query Strategy: Avoiding N+1 on `list_tasks`
 
-`Task` carries `parent_ids: Vec<TaskId>` and `depends_on: Vec<Dependency>`
+`Task` carries `parent_id: Option<TaskId>` and `depends_on: Vec<Dependency>`
 inline (Core LLD §Data Model), but those live in separate tables here.
 Naively, assembling `N` tasks would cost `1 + 2N` queries (one for the
 task rows, two edge queries per task). Instead, `list_tasks`/`get_tree`'s
@@ -408,11 +412,12 @@ path batches:
 
 1. One query against `tasks` (plus `task_types` if the filter needs it)
    to get the matching id set and scalar fields.
-2. One query against `parent_edges WHERE child_id IN (...)` for the
-   whole id set, grouped by `child_id` in Rust into a `HashMap<TaskId,
-Vec<TaskId>>`.
+2. One query against `parent_edges WHERE child_id IN (...) AND parent_id
+   IS NOT NULL` for the whole id set, collected in Rust into a
+   `HashMap<TaskId, TaskId>` — the unique index on `child_id` means at most
+   one row per task, so there is nothing to group.
 3. One query against `dependency_edges WHERE successor_id IN (...)`,
-   same grouping.
+   grouped by `successor_id` into a `HashMap<TaskId, Vec<Dependency>>`.
 4. Zip the three into `Vec<Task>`.
 
 Four queries regardless of `N` (SQLite's `IN (...)` with a few hundred
@@ -441,7 +446,8 @@ fine at hundreds of rows.
 - `StoreTx` methods are tested directly against `SqliteStore`, one test
   module per table group (`task`, `edges`, `types`), named for behavior
   per the repo's existing convention (LLD-core-library.md §Testing
-  Strategy): e.g. `replace_parent_edges_should_keep_edges_it_was_asked_to_keep`,
+  Strategy): e.g. `set_parent_edge_should_replace_the_previous_parent`,
+  `set_parent_edge_should_keep_position_when_parent_is_unchanged`,
   `add_dependency_edge_should_replace_type_on_existing_pair`,
   `list_tasks_should_exclude_soft_deleted_by_default`,
   `list_child_edges_should_return_all_children_of_multi_child_parent`,
@@ -456,16 +462,29 @@ fine at hundreds of rows.
   committed (`get_task` on any of them still returns the pre-transaction
   state) — this is the one property Core LLD's cascade/subtree-delete
   guarantees depend on entirely at this layer.
-- **Multi-parent / multi-edge correctness**: a task with two parents
-  round-trips both parent ids through `put_task`'s edge-independent
-  design (edges added via `replace_parent_edges`, not embedded in the row) —
-  confirms `list_tasks` batching (§Query Strategy) groups correctly when
-  a child has >1 parent edge row.
+- **Single-parent correctness**: `parent_edges_should_reject_a_second_edge_for_a_child`
+  inserts a second edge row for a task with raw SQL, bypassing the trait,
+  and expects the unique index on `child_id` to reject it whichever parent
+  (real or NULL) either row names.
+  `every_task_should_have_exactly_one_parent_edge_row` drives a task
+  through `set_parent_edge` (top level, under a parent, to another parent,
+  back to the top level, to the parent it already has) and then counts
+  `parent_edges` rows per `child_id` with raw SQL, expecting exactly one
+  for every task. A task's parent round-trips through `put_task`'s
+  edge-independent design (the edge is written by `set_parent_edge`, not
+  embedded in the row).
 - **Foreign-key/constraint smoke test**: writing an edge or dependency
-  referencing a nonexistent task id fails fast via the `PRAGMA
-foreign_keys` constraint, confirming it's actually enabled per
-  connection (a common `rusqlite` footgun — the pragma must be set on
-  every new connection, it isn't a database-file-level setting).
+  referencing a nonexistent task id
+  (`set_parent_edge_referencing_nonexistent_task_fails_foreign_key_check`,
+  `add_dependency_edge_referencing_nonexistent_task_fails_foreign_key_check`)
+  fails fast via the `PRAGMA foreign_keys` constraint, confirming it's
+  actually enabled per connection (a common `rusqlite` footgun — the pragma
+  must be set on every new connection, it isn't a database-file-level
+  setting).
+- **Baseline reset hint**: `open_should_suggest_a_reset_when_the_applied_baseline_differs`
+  creates a file from a different `V1__init` text and expects `open` to
+  fail with the "delete the database file" hint (§Schema, Migration
+  policy).
 - **Migrations against populated databases**: open-time migration handling
   is tested against a file-backed database that already contains rows, not
   only an empty one — `open_should_run_a_rebuild_migration_over_referenced_rows`
@@ -488,15 +507,16 @@ Two things this LLD had made an assumption about because Core LLD's
 back to Core LLD in review and now fixed there:
 
 1. **Reverse-edge lookups.** `StoreTx` now has named methods for both
-   directions: `list_parent_edges`/`list_dependency_edges` (parents of
+   directions: `get_parent_edge`/`list_dependency_edges` (the parent of
    `id` / predecessors of `id`, as this LLD already assumed) alongside
-   new `list_child_edges`/`list_successor_edges` (children of `id` /
+   `list_child_edges`/`list_successor_edges` (children of `id` /
    successors of `id`) for §Algorithm 3's cascade and §Algorithm 4's
-   rollup. No schema change was needed — the reverse direction was
-   already indexed (`idx_parent_edges_child` and the `parent_edges` PK;
-   `idx_dependency_edges_successor` and the `dependency_edges` PK, see
-   §Schema); this only added the two trait methods and their
-   implementations above (§`Store`/`StoreTx` Implementation).
+   rollup. No schema change was needed — both directions were already
+   indexed (the unique `idx_parent_edges_child` and
+   `idx_parent_edges_parent_pos`; `idx_dependency_edges_successor` and
+   the `dependency_edges` PK, see §Schema); this only added the two
+   trait methods and their implementations above (§`Store`/`StoreTx`
+   Implementation).
 2. **`TreeFilter`'s fields.** Now defined in Core LLD (§Data Model):
    `type_key: Option<String>`, `status: Option<TaskStatus>`,
    `assignee_id: Option<UserId>`, `include_deleted: bool` — exactly what
@@ -542,7 +562,7 @@ back to Core LLD in review and now fixed there:
 2. [ ] Write `V1__init.sql` per §Schema; `SqliteStore::open`/`open_in_memory`
 3. [ ] Implement `task` module (`get_task`, `put_task`, batched `list_tasks` per §Query Strategy)
 4. [ ] Implement `edges` module (`parent_edges`, `dependency_edges`, both directions —
-       `list_parent_edges`/`list_child_edges`, `list_dependency_edges`/`list_successor_edges` —
+       `get_parent_edge`/`list_child_edges`, `list_dependency_edges`/`list_successor_edges` —
        idempotent add, plain remove)
 5. [ ] Implement `types` module (`task_types` CRUD)
 6. [ ] Implement `Store::transaction` (`RefCell`-based, §Decision) and wire `SqliteTx`

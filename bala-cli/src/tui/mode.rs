@@ -38,7 +38,7 @@ pub enum Mode {
 /// `Delete` is the `dd` sequence on a task with no children, confirmed with
 /// `y`/`n`. `DeleteWithChildren` is `dd` on a task that has children, which
 /// asks how to treat them: `s` deletes the whole subtree, `p` promotes the
-/// children to the task's parents, `n`/`Esc` cancels. `CompleteCascade` is
+/// children to the task's parent (or to top level), `n`/`Esc` cancels. `CompleteCascade` is
 /// the confirmation for completing a task that has incomplete children
 /// (which completes them too). `InheritFromParent` is the prompt shown
 /// after creating a new subtask (`o`) whose parent has an assignee and/or
@@ -81,8 +81,8 @@ pub enum DetailField {
 ///   title/description, edited from the Detail pane.
 /// - `NewSubtaskTitle(TaskId)`: a new subtask's title, under the given
 ///   parent task id (`o`).
-/// - `Parents(TaskId)`: reparenting the given task; the buffer holds a
-///   comma-separated list of its parent ids.
+/// - `Parent(TaskId)`: reparenting the given task; the buffer holds its
+///   single parent id, or is empty for a top-level task.
 /// - `TypeKey(TaskId)`: the given task's `type_key`, edited from the list;
 ///   the buffer holds the raw type key being typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +91,6 @@ pub enum EditableField {
     Title(TaskId),
     Description(TaskId),
     NewSubtaskTitle(TaskId),
-    Parents(TaskId),
+    Parent(TaskId),
     TypeKey(TaskId),
 }

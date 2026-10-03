@@ -6,9 +6,9 @@
 //! without a real database.
 //!
 //! Parent edges are kept in two maps mirroring the SQLite `parent_edges`
-//! table: child -> parents (`None` = the NULL top-level edge) and parent ->
-//! children in position order (`None` = the root list). A child's position
-//! is its index in the parent's list.
+//! table: child -> its one parent (`None` = the NULL top-level edge) and
+//! parent -> children in position order (`None` = the root list). A child's
+//! position is its index in the parent's list.
 //!
 //! Dependency edges are likewise kept in two maps mirroring the SQLite
 //! `dependency_edges` table: successor -> its predecessors (each with the
@@ -19,8 +19,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::model::{
-    Dependency, DependencyType, Parents, Placement, Task, TaskId, TaskType, TreeFilter, User,
-    UserId,
+    Dependency, DependencyType, Placement, Task, TaskId, TaskType, TreeFilter, User, UserId,
 };
 use crate::store::{Store, StoreError, StoreTx};
 
@@ -34,8 +33,9 @@ pub struct InMemoryStore {
 struct State {
     users: HashMap<UserId, User>,
     tasks: HashMap<TaskId, Task>,
-    /// child -> its parents; `None` is a top-level task's NULL edge.
-    parents_of: HashMap<TaskId, Vec<Option<TaskId>>>,
+    /// child -> its parent; `None` is a top-level task's NULL edge. A
+    /// child with no entry has no edge at all.
+    parent_of: HashMap<TaskId, Option<TaskId>>,
     /// parent (`None` = the root list) -> children, in position order.
     children_of: HashMap<Option<TaskId>, Vec<TaskId>>,
     /// successor -> the tasks it depends on, in insertion order.
@@ -56,10 +56,12 @@ impl Store for InMemoryStore {
 }
 
 impl State {
-    /// Clones a stored task as a read returns it: `depends_on` is taken
-    /// from the dependency edges, whatever value `put_task` was handed.
+    /// Clones a stored task as a read returns it: `parent_id` is taken from
+    /// the parent edge and `depends_on` from the dependency edges, whatever
+    /// values `put_task` was handed.
     fn read_task(&self, task: &Task) -> Task {
         let mut task = task.clone();
+        task.parent_id = self.parent_of.get(&task.id).copied().flatten();
         task.depends_on = self
             .predecessors_of
             .get(&task.id)
@@ -126,56 +128,35 @@ impl StoreTx for State {
             .collect())
     }
 
-    fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
-        Ok(self
-            .parents_of
-            .get(&id)
-            .map(|ps| ps.iter().copied().flatten().collect())
-            .unwrap_or_default())
+    fn get_parent_edge(&mut self, id: TaskId) -> Result<Option<TaskId>, StoreError> {
+        Ok(self.parent_of.get(&id).copied().flatten())
     }
 
-    fn replace_parent_edges(
+    fn set_parent_edge(
         &mut self,
         child: TaskId,
-        parents: &Parents,
+        parent: Option<TaskId>,
         placement: Placement,
     ) -> Result<(), StoreError> {
-        // Desired parents: `None` = the NULL edge (top level).
-        let mut wanted: Vec<Option<TaskId>> = Vec::new();
-        match parents {
-            Parents::TopLevel => wanted.push(None),
-            Parents::Under(ids) => {
-                for &id in ids {
-                    if !wanted.contains(&Some(id)) {
-                        wanted.push(Some(id));
-                    }
+        match self.parent_of.insert(child, parent) {
+            // Already under `parent`: the edge keeps its position.
+            Some(old) if old == parent => return Ok(()),
+            Some(old) => {
+                if let Some(siblings) = self.children_of.get_mut(&old) {
+                    siblings.retain(|&c| c != child);
                 }
             }
+            None => {}
         }
-        let existing = self.parents_of.remove(&child).unwrap_or_default();
-        let mut kept = Vec::with_capacity(wanted.len());
-        for old in existing {
-            if wanted.contains(&old) {
-                kept.push(old); // a kept edge keeps its position
-            } else if let Some(siblings) = self.children_of.get_mut(&old) {
-                siblings.retain(|&c| c != child);
-            }
-        }
-        for parent in wanted {
-            if !kept.contains(&parent) {
-                let siblings = self.children_of.entry(parent).or_default();
-                let at = match placement {
-                    Placement::After(sibling) if sibling != child => siblings
-                        .iter()
-                        .position(|&c| c == sibling)
-                        .map_or(siblings.len(), |i| i + 1),
-                    _ => siblings.len(),
-                };
-                siblings.insert(at, child);
-                kept.push(parent);
-            }
-        }
-        self.parents_of.insert(child, kept);
+        let siblings = self.children_of.entry(parent).or_default();
+        let at = match placement {
+            Placement::After(sibling) if sibling != child => siblings
+                .iter()
+                .position(|&c| c == sibling)
+                .map_or(siblings.len(), |i| i + 1),
+            _ => siblings.len(),
+        };
+        siblings.insert(at, child);
         Ok(())
     }
 
@@ -283,7 +264,7 @@ mod tests {
             id: TaskId::new(),
             title: "Title".to_owned(),
             description: None,
-            parent_ids: Vec::new(),
+            parent_id: None,
             type_key: type_key.to_owned(),
             status,
             // `InMemoryStore::put_task` always resets `progress` to `0.0`
@@ -394,65 +375,133 @@ mod tests {
     }
 
     #[test]
-    fn list_parent_edges_for_task_with_no_parents_returns_empty() {
+    fn get_parent_edge_for_task_with_no_parent_returns_none() {
         let store = InMemoryStore::default();
-        let edges = store
-            .transaction(|tx| tx.list_parent_edges(TaskId::new()))
+        let edge = store
+            .transaction(|tx| tx.get_parent_edge(TaskId::new()))
             .unwrap();
-        assert_eq!(edges, []);
+        assert_eq!(edge, None);
     }
 
     #[test]
-    fn replace_parent_edges_then_list_parent_edges_returns_it() {
+    fn set_parent_edge_then_get_parent_edge_returns_it() {
         let store = InMemoryStore::default();
         let parent = TaskId::new();
         let child = TaskId::new();
 
         store
+            .transaction(|tx| tx.set_parent_edge(child, Some(parent), Placement::End))
+            .unwrap();
+
+        let edge = store.transaction(|tx| tx.get_parent_edge(child)).unwrap();
+        assert_eq!(edge, Some(parent));
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn set_parent_edge_should_replace_the_previous_parent() {
+        let store = InMemoryStore::default();
+        let v = ids(6);
+        let (p, q, a, child, b, c) = (v[0], v[1], v[2], v[3], v[4], v[5]);
+        store
             .transaction(|tx| {
-                tx.replace_parent_edges(child, &Parents::Under(vec![parent]), Placement::End)
+                append(tx, a, Some(p), Placement::End);
+                append(tx, child, Some(p), Placement::End);
+                append(tx, b, Some(p), Placement::End);
+                append(tx, c, Some(q), Placement::End);
+                Ok(())
             })
             .unwrap();
 
-        let edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();
-        assert_eq!(edges, vec![parent]);
+        store
+            .transaction(|tx| tx.set_parent_edge(child, Some(q), Placement::End))
+            .unwrap();
+
+        // One edge, to the new parent: the old one is gone, the former
+        // siblings keep their order, and the child lands at the end.
+        let children = |parent| store.transaction(|tx| tx.list_child_edges(parent)).unwrap();
+        let parent_of = |id| store.transaction(|tx| tx.get_parent_edge(id)).unwrap();
+        assert_eq!(parent_of(child), Some(q));
+        assert_eq!(children(Some(p)), [a, b]);
+        assert_eq!(children(Some(q)), [c, child]);
+
+        // Moving to the top level replaces the real edge with the NULL one,
+        // and moving back under a parent replaces the NULL one.
+        store
+            .transaction(|tx| tx.set_parent_edge(child, None, Placement::End))
+            .unwrap();
+        assert_eq!(parent_of(child), None);
+        assert_eq!(children(Some(q)), [c]);
+        assert_eq!(children(None), [child]);
+        store
+            .transaction(|tx| tx.set_parent_edge(child, Some(p), Placement::After(a)))
+            .unwrap();
+        assert_eq!(parent_of(child), Some(p));
+        assert_eq!(children(None), []);
+        assert_eq!(children(Some(p)), [a, child, b]);
+    }
+
+    #[test]
+    fn get_task_should_take_parent_id_from_the_parent_edge() {
+        let store = InMemoryStore::default();
+        let (parent, other) = (TaskId::new(), TaskId::new());
+        let mut task = sample_task("task", TaskStatus::Incomplete);
+        task.parent_id = Some(other);
+        let id = task.id;
+        store
+            .transaction(|tx| {
+                tx.put_task(&task)?;
+                tx.set_parent_edge(id, Some(parent), Placement::End)
+            })
+            .unwrap();
+
+        // The edge, not the value `put_task` was handed, is what a read
+        // reports, and it follows the edge when the edge moves.
+        let read = |id| {
+            let filter = TreeFilter::default();
+            store
+                .transaction(|tx| {
+                    Ok((
+                        tx.get_task(id)?.unwrap().parent_id,
+                        tx.get_task_including_deleted(id)?.unwrap().parent_id,
+                        tx.list_tasks(&filter)?[0].parent_id,
+                    ))
+                })
+                .unwrap()
+        };
+        assert_eq!(read(id), (Some(parent), Some(parent), Some(parent)));
+        store
+            .transaction(|tx| tx.set_parent_edge(id, None, Placement::End))
+            .unwrap();
+        assert_eq!(read(id), (None, None, None));
     }
 
     #[test]
     fn top_level_task_should_have_single_null_parent_edge() {
         let mut store = State::default();
         let a = TaskId::new();
-        store
-            .replace_parent_edges(a, &Parents::TopLevel, Placement::End)
-            .unwrap();
-        store
-            .replace_parent_edges(a, &Parents::TopLevel, Placement::End)
-            .unwrap();
+        store.set_parent_edge(a, None, Placement::End).unwrap();
+        store.set_parent_edge(a, None, Placement::End).unwrap();
         assert_eq!(store.list_child_edges(None).unwrap(), vec![a]);
-        assert_eq!(store.list_parent_edges(a).unwrap(), []);
+        assert_eq!(store.get_parent_edge(a).unwrap(), None);
         // Moving under a real parent drops the NULL edge; moving back restores one.
         let p = TaskId::new();
-        store
-            .replace_parent_edges(a, &Parents::Under(vec![p]), Placement::End)
-            .unwrap();
+        store.set_parent_edge(a, Some(p), Placement::End).unwrap();
         assert_eq!(store.list_child_edges(None).unwrap(), []);
-        store
-            .replace_parent_edges(a, &Parents::TopLevel, Placement::End)
-            .unwrap();
+        store.set_parent_edge(a, None, Placement::End).unwrap();
         assert_eq!(store.list_child_edges(None).unwrap(), vec![a]);
     }
 
     #[test]
-    fn replace_parent_edges_should_reject_second_null_edge() {
-        // The write API cannot express a second NULL edge (`Parents::TopLevel`
-        // is idempotent); the raw duplicate is rejected by SQLite in
-        // `bala-store`. Here: repeated TopLevel writes never duplicate.
+    fn set_parent_edge_should_reject_second_null_edge() {
+        // The write API cannot express a second NULL edge (setting `None`
+        // on a top-level task changes nothing); the raw duplicate is
+        // rejected by SQLite in `bala-store`. Here: repeated top-level
+        // writes never duplicate.
         let mut store = State::default();
         let a = TaskId::new();
         for _ in 0..3 {
-            store
-                .replace_parent_edges(a, &Parents::TopLevel, Placement::End)
-                .unwrap();
+            store.set_parent_edge(a, None, Placement::End).unwrap();
         }
         assert_eq!(store.list_child_edges(None).unwrap(), vec![a]);
     }
@@ -463,84 +512,19 @@ mod tests {
         let (a, b, c) = (TaskId::new(), TaskId::new(), TaskId::new());
         // Insertion order deliberately differs from any id ordering.
         for id in [b, c, a] {
-            store
-                .replace_parent_edges(id, &Parents::TopLevel, Placement::End)
-                .unwrap();
+            store.set_parent_edge(id, None, Placement::End).unwrap();
         }
         assert_eq!(store.list_child_edges(None).unwrap(), vec![b, c, a]);
     }
 
     #[test]
-    fn replace_parent_edges_should_replace_whole_set_atomically() {
-        let store = InMemoryStore::default();
-        let (a, b, c, child) = (TaskId::new(), TaskId::new(), TaskId::new(), TaskId::new());
-        store
-            .transaction(|tx| {
-                tx.replace_parent_edges(child, &Parents::Under(vec![a, b]), Placement::End)
-            })
-            .unwrap();
-
-        store
-            .transaction(|tx| {
-                tx.replace_parent_edges(child, &Parents::Under(vec![c]), Placement::End)
-            })
-            .unwrap();
-
-        let edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();
-        assert_eq!(edges, vec![c]);
-        assert_eq!(
-            store
-                .transaction(|tx| tx.list_child_edges(Some(a)))
-                .unwrap(),
-            []
-        );
-
-        store
-            .transaction(|tx| tx.replace_parent_edges(child, &Parents::TopLevel, Placement::End))
-            .unwrap();
-        let edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();
-        assert_eq!(edges, []);
-    }
-
-    #[test]
-    fn replace_parent_edges_should_keep_edges_it_was_asked_to_keep() {
-        let store = InMemoryStore::default();
-        let (a, b, c, child) = (TaskId::new(), TaskId::new(), TaskId::new(), TaskId::new());
-        store
-            .transaction(|tx| {
-                tx.replace_parent_edges(child, &Parents::Under(vec![a, b]), Placement::End)
-            })
-            .unwrap();
-
-        store
-            .transaction(|tx| {
-                tx.replace_parent_edges(child, &Parents::Under(vec![b, c, b]), Placement::End)
-            })
-            .unwrap();
-
-        let mut edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();
-        edges.sort_by_key(|&id| Uuid::from(id));
-        let mut expected = vec![b, c];
-        expected.sort_by_key(|&id| Uuid::from(id));
-        assert_eq!(edges, expected);
-        assert_eq!(
-            store
-                .transaction(|tx| tx.list_child_edges(Some(b)))
-                .unwrap(),
-            vec![child]
-        );
-    }
-
-    #[test]
-    fn replace_parent_edges_then_list_child_edges_returns_child() {
+    fn set_parent_edge_then_list_child_edges_returns_child() {
         let store = InMemoryStore::default();
         let parent = TaskId::new();
         let child = TaskId::new();
 
         store
-            .transaction(|tx| {
-                tx.replace_parent_edges(child, &Parents::Under(vec![parent]), Placement::End)
-            })
+            .transaction(|tx| tx.set_parent_edge(child, Some(parent), Placement::End))
             .unwrap();
 
         let edges = store
@@ -700,22 +684,23 @@ mod tests {
         (0..n).map(|_| TaskId::new()).collect()
     }
 
-    fn append(tx: &mut dyn StoreTx, child: TaskId, parents: &Parents, at: Placement) {
-        tx.replace_parent_edges(child, parents, at).unwrap();
+    fn append(tx: &mut dyn StoreTx, child: TaskId, parent: Option<TaskId>, at: Placement) {
+        tx.set_parent_edge(child, parent, at).unwrap();
     }
 
     #[test]
     #[allow(clippy::many_single_char_names)]
-    fn replace_parent_edges_should_keep_position_of_retained_parents() {
+    fn set_parent_edge_should_keep_position_when_parent_is_unchanged() {
         let store = InMemoryStore::default();
-        let v = ids(5);
-        let (p, q, y, child, z) = (v[0], v[1], v[2], v[3], v[4]);
+        let v = ids(4);
+        let (p, y, child, z) = (v[0], v[1], v[2], v[3]);
         store
             .transaction(|tx| {
-                append(tx, y, &Parents::Under(vec![p]), Placement::End);
-                append(tx, child, &Parents::Under(vec![p]), Placement::End);
-                append(tx, z, &Parents::Under(vec![p]), Placement::End);
-                append(tx, child, &Parents::Under(vec![p, q]), Placement::After(z));
+                append(tx, y, Some(p), Placement::End);
+                append(tx, child, Some(p), Placement::End);
+                append(tx, z, Some(p), Placement::End);
+                append(tx, child, Some(p), Placement::After(z));
+                append(tx, child, Some(p), Placement::End);
                 Ok(())
             })
             .unwrap();
@@ -723,28 +708,24 @@ mod tests {
         let under_p = store
             .transaction(|tx| tx.list_child_edges(Some(p)))
             .unwrap();
-        let under_q = store
-            .transaction(|tx| tx.list_child_edges(Some(q)))
-            .unwrap();
 
         assert_eq!(under_p, [y, child, z]);
-        assert_eq!(under_q, [child]);
     }
 
     #[test]
     #[allow(clippy::many_single_char_names)]
-    fn replace_parent_edges_should_place_after_given_sibling() {
+    fn set_parent_edge_should_place_after_given_sibling() {
         let store = InMemoryStore::default();
         let v = ids(7);
         let (p, q, a, b, c, child, other) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
         store
             .transaction(|tx| {
-                append(tx, a, &Parents::Under(vec![p]), Placement::End);
-                append(tx, b, &Parents::Under(vec![p]), Placement::End);
-                append(tx, c, &Parents::Under(vec![q]), Placement::End);
-                append(tx, child, &Parents::Under(vec![p, q]), Placement::After(a));
+                append(tx, a, Some(p), Placement::End);
+                append(tx, b, Some(p), Placement::End);
+                append(tx, c, Some(q), Placement::End);
+                append(tx, child, Some(p), Placement::After(a));
                 // Sibling not under the parent: falls back to End.
-                append(tx, other, &Parents::Under(vec![p]), Placement::After(c));
+                append(tx, other, Some(p), Placement::After(c));
                 Ok(())
             })
             .unwrap();
@@ -752,24 +733,20 @@ mod tests {
         let under_p = store
             .transaction(|tx| tx.list_child_edges(Some(p)))
             .unwrap();
-        let under_q = store
-            .transaction(|tx| tx.list_child_edges(Some(q)))
-            .unwrap();
 
         assert_eq!(under_p, [a, child, b, other]);
-        assert_eq!(under_q, [c, child]);
     }
 
     #[test]
-    fn replace_parent_edges_should_place_top_level_after_given_root() {
+    fn set_parent_edge_should_place_top_level_after_given_root() {
         let store = InMemoryStore::default();
         let v = ids(3);
         let (a, b, child) = (v[0], v[1], v[2]);
         store
             .transaction(|tx| {
-                append(tx, a, &Parents::TopLevel, Placement::End);
-                append(tx, b, &Parents::TopLevel, Placement::End);
-                append(tx, child, &Parents::TopLevel, Placement::After(a));
+                append(tx, a, None, Placement::End);
+                append(tx, b, None, Placement::End);
+                append(tx, child, None, Placement::After(a));
                 Ok(())
             })
             .unwrap();
@@ -787,10 +764,10 @@ mod tests {
         let (p, a, b, r) = (v[0], v[1], v[2], v[3]);
         store
             .transaction(|tx| {
-                append(tx, p, &Parents::TopLevel, Placement::End);
-                append(tx, a, &Parents::Under(vec![p]), Placement::End);
-                append(tx, b, &Parents::Under(vec![p]), Placement::End);
-                append(tx, r, &Parents::TopLevel, Placement::End);
+                append(tx, p, None, Placement::End);
+                append(tx, a, Some(p), Placement::End);
+                append(tx, b, Some(p), Placement::End);
+                append(tx, r, None, Placement::End);
                 Ok(())
             })
             .unwrap();
@@ -809,15 +786,15 @@ mod tests {
 
     #[test]
     #[allow(clippy::many_single_char_names)]
-    fn swap_child_positions_should_swap_only_the_given_parent() {
+    fn swap_child_positions_should_swap_the_two_children() {
         let store = InMemoryStore::default();
-        let v = ids(5);
-        let (p, q, a, b, c) = (v[0], v[1], v[2], v[3], v[4]);
+        let v = ids(4);
+        let (p, a, b, c) = (v[0], v[1], v[2], v[3]);
         store
             .transaction(|tx| {
-                append(tx, a, &Parents::Under(vec![p, q]), Placement::End);
-                append(tx, b, &Parents::Under(vec![p, q]), Placement::End);
-                append(tx, c, &Parents::Under(vec![p]), Placement::End);
+                append(tx, a, Some(p), Placement::End);
+                append(tx, b, Some(p), Placement::End);
+                append(tx, c, Some(p), Placement::End);
                 tx.swap_child_positions(Some(p), a, c)
             })
             .unwrap();
@@ -825,12 +802,8 @@ mod tests {
         let under_p = store
             .transaction(|tx| tx.list_child_edges(Some(p)))
             .unwrap();
-        let under_q = store
-            .transaction(|tx| tx.list_child_edges(Some(q)))
-            .unwrap();
 
         assert_eq!(under_p, [c, b, a]);
-        assert_eq!(under_q, [a, b]);
     }
 
     #[test]
@@ -840,7 +813,7 @@ mod tests {
         let (p, a, b) = (v[0], v[1], v[2]);
         store
             .transaction(|tx| {
-                append(tx, a, &Parents::Under(vec![p]), Placement::End);
+                append(tx, a, Some(p), Placement::End);
                 tx.swap_child_positions(Some(p), a, b)
             })
             .unwrap();

@@ -7,9 +7,9 @@
 
 ## Context
 
-Bala is a new task management app: arbitrarily-nested tasks (which may
-have more than one parent), typed dependencies (finish-to-start as the
-baseline case) with cascading reschedule, and a Gantt view derived from
+Bala is a new task management app: arbitrarily-nested tasks (a tree —
+each task has at most one parent), typed dependencies (finish-to-start as
+the baseline case) with cascading reschedule, and a Gantt view derived from
 task data. It starts single-user / small-team with no existing design
 files.
 
@@ -19,6 +19,18 @@ files.
 - "Arbitrary nesting" means a task can have subtasks, which can have
   their own subtasks, with no depth limit. This lets users model
   initiatives, goals, projects, stories, and subtasks however they like.
+- The hierarchy is a tree: every task has at most one parent. Work that
+  two goals share sits under one of them, and the other goal depends on
+  it — finish-to-finish when the meaning is "goal A is not done until
+  this is done". An earlier design let a task sit under several parents
+  so it could be shared by two goals or projects. That was dropped:
+  dependencies already express the shared-work case, nothing the product
+  requires needs a second parent, and a hierarchy in which a task could
+  have several parents was the source of most hierarchy edge cases (which
+  parent a row is shown under, what a subtree delete may remove,
+  per-parent sibling positions). What
+  was given up: a shared task no longer counts toward a second goal's
+  rolled-up progress, since a dependency does not contribute to progress.
 - Dependencies are finish-to-start (B can't start until A finishes) as
   the baseline case.
 - The Gantt chart is a read view generated from task dates, hierarchy,
@@ -74,9 +86,9 @@ flowchart LR
 |---|---|---|
 | **CLI/TUI Client (v1)** | Terminal rendering (tree/list, task detail, text-based Gantt), keyboard-driven interaction including rescheduling, client-local view state (collapse/expand, zoom — a local config file, not a server-side setting) | Any business rule; calls the Core Library and trusts its answers |
 | **Web Client (future)** | Browser rendering equivalent, mouse drag-to-reschedule, PNG/PDF export | Same — no business logic; talks only to the Web API, never the library directly |
-| **Core Library** | The entire domain layer: task CRUD, hierarchy invariants (no circular nesting, multi-parent reparenting), dependency invariants (no self/ancestor deps, cycle detection, typed constraints), typed cascade scheduling (finish-to-start default, plus start-to-start/finish-to-finish/start-to-finish), progress rollup, task-type/label config. Every rule lives here exactly once, exposed as a set of methods any caller — in-process today, wrapped over HTTP later — uses the same way | Rendering, transport, serialization, HTTP concerns |
+| **Core Library** | The entire domain layer: task CRUD, hierarchy invariants (one parent per task, no circular nesting), dependency invariants (no self/ancestor deps, cycle detection, typed constraints), typed cascade scheduling (finish-to-start default, plus start-to-start/finish-to-finish/start-to-finish), progress rollup, task-type/label config. Every rule lives here exactly once, exposed as a set of methods any caller — in-process today, wrapped over HTTP later — uses the same way | Rendering, transport, serialization, HTTP concerns |
 | **Web API (future)** | Pure translation: HTTP routing + JSON (de)serialization + (eventually) auth — ideally ~one endpoint per Core Library method | Any domain logic. If a rule can't be phrased as "call this library method," it doesn't belong in this layer |
-| **Data Store** | Durable persistence of tasks, hierarchy edges (a task may have multiple parents), dependency edges, task types, and their timestamps, and minimal user identity rows (`id`, `name`) for task assignment | Any business rules — invariants are enforced by the Core Library before writes |
+| **Data Store** | Durable persistence of tasks, hierarchy edges (one parent per task), dependency edges, task types, and their timestamps, and minimal user identity rows (`id`, `name`) for task assignment | Any business rules — invariants are enforced by the Core Library before writes |
 
 This still groups Epics 1, 3, and 4's logic (CRUD, hierarchy, dependencies,
 rollup) into one component rather than three — splitting those at this
@@ -94,10 +106,9 @@ carries it (fields grow in LLD, not here):
 ```
 Task {
   id, title, description,
-  parentIds: [taskId],      // empty = top-level; a task may sit under
-                             // more than one parent (e.g. shared by two
-                             // goals/projects) — hierarchy is a DAG, not
-                             // a strict tree
+  parentId: taskId | null,  // null = top-level; a task has at most one
+                             // parent — hierarchy is a tree (see
+                             // §Product Assumptions)
   type,                     // Initiative | Goal | Project | Story | Task | custom
   status,                   // incomplete | complete (extensible later)
   startDate, dueDate,
@@ -122,7 +133,7 @@ exact signatures/error types are a Core Library LLD concern):
 create_task(NewTask)                          -> Task
 update_task(id, TaskPatch)                     -> Task
 delete_task(id, mode: Subtree | PromoteChildren) -> DeleteOutcome   // deleted + updated
-set_parents(id, newParentIds)                  -> Task
+set_parent(id, parentId | null)                -> Task
 add_dependency(id, predecessorId, type)        -> Task
 remove_dependency(id, predecessorId)           -> Task
 preview_cascade(id, TaskPatch)                 -> Vec<Task>     // #61 AC3, no commit
@@ -186,8 +197,8 @@ with its own logic.
 ### 4. Core Library ↔ Data Store — internal
 
 Not a network contract. The one constraint this HLD fixes: tasks form a
-hierarchy graph (`parentIds` — a DAG, since a task may have more than one
-parent) plus a separate typed dependency edge set (`predecessorId →
+hierarchy tree (`parentId` — each task has at most one parent) plus a
+separate typed dependency edge set (`predecessorId →
 successorId`, each edge carrying a finish-to-start/start-to-start/
 finish-to-finish/start-to-finish type), stored distinctly — hierarchy and
 dependency are related but independent graphs (a dependency validity

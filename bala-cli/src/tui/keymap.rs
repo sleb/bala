@@ -87,10 +87,10 @@ pub enum Action {
     /// `Normal` mode, `List` pane, `f`: cycle the active type filter.
     CycleTypeFilter,
     /// `Normal` mode, `List` pane, `J`: move the focused task down among its
-    /// siblings (under the parent it is rendered beneath).
+    /// siblings.
     MoveTaskDown,
     /// `Normal` mode, `List` pane, `K`: move the focused task up among its
-    /// siblings (under the parent it is rendered beneath).
+    /// siblings.
     MoveTaskUp,
     /// `Normal` mode, `List` pane, `L`: indent the focused task under its
     /// previous sibling (it becomes that sibling's last child).
@@ -358,7 +358,7 @@ pub static CONFIRM_DELETE_CHILDREN_BINDINGS: &[Binding] = &[
         keys: &[KeyCode::Char('p')],
         action: Action::ConfirmDelete(DeleteMode::PromoteChildren),
         label: "p",
-        description: "Delete the task, promoting its subtasks to its parents",
+        description: "Delete the task, promoting its subtasks to its parent",
     },
     Binding {
         keys: &[KeyCode::Char('n'), KeyCode::Esc],
@@ -1181,7 +1181,7 @@ mod tests {
                 .any(|e| e.key == "s" && e.description == "Delete the task and its subtasks")
         );
         assert!(entries.iter().any(|e| e.key == "p"
-            && e.description == "Delete the task, promoting its subtasks to its parents"));
+            && e.description == "Delete the task, promoting its subtasks to its parent"));
         assert!(entries.iter().any(|e| e.key == "n/Esc"));
         assert!(!entries.iter().any(|e| e.key == "y"));
     }

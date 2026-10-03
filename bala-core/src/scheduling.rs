@@ -4,11 +4,12 @@
 //! two distinct tasks passes before it is written; the caller rejects a
 //! self-dependency first. It enforces two invariants: no task depends on
 //! its own ancestor or descendant in the hierarchy, and no chain of
-//! dependencies leads back to where it started. Every walk is an explicit
-//! work-stack, not recursion, as in
+//! dependencies leads back to where it started. No walk recurses, as in
 //! [`hierarchy::check_new_parent`](crate::hierarchy::check_new_parent):
 //! hierarchy depth and dependency chains are unbounded, so a long enough
-//! chain could overflow the process stack if they recursed.
+//! chain could overflow the process stack if they did. The hierarchy is a
+//! tree, so its walks are plain loops up one parent chain; the dependency
+//! graph is a real graph, so its walk is an explicit work-stack.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,12 +22,12 @@ use crate::store::{StoreError, StoreTx};
 /// `id == predecessor` with [`CoreError::SelfDependency`] before calling
 /// this.
 ///
-/// Both hierarchy checks walk upward through every parent of every task
-/// via [`StoreTx::list_parent_edges`]: from `id` looking for `predecessor`
-/// (an ancestor), then from `predecessor` looking for `id` (a descendant
-/// of `id` is exactly a task from which `id` is reachable upward). Each
-/// walk visits only the ancestors of its start, never `id`'s whole
-/// subtree. Then walks the dependency graph from `predecessor` through
+/// Both hierarchy checks follow one parent chain upward via
+/// [`StoreTx::get_parent_edge`]: from `id` looking for `predecessor` (an
+/// ancestor), then from `predecessor` looking for `id` (a descendant of
+/// `id` is exactly a task from which `id` is reachable upward). Each walk
+/// visits only the ancestors of its start, never `id`'s whole subtree.
+/// Then walks the dependency graph from `predecessor` through
 /// what it already depends on, transitively, via
 /// [`StoreTx::list_dependency_edges`], and rejects if `id` turns up: the
 /// new edge would close a cycle. That walk ignores dependency types, and
@@ -46,10 +47,7 @@ pub fn check_new_dependency(
     id: TaskId,
     predecessor: TaskId,
 ) -> Result<(), CoreError> {
-    let up = |tx: &mut dyn StoreTx, task: TaskId| tx.list_parent_edges(task);
-    let is_ancestor = find_path(tx, id, predecessor, up)?.is_some();
-    let is_descendant = !is_ancestor && find_path(tx, predecessor, id, up)?.is_some();
-    if is_ancestor || is_descendant {
+    if has_ancestor(tx, id, predecessor)? || has_ancestor(tx, predecessor, id)? {
         return Err(CoreError::DependsOnRelative {
             task: id,
             other: predecessor,
@@ -71,6 +69,20 @@ pub fn check_new_dependency(
     }
 
     Ok(())
+}
+
+/// Whether `ancestor` is on `task`'s parent chain, at any distance. A plain
+/// loop up the one chain: a task has at most one parent, so there is
+/// nothing to branch into and nothing to revisit.
+fn has_ancestor(tx: &mut dyn StoreTx, task: TaskId, ancestor: TaskId) -> Result<bool, StoreError> {
+    let mut current = tx.get_parent_edge(task)?;
+    while let Some(parent) = current {
+        if parent == ancestor {
+            return Ok(true);
+        }
+        current = tx.get_parent_edge(parent)?;
+    }
+    Ok(false)
 }
 
 /// Finds a path from `start` to `target` by following `neighbors` one edge

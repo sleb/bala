@@ -9,11 +9,10 @@ use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 
 use crate::error::CoreError;
-use crate::hierarchy::replace_parents;
+use crate::hierarchy;
 use crate::model::{
-    DeleteMode, DeleteOutcome, Dependency, DependencyType, Direction, Field, NewTask, Parents,
-    Placement, SiblingOrder, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User,
-    UserId,
+    DeleteMode, DeleteOutcome, Dependency, DependencyType, Direction, Field, NewTask, Placement,
+    SiblingOrder, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User, UserId,
 };
 use crate::rollup;
 use crate::scheduling::check_new_dependency;
@@ -101,8 +100,8 @@ impl<S: Store> Core<S> {
     }
 
     /// Creates a task per LLD §Algorithm: validates the
-    /// title, type key, date range, each given parent, and the assignee,
-    /// then persists the new task and its parent edges. Everything after
+    /// title, type key, date range, the given parent, and the assignee,
+    /// then persists the new task and its parent edge. Everything after
     /// the title check, validation and writes alike, runs in a single
     /// store transaction, and the validation errors below are checked in
     /// the order listed ([`CoreError::Store`] can surface from any step).
@@ -115,22 +114,12 @@ impl<S: Store> Core<S> {
     ///   default) names no configured [`TaskType`].
     /// - [`CoreError::InvalidDateRange`] if both dates are given and
     ///   `due_date` is before `start_date`.
-    /// - [`CoreError::NotFound`] if any of `new.parent_ids` names no
-    ///   existing task.
+    /// - [`CoreError::NotFound`] if `new.parent_id` is `Some` and names no
+    ///   existing, live task.
     /// - [`CoreError::UnknownUser`] if `new.assignee_id` is `Some` and
     ///   names no existing [`User`].
     /// - [`CoreError::Store`] if the backend fails.
-    ///
-    /// A duplicate id in `new.parent_ids` (e.g. a CLI/TUI caller passing
-    /// the same parent twice) is deduplicated up front, keeping the first
-    /// occurrence's position: it is existence-checked once, and
-    /// `task.parent_ids` and the written edges never contain a duplicate,
-    /// which matters because `render::task_rows` builds its child index
-    /// straight off `parent_ids` and would otherwise render the task twice
-    /// under the same parent.
     pub fn create_task(&mut self, new: NewTask) -> Result<Task, CoreError> {
-        let parent_ids = dedupe_parent_ids(new.parent_ids);
-
         if new.title.trim().is_empty() {
             return Err(CoreError::EmptyTitle);
         }
@@ -140,7 +129,7 @@ impl<S: Store> Core<S> {
             id: TaskId::new(),
             title: new.title,
             description: new.description,
-            parent_ids,
+            parent_id: new.parent_id,
             type_key: new.type_key.unwrap_or_else(|| DEFAULT_TYPE_KEY.to_owned()),
             status: TaskStatus::Incomplete,
             progress: 0.0,
@@ -176,10 +165,10 @@ impl<S: Store> Core<S> {
             {
                 return Ok(Err(CoreError::InvalidDateRange { start, due }));
             }
-            for &parent_id in &task.parent_ids {
-                if tx.get_task(parent_id)?.is_none() {
-                    return Ok(Err(CoreError::NotFound(parent_id)));
-                }
+            if let Some(parent_id) = task.parent_id
+                && tx.get_task(parent_id)?.is_none()
+            {
+                return Ok(Err(CoreError::NotFound(parent_id)));
             }
             if let Some(assignee_id) = task.assignee_id
                 && tx.get_user(assignee_id)?.is_none()
@@ -188,14 +177,10 @@ impl<S: Store> Core<S> {
             }
 
             // No cycle check: a new id has no descendants, so it cannot be
-            // an ancestor of any of its parents, and every parent's
-            // existence was checked just above.
+            // an ancestor of its parent, and the parent's existence was
+            // checked just above.
             tx.put_task(&task)?;
-            tx.replace_parent_edges(
-                task.id,
-                &Parents::from_ids(task.parent_ids.clone()),
-                Placement::End,
-            )?;
+            tx.set_parent_edge(task.id, task.parent_id, Placement::End)?;
             // A just-created task has no children of its own yet (nothing
             // can point at `task.id` before this call), so this always
             // degenerates to the same `0.0` a leaf-only placeholder would
@@ -264,7 +249,7 @@ impl<S: Store> Core<S> {
     /// `StoreTx::get_task`, the same pattern `list_children` uses) and
     /// `rollup::direct_children_progress` averages their `status` flags —
     /// a leaf task's `progress` falls back to its own `status`.
-    /// Hierarchy assembly beyond what `Task::parent_ids` already carries is
+    /// Hierarchy assembly beyond what `Task::parent_id` already carries is
     /// still out of scope.
     ///
     /// The base list and every per-task child lookup run inside the same
@@ -432,29 +417,18 @@ impl<S: Store> Core<S> {
 
     /// Deletes a task per LLD §Algorithm: tombstones `id`
     /// (`deleted_at` set, never a hard delete) and, per `mode`, either
-    /// recursively tombstones every child left with no other live parent
-    /// ([`DeleteMode::Subtree`]) or reparents each child onto `id`'s own
-    /// parents, leaving it top-level if `id` had none
-    /// ([`DeleteMode::PromoteChildren`]).
-    ///
-    /// With multiple parents, `Subtree` only ever removes parent-edges,
-    /// not tasks: a child still reachable through another live parent
-    /// keeps existing, just with one less parent edge, so deleting one
-    /// goal can never silently delete a task another goal still needs.
-    /// `PromoteChildren` follows the same rule in reverse: a child with
-    /// other parents besides `id` simply gains an edge to each of `id`'s
-    /// parents alongside the ones it already keeps.
+    /// recursively tombstones every descendant ([`DeleteMode::Subtree`]) or
+    /// reparents each child onto `id`'s own parent, leaving it top-level if
+    /// `id` had none ([`DeleteMode::PromoteChildren`]).
     ///
     /// Everything runs inside one [`Store::transaction`]. Returns a
     /// [`DeleteOutcome`] split by kind: `deleted` holds every task
     /// tombstoned, `updated` every surviving task whose own fields changed
-    /// (a child that lost an edge under `Subtree` but is still reachable
-    /// through another live parent, or a child reparented under
-    /// `PromoteChildren`). Both lists hold only tasks whose own stored row
-    /// changed, each at most once, at its final value, and no id is in
-    /// both. A parent whose rolled-up `progress` changed only because its
-    /// children changed is not included; a caller that shows it re-fetches
-    /// it.
+    /// — the children reparented under `PromoteChildren`; `Subtree` leaves
+    /// it empty. Both lists hold only tasks whose own stored row changed,
+    /// each at most once, at its final value, and no id is in both. A
+    /// parent whose rolled-up `progress` changed only because its children
+    /// changed is not included; a caller that shows it re-fetches it.
     ///
     /// # Errors
     ///
@@ -481,45 +455,29 @@ impl<S: Store> Core<S> {
 
             match mode {
                 DeleteMode::Subtree => {
-                    tombstone_subtree(tx, id, now, &mut outcome)?;
+                    tombstone_subtree(tx, id, now, &mut outcome.deleted)?;
                 }
                 DeleteMode::PromoteChildren => {
-                    // `id`'s own parents, fetched independent of the
-                    // child loop below: they're a separate edge set
-                    // (id-as-child-of-its-parents) from the edges the
-                    // loop mutates (id-as-parent-of-its-children).
-                    let grandparents = tx.list_parent_edges(id)?;
+                    // `id`'s own parent, as read with the task. The loop
+                    // below never changes it: it rewrites the edges of
+                    // `id`'s children, not `id`'s own.
+                    let grandparent = task.parent_id;
 
                     let mut deleted = task;
                     deleted.deleted_at = Some(now);
                     deleted.updated_at = now;
 
                     for child in tx.list_child_edges(Some(id))? {
-                        let mut new_parents = tx.list_parent_edges(child)?;
-                        new_parents.retain(|&p| p != id);
-                        for &grandparent in &grandparents {
-                            if !new_parents.contains(&grandparent) {
-                                new_parents.push(grandparent);
-                            }
-                        }
-                        if let Err(e) = replace_parents(
-                            tx,
-                            child,
-                            &Parents::from_ids(new_parents),
-                            Placement::End,
-                        ) {
+                        if let Err(e) =
+                            hierarchy::set_parent(tx, child, grandparent, Placement::End)
+                        {
                             return Ok(Err(e));
                         }
 
                         if let Some(mut child_task) = tx.get_task(child)? {
-                            child_task.parent_ids.retain(|&p| p != id);
-                            for &grandparent in &grandparents {
-                                if !child_task.parent_ids.contains(&grandparent) {
-                                    child_task.parent_ids.push(grandparent);
-                                }
-                            }
+                            child_task.parent_id = grandparent;
                             // `child`'s own children are untouched by this
-                            // reparent (only its *parent* edges change), so
+                            // reparent (only its *parent* edge changes), so
                             // this is safe to compute at any point in the
                             // loop.
                             child_task.progress = compute_progress(tx, child, child_task.status)?;
@@ -590,8 +548,11 @@ impl<S: Store> Core<S> {
 
     /// Restores a soft-deleted task per LLD §Algorithm. This restores only
     /// the `id` row itself: it is not a full undo for `delete_task`, since
-    /// any descendants that `delete_task` tombstoned stay tombstoned and any
-    /// parent edges it removed stay removed. Looks `id` up via [`StoreTx::get_task_including_deleted`] — unlike
+    /// any descendants that `delete_task` tombstoned stay tombstoned, and a
+    /// descendant restored on its own comes back at the top level, where
+    /// the subtree delete left its parent edge (the task the delete was
+    /// called on keeps its edge, so it comes back under its parent). Looks
+    /// `id` up via [`StoreTx::get_task_including_deleted`] — unlike
     /// `delete_task`'s `get_task`, this must see a tombstoned row, not
     /// just a live one — clears `deleted_at`, bumps `updated_at`, and
     /// persists.
@@ -697,58 +658,51 @@ impl<S: Store> Core<S> {
         Ok(touched)
     }
 
-    /// Bulk, atomic reparent per LLD §Method Contract: replaces
-    /// `id`'s entire parent set with `new_parents` in one commit.
+    /// Moves `id` under `parent` per LLD §Method Contract; `None` promotes
+    /// it to the top level. `id` lands after the new parent's existing
+    /// children, and its subtree moves with it.
     ///
-    /// Every candidate in `new_parents` is checked — for existence and for
-    /// the hierarchy invariant via `hierarchy::check_new_parent` — before
-    /// any edge is touched, so a bad candidate anywhere in the list
-    /// (existence failure or a would-be cycle) leaves `id`'s existing parent
-    /// edges completely untouched rather than partially reparented. An empty `new_parents`
-    /// promotes `id` to top-level.
+    /// The whole read-check-write runs inside one [`Store::transaction`].
+    /// `parent` is checked — for existence and for the hierarchy invariant
+    /// via `hierarchy::check_new_parent` — before anything is written, so a
+    /// rejected call leaves `id`'s parent edge and row untouched. If `id` is
+    /// already under `parent`, nothing is written and the task is returned
+    /// as stored: `updated_at` is unchanged and it keeps its position among
+    /// its siblings.
     ///
     /// # Errors
     ///
-    /// - [`CoreError::NotFound`] if `id`, or any entry in `new_parents`,
-    ///   names no existing task.
-    /// - [`CoreError::CircularHierarchy`] if attaching `id` under any entry
-    ///   in `new_parents` would make `id` its own ancestor.
+    /// - [`CoreError::NotFound`] if `id` or `parent` names no existing, live
+    ///   task; it carries whichever id is missing, `id` first.
+    /// - [`CoreError::CircularHierarchy`] if `parent` is `id` itself or one
+    ///   of its descendants: the move would make `id` its own ancestor.
     /// - [`CoreError::Store`] if the backend fails.
-    ///
-    /// A duplicate id in `new_parents` (e.g. a CLI/TUI caller passing the
-    /// same parent twice) is deduplicated up front, keeping the first
-    /// occurrence's position: `task.parent_ids` and the written edges never
-    /// contain a duplicate, which matters because `render::task_rows`
-    /// builds its child index straight off `parent_ids` and would otherwise
-    /// render the task twice under the same parent.
-    pub fn set_parents(&mut self, id: TaskId, new_parents: Vec<TaskId>) -> Result<Task, CoreError> {
-        let new_parents = dedupe_parent_ids(new_parents);
-
+    pub fn set_parent(&mut self, id: TaskId, parent: Option<TaskId>) -> Result<Task, CoreError> {
         let task = self.store.transaction(|tx| {
             let Some(mut task) = tx.get_task(id)? else {
                 return Ok(Err(CoreError::NotFound(id)));
             };
 
-            for &candidate in &new_parents {
-                if tx.get_task(candidate)?.is_none() {
-                    return Ok(Err(CoreError::NotFound(candidate)));
-                }
+            if let Some(candidate) = parent
+                && tx.get_task(candidate)?.is_none()
+            {
+                return Ok(Err(CoreError::NotFound(candidate)));
             }
 
-            if let Err(e) = replace_parents(
-                tx,
-                id,
-                &Parents::from_ids(new_parents.clone()),
-                Placement::End,
-            ) {
+            if task.parent_id == parent {
+                task.progress = compute_progress(tx, id, task.status)?;
+                return Ok(Ok(task));
+            }
+
+            if let Err(e) = hierarchy::set_parent(tx, id, parent, Placement::End) {
                 return Ok(Err(e));
             }
 
-            task.parent_ids = new_parents;
+            task.parent_id = parent;
             // `status` is untouched by a reparent, and neither is `id`'s
-            // own children set (only `id`'s *parent* edges change here), so
+            // own children set (only `id`'s *parent* edge changes here), so
             // recomputing via `compute_progress` is safe and leaves every
-            // sibling under the old/new parent(s) untouched — this call
+            // sibling under the old and new parent untouched — this call
             // never writes any row but `id`'s own.
             task.progress = compute_progress(tx, id, task.status)?;
             task.updated_at = Utc::now();
@@ -760,13 +714,13 @@ impl<S: Store> Core<S> {
         Ok(task)
     }
 
-    /// Moves `id` one position among the live children of `parent`
-    /// (`None` = the top level), toward the front for [`Direction::Up`] or
-    /// the back for [`Direction::Down`], by swapping with the nearest live
-    /// sibling in that direction (soft-deleted siblings are skipped). Only
-    /// `parent`'s list changes: `id`'s position under any other parent is
-    /// untouched, as are its parents, depth and `updated_at`. The whole
-    /// operation runs in one transaction.
+    /// Moves `id` one position among the live children of its parent (the
+    /// top level for a task with no parent), toward the front for
+    /// [`Direction::Up`] or the back for [`Direction::Down`], by swapping
+    /// with the nearest live sibling in that direction (soft-deleted
+    /// siblings are skipped). Only the order of the parent's children
+    /// changes: `id`'s parent, depth and `updated_at` are untouched. The
+    /// whole operation runs in one transaction.
     ///
     /// Returns `true` if the task moved, `false` if it was already at that
     /// end (a no-op: nothing is written and no error is raised).
@@ -774,42 +728,36 @@ impl<S: Store> Core<S> {
     /// # Errors
     ///
     /// - [`CoreError::NotFound`] if `id` names no live task.
-    /// - [`CoreError::NotUnderParent`] if `id` is not a child of `parent`.
     /// - [`CoreError::Store`] if the backend fails.
-    pub fn move_sibling(
-        &mut self,
-        parent: Option<TaskId>,
-        id: TaskId,
-        direction: Direction,
-    ) -> Result<bool, CoreError> {
+    pub fn move_sibling(&mut self, id: TaskId, direction: Direction) -> Result<bool, CoreError> {
         let moved = self.store.transaction(|tx| {
-            if let Err(e) = live_task(tx, id) {
-                return Ok(Err(e));
-            }
-            let live = match live_siblings(tx, parent, id) {
-                Ok(live) => live,
+            let task = match live_task(tx, id) {
+                Ok(task) => task,
                 Err(e) => return Ok(Err(e)),
             };
-            let at = live.iter().position(|&s| s == id).unwrap_or(0);
-            let neighbor = match direction {
-                Direction::Up => at.checked_sub(1),
-                Direction::Down => Some(at + 1),
-            }
-            .and_then(|i| live.get(i).copied());
+            let live = live_siblings(tx, task.parent_id, id)?;
+            let neighbor = live
+                .iter()
+                .position(|&s| s == id)
+                .and_then(|at| match direction {
+                    Direction::Up => at.checked_sub(1),
+                    Direction::Down => Some(at + 1),
+                })
+                .and_then(|i| live.get(i).copied());
             let Some(neighbor) = neighbor else {
                 return Ok(Ok(false));
             };
-            tx.swap_child_positions(parent, id, neighbor)?;
+            tx.swap_child_positions(task.parent_id, id, neighbor)?;
             Ok(Ok(true))
         })??;
         Ok(moved)
     }
 
     /// Indents `id` under its nearest live previous sibling among the
-    /// children of `parent` (`None` = the top level): `id` leaves `parent`
-    /// and becomes the last child of that sibling. Only `id`'s own parent
-    /// edges change, so its subtree moves with it, and its position under any
-    /// *other* parent is untouched. Runs in one transaction.
+    /// children of its parent (the top level for a task with no parent):
+    /// `id` leaves that parent and becomes the last child of the sibling.
+    /// Only `id`'s own parent edge changes, so its subtree moves with it.
+    /// Runs in one transaction.
     ///
     /// Returns `true` if the task moved, `false` if it has no live previous
     /// sibling (a no-op: nothing is written).
@@ -817,84 +765,58 @@ impl<S: Store> Core<S> {
     /// # Errors
     ///
     /// - [`CoreError::NotFound`] if `id` names no live task.
-    /// - [`CoreError::NotUnderParent`] if `id` is not a child of `parent`.
     /// - [`CoreError::CircularHierarchy`] if the previous sibling is a
-    ///   descendant of `id` (possible in a DAG), via the same guard as
-    ///   [`Core::set_parents`].
+    ///   descendant of `id`, via the same guard as [`Core::set_parent`]. A
+    ///   sibling is never a descendant in a tree, so this cannot arise from
+    ///   a valid store.
     /// - [`CoreError::Store`] if the backend fails.
-    pub fn indent_task(&mut self, parent: Option<TaskId>, id: TaskId) -> Result<bool, CoreError> {
+    pub fn indent_task(&mut self, id: TaskId) -> Result<bool, CoreError> {
         let changed = self.store.transaction(|tx| {
             let mut task = match live_task(tx, id) {
                 Ok(task) => task,
                 Err(e) => return Ok(Err(e)),
             };
-            let live = match live_siblings(tx, parent, id) {
-                Ok(live) => live,
-                Err(e) => return Ok(Err(e)),
-            };
+            let live = live_siblings(tx, task.parent_id, id)?;
             let at = live.iter().position(|&s| s == id);
             let Some(target) = at.and_then(|i| i.checked_sub(1)).map(|i| live[i]) else {
                 return Ok(Ok(false));
             };
-            let mut ids = without(&task.parent_ids, parent);
-            if !ids.contains(&target) {
-                ids.push(target);
-            }
-            Ok(write_parents(tx, &mut task, ids, Placement::End).map(|()| true))
+            Ok(write_parent(tx, &mut task, Some(target), Placement::End).map(|()| true))
         })??;
         Ok(changed)
     }
 
-    /// Outdents `id` one level: it leaves `parent` and joins `grandparent`
-    /// (`None` = the top level), landing immediately after `parent` among
-    /// `grandparent`'s children. `parent` is the task's rendered parent and
-    /// `grandparent` is `parent`'s rendered parent. Only that one path
-    /// changes: any other parents of `id` are kept. Runs in one transaction.
+    /// Outdents `id` one level: it leaves its parent and joins that
+    /// parent's own parent (the top level when the parent has none),
+    /// landing immediately after its old parent among the new siblings.
+    /// Only `id`'s own parent edge changes, so its subtree moves with it.
+    /// Runs in one transaction.
     ///
-    /// If `grandparent` is `None`, `id` becomes top level only when `parent`
-    /// was its sole parent; if other real parents remain, `id` just drops
-    /// `parent` (a task is never both top level and under a parent).
-    ///
-    /// Returns `true` if the task moved, `false` if `parent` is `None`
+    /// Returns `true` if the task moved, `false` if it has no parent
     /// (already top level: nothing is written).
     ///
     /// # Errors
     ///
     /// - [`CoreError::NotFound`] if `id` names no live task.
-    /// - [`CoreError::NotUnderParent`] if `id` is not a child of `parent`,
-    ///   or `parent` is not a child of `grandparent`.
-    /// - [`CoreError::CircularHierarchy`] if the move would create a cycle.
+    /// - [`CoreError::CircularHierarchy`] if the move would create a cycle,
+    ///   via the same guard as [`Core::set_parent`]. A task's grandparent
+    ///   is never its descendant in a tree, so this cannot arise from a
+    ///   valid store.
     /// - [`CoreError::Store`] if the backend fails.
-    pub fn outdent_task(
-        &mut self,
-        parent: Option<TaskId>,
-        grandparent: Option<TaskId>,
-        id: TaskId,
-    ) -> Result<bool, CoreError> {
-        let Some(old_parent) = parent else {
-            return Ok(false);
-        };
+    pub fn outdent_task(&mut self, id: TaskId) -> Result<bool, CoreError> {
         let changed = self.store.transaction(|tx| {
             let mut task = match live_task(tx, id) {
                 Ok(task) => task,
                 Err(e) => return Ok(Err(e)),
             };
-            if !task.parent_ids.contains(&old_parent) {
-                return Ok(Err(CoreError::NotUnderParent { task: id, parent }));
-            }
-            if !tx.list_child_edges(grandparent)?.contains(&old_parent) {
-                return Ok(Err(CoreError::NotUnderParent {
-                    task: old_parent,
-                    parent: grandparent,
-                }));
-            }
-            let mut ids = without(&task.parent_ids, parent);
-            if let Some(g) = grandparent
-                && !ids.contains(&g)
-            {
-                ids.push(g);
-            }
-            Ok(write_parents(tx, &mut task, ids, Placement::After(old_parent)).map(|()| true))
+            let Some(old_parent) = task.parent_id else {
+                return Ok(Ok(false));
+            };
+            let grandparent = tx.get_parent_edge(old_parent)?;
+            Ok(
+                write_parent(tx, &mut task, grandparent, Placement::After(old_parent))
+                    .map(|()| true),
+            )
         })??;
         Ok(changed)
     }
@@ -922,8 +844,7 @@ impl<S: Store> Core<S> {
     ///   (a soft-deleted one counts as missing); it carries whichever id is
     ///   missing, `id` first.
     /// - [`CoreError::DependsOnRelative`] if `predecessor` is an ancestor or
-    ///   a descendant of `id` in the hierarchy, through any of a task's
-    ///   parents.
+    ///   a descendant of `id` in the hierarchy.
     /// - [`CoreError::CircularDependency`] if `predecessor` already depends
     ///   on `id`, directly or transitively, through edges of any type and
     ///   through soft-deleted tasks; `cycle` is `[id, predecessor, …, id]`,
@@ -1037,55 +958,31 @@ fn live_task(tx: &mut dyn StoreTx, id: TaskId) -> Result<Task, CoreError> {
 }
 
 /// `parent`'s children in order, keeping `id` and dropping soft-deleted
-/// siblings; `NotUnderParent` if `id` is not among them.
+/// siblings.
 fn live_siblings(
     tx: &mut dyn StoreTx,
     parent: Option<TaskId>,
     id: TaskId,
-) -> Result<Vec<TaskId>, CoreError> {
+) -> Result<Vec<TaskId>, StoreError> {
     let mut live = Vec::new();
     for sibling in tx.list_child_edges(parent)? {
         if sibling == id || tx.get_task(sibling)?.is_some() {
             live.push(sibling);
         }
     }
-    if live.contains(&id) {
-        Ok(live)
-    } else {
-        Err(CoreError::NotUnderParent { task: id, parent })
-    }
+    Ok(live)
 }
 
-/// `parents` without `removed` (`None` removes nothing: the top-level edge
-/// is not part of `parent_ids`).
-fn without(parents: &[TaskId], removed: Option<TaskId>) -> Vec<TaskId> {
-    parents
-        .iter()
-        .copied()
-        .filter(|p| Some(*p) != removed)
-        .collect()
-}
-
-/// `parent_ids` with every repeated id removed, keeping each id at its
-/// first occurrence's position.
-fn dedupe_parent_ids(parent_ids: Vec<TaskId>) -> Vec<TaskId> {
-    let mut seen = HashSet::with_capacity(parent_ids.len());
-    parent_ids
-        .into_iter()
-        .filter(|parent| seen.insert(*parent))
-        .collect()
-}
-
-/// Writes `task`'s new parent set through the shared cycle-checked writer and
-/// persists the updated row (`parent_ids`, `updated_at`).
-fn write_parents(
+/// Writes `task`'s new parent through the shared cycle-checked writer and
+/// persists the updated row (`parent_id`, `updated_at`).
+fn write_parent(
     tx: &mut dyn StoreTx,
     task: &mut Task,
-    ids: Vec<TaskId>,
+    parent: Option<TaskId>,
     placement: Placement,
 ) -> Result<(), CoreError> {
-    replace_parents(tx, task.id, &Parents::from_ids(ids.clone()), placement)?;
-    task.parent_ids = ids;
+    hierarchy::set_parent(tx, task.id, parent, placement)?;
+    task.parent_id = parent;
     task.updated_at = Utc::now();
     tx.put_task(task)?;
     Ok(())
@@ -1113,9 +1010,8 @@ fn live_sibling_order(tx: &mut dyn StoreTx) -> Result<SiblingOrder, StoreError> 
 }
 
 /// Stable-sorts `tasks` into depth-first sibling order (roots first, each
-/// task followed by its children). A task reachable under several parents
-/// takes its first position; tasks not reached (e.g. under a deleted parent)
-/// keep their relative order at the end.
+/// task followed by its children). Tasks not reached (e.g. under a deleted
+/// parent) keep their relative order at the end.
 fn sort_by_hierarchy_order(tx: &mut dyn StoreTx, tasks: &mut [Task]) -> Result<(), StoreError> {
     let order = live_sibling_order(tx)?;
     let mut rank: HashMap<TaskId, usize> = HashMap::new();
@@ -1158,20 +1054,15 @@ fn compute_progress(
 ///
 /// Iterative (an explicit work stack), not recursive, for the same
 /// deep-chain-safety reason as `mark_complete_subtree`/`tombstone_subtree`.
-/// A task reachable through two parents is visited (and, if incomplete,
-/// counted) only once, via `visited`. A child id that no longer resolves
-/// via [`StoreTx::get_task`] (already deleted) is skipped, matching how
-/// other code in this module treats missing lookups.
+/// Each task has one parent, so the walk reaches every descendant exactly
+/// once and none is counted twice. A child id that no longer resolves via
+/// [`StoreTx::get_task`] (already deleted) is skipped, matching how other
+/// code in this module treats missing lookups.
 fn incomplete_descendants(tx: &mut dyn StoreTx, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
     let mut incomplete = Vec::new();
-    let mut visited = std::collections::HashSet::new();
     let mut pending = tx.list_child_edges(Some(id))?;
 
     while let Some(current) = pending.pop() {
-        if !visited.insert(current) {
-            continue;
-        }
-
         let Some(task) = tx.get_task(current)? else {
             continue;
         };
@@ -1191,11 +1082,11 @@ fn incomplete_descendants(tx: &mut dyn StoreTx, id: TaskId) -> Result<Vec<TaskId
 /// deep-chain-safety reason as `tombstone_subtree`. Unlike that function,
 /// this never touches parent/child edges — it only walks descendants via
 /// [`StoreTx::list_child_edges`] and flips `status`/`completed_at`/
-/// `updated_at`. A task reachable through two parents is visited only
-/// once (tracked via `visited`), and a task already
-/// [`TaskStatus::Complete`] is walked through (to reach further
-/// descendants) but not re-written or added to `touched`, so its
-/// `completed_at` isn't clobbered and it isn't double-counted.
+/// `updated_at`. Each task has one parent, so the walk reaches every
+/// descendant exactly once. A task already [`TaskStatus::Complete`] is
+/// walked through (to reach further descendants) but not re-written or
+/// added to `touched`, so its `completed_at` and `updated_at` are kept and
+/// it isn't reported as changed.
 ///
 /// Two passes, deliberately: the first flips every not-yet-complete
 /// descendant's `status`/`completed_at`/`updated_at` and commits it, without
@@ -1214,15 +1105,10 @@ fn mark_complete_subtree(
     now: chrono::DateTime<Utc>,
     touched: &mut Vec<Task>,
 ) -> Result<(), StoreError> {
-    let mut visited = std::collections::HashSet::new();
     let mut pending = vec![id];
     let mut touched_ids = Vec::new();
 
     while let Some(current) = pending.pop() {
-        if !visited.insert(current) {
-            continue;
-        }
-
         let Some(mut task) = tx.get_task(current)? else {
             continue;
         };
@@ -1250,30 +1136,24 @@ fn mark_complete_subtree(
     Ok(())
 }
 
-/// Tombstones `id` under [`DeleteMode::Subtree`]: sets
-/// `deleted_at`/`updated_at`, drops the `id -> child` edge for every
-/// direct child, and — only for a child left with no remaining parents —
-/// processes it too, at arbitrary depth. A child still reachable through
-/// another live parent keeps existing (not tombstoned), just with one
-/// less parent edge.
+/// Tombstones `id` and every descendant under [`DeleteMode::Subtree`]:
+/// each gets `deleted_at`/`updated_at` set and is appended to `deleted`,
+/// once. A task has one parent, so everything beneath `id` goes with it and
+/// no task outside the subtree is touched.
+///
+/// Each tombstoned task's children have their parent edge moved to the top
+/// level as the walk passes, so a tombstoned task is left with no child
+/// edges; `id`'s own parent edge is kept.
 ///
 /// Iterative (an explicit work stack), not recursive: `create_task`
 /// permits arbitrarily deep parent chains, so a user-built hierarchy deep
 /// enough could overflow the process stack if this walked it via Rust
 /// call recursion instead.
-///
-/// Every tombstoned [`Task`] is appended to `outcome.deleted`, and every
-/// surviving child that lost an edge is recorded in `outcome.updated`. A
-/// task can be reached more than once in one walk: a child that loses one
-/// parent and survives may lose another later (keeping one entry, at its
-/// latest value), or be left parentless by a later tombstone and so be
-/// tombstoned itself (moving from `updated` to `deleted`). Each id
-/// therefore appears at most once across both lists.
 fn tombstone_subtree(
     tx: &mut dyn StoreTx,
     id: TaskId,
     now: chrono::DateTime<Utc>,
-    outcome: &mut DeleteOutcome,
+    deleted: &mut Vec<Task>,
 ) -> Result<(), StoreError> {
     let mut pending = vec![id];
 
@@ -1282,10 +1162,10 @@ fn tombstone_subtree(
             continue;
         };
         // A task tombstoned by an earlier call keeps its own parent edge,
-        // so it's still among its parent's child edges and gets queued here
-        // once the walk drops that edge. It already has no child edges of
-        // its own; re-tombstoning it would overwrite its original
-        // `deleted_at` and wrongly report it as deleted by this call.
+        // so it's still among its parent's child edges and gets queued
+        // here. It already has no child edges of its own; re-tombstoning
+        // it would overwrite its original `deleted_at` and wrongly report
+        // it as deleted by this call.
         if task.deleted_at.is_some() {
             continue;
         }
@@ -1293,63 +1173,24 @@ fn tombstone_subtree(
         task.updated_at = now;
 
         for child in tx.list_child_edges(Some(current))? {
-            let mut remaining_parents = tx.list_parent_edges(child)?;
-            remaining_parents.retain(|&p| p != current);
-            // Dropping a parent can never create a cycle, so the only
-            // failure `replace_parents` can report here is a backend one,
-            // which is passed through so the transaction rolls back.
-            replace_parents(
-                tx,
-                child,
-                &Parents::from_ids(remaining_parents.clone()),
-                Placement::End,
-            )
-            .map_err(|e| match e {
-                CoreError::Store(store_err) => store_err,
-                other => StoreError::Backend(other.to_string()),
-            })?;
-
-            if remaining_parents.is_empty() {
-                pending.push(child);
-            } else if let Some(mut child_task) = tx.get_task(child)? {
-                child_task.parent_ids.retain(|&p| p != current);
-                // `child`'s own children are untouched by this edge removal
-                // (only its *parent* edges change), so this is safe to
-                // compute regardless of loop order.
-                child_task.progress = compute_progress(tx, child, child_task.status)?;
-                child_task.updated_at = now;
-                tx.put_task(&child_task)?;
-                record_updated(&mut outcome.updated, child_task);
-            }
+            tx.set_parent_edge(child, None, Placement::End)?;
+            pending.push(child);
         }
 
         // `status` is untouched by a delete, but `progress` is re-derived
         // rather than trusted from the fetched row — see `update_task`'s
-        // matching comment. Computed here, after the loop above has
-        // already removed every one of `current`'s own child edges (it
-        // unconditionally rewrites the parent edges of each, regardless
-        // of whether that child is reparented away or queued in `pending`
-        // for its own tombstoning), so it reflects the committed
-        // (now-empty) child-edge set — matching what a later independent
-        // fetch (e.g. `get_tree` with `include_deleted: true`) would
-        // recompute, rather than a stale pre-delete snapshot the returned
-        // `Task` can no longer back up.
+        // matching comment. Computed here, after the loop above has moved
+        // every one of `current`'s children away, so it reflects the
+        // committed (now-empty) child-edge set — matching what a later
+        // independent fetch (e.g. `get_tree` with `include_deleted: true`)
+        // would recompute, rather than a stale pre-delete snapshot the
+        // returned `Task` can no longer back up.
         task.progress = compute_progress(tx, current, task.status)?;
         tx.put_task(&task)?;
-        outcome.updated.retain(|t| t.id != current);
-        outcome.deleted.push(task);
+        deleted.push(task);
     }
 
     Ok(())
-}
-
-/// Records `task` in `updated`, replacing any earlier entry for the same id
-/// in place so `updated` holds each task at most once, at its latest value.
-fn record_updated(updated: &mut Vec<Task>, task: Task) {
-    match updated.iter_mut().find(|t| t.id == task.id) {
-        Some(existing) => *existing = task,
-        None => updated.push(task),
-    }
 }
 
 #[cfg(test)]
@@ -1368,7 +1209,7 @@ mod tests {
         NewTask {
             title: title.to_owned(),
             description: None,
-            parent_ids: Vec::new(),
+            parent_id: None,
             type_key: None,
             start_date: None,
             due_date: None,
@@ -1412,22 +1253,32 @@ mod tests {
 
         let task = core.create_task(minimal_new_task("Top level")).unwrap();
 
-        assert_eq!(task.parent_ids, []);
+        assert_eq!(task.parent_id, None);
     }
 
     #[test]
-    fn create_task_should_attach_to_given_parent_when_parent_ids_provided() {
+    fn create_task_should_attach_to_given_parent() {
         let mut core = new_core();
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
 
         let child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .unwrap();
 
-        assert_eq!(child.parent_ids, vec![parent.id]);
+        assert_eq!(child.parent_id, Some(parent.id));
+        // The one stored edge names the parent, and the child is not also
+        // at the top level.
+        let stored_parent = core
+            .store
+            .transaction(|tx| tx.get_parent_edge(child.id))
+            .unwrap();
+        assert_eq!(stored_parent, Some(parent.id));
+        let order = core.sibling_order().unwrap();
+        assert_eq!(order.children_of(Some(parent.id)), [child.id]);
+        assert_eq!(order.children_of(None), [parent.id]);
     }
 
     #[test]
@@ -1436,7 +1287,7 @@ mod tests {
         let missing_parent = TaskId::new();
 
         let result = core.create_task(NewTask {
-            parent_ids: vec![missing_parent],
+            parent_id: Some(missing_parent),
             ..minimal_new_task("Orphan")
         });
 
@@ -1509,7 +1360,7 @@ mod tests {
             type_key: Some("bogus".to_owned()),
             start_date: NaiveDate::from_ymd_opt(2026, 1, 31),
             due_date: NaiveDate::from_ymd_opt(2026, 1, 1),
-            parent_ids: vec![TaskId::new()],
+            parent_id: Some(TaskId::new()),
             assignee_id: Some(UserId::new()),
             ..minimal_new_task("Everything wrong")
         }
@@ -1548,7 +1399,7 @@ mod tests {
             due_date: None,
             ..new_task_failing_every_check()
         };
-        let missing = failing.parent_ids[0];
+        let missing = failing.parent_id.unwrap();
 
         let result = core.create_task(failing);
 
@@ -1566,7 +1417,7 @@ mod tests {
         for i in 0..50 {
             deepest = core
                 .create_task(NewTask {
-                    parent_ids: vec![deepest],
+                    parent_id: Some(deepest),
                     ..minimal_new_task(&format!("Level {i}"))
                 })
                 .unwrap()
@@ -1575,7 +1426,7 @@ mod tests {
 
         let before_shallow = calls();
         core.create_task(NewTask {
-            parent_ids: vec![top.id],
+            parent_id: Some(top.id),
             ..minimal_new_task("Under top")
         })
         .unwrap();
@@ -1583,48 +1434,13 @@ mod tests {
 
         let before_deep = calls();
         core.create_task(NewTask {
-            parent_ids: vec![deepest],
+            parent_id: Some(deepest),
             ..minimal_new_task("Under deepest")
         })
         .unwrap();
         let deep_calls = calls() - before_deep;
 
         assert_eq!(deep_calls, shallow_calls);
-    }
-
-    /// Every parent `get_task` runs in the transaction that `put_task`s
-    /// the new task, so a concurrent delete can't slip in between.
-    #[test]
-    fn create_task_should_check_parents_in_the_same_transaction_that_writes_the_task() {
-        let store = CountingStore::new();
-        let log = store.log();
-        let mut core = Core::new(store).unwrap();
-        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
-        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
-        let start = log.borrow().len();
-
-        core.create_task(NewTask {
-            parent_ids: vec![parent_a.id, parent_b.id],
-            ..minimal_new_task("Child")
-        })
-        .unwrap();
-
-        let calls = log.borrow()[start..].to_vec();
-        let tx_of = |method| {
-            calls
-                .iter()
-                .filter(|(_, m)| *m == method)
-                .map(|&(tx, _)| tx)
-                .collect::<Vec<_>>()
-        };
-        let put_task_txs = tx_of("put_task");
-        assert_eq!(put_task_txs.len(), 1, "calls: {calls:?}");
-        let get_task_txs = tx_of("get_task");
-        assert_eq!(get_task_txs.len(), 2, "calls: {calls:?}");
-        assert!(
-            get_task_txs.iter().all(|&tx| tx == put_task_txs[0]),
-            "calls: {calls:?}"
-        );
     }
 
     /// A soft-deleted parent is reported as `NotFound`, like a missing one.
@@ -1635,7 +1451,7 @@ mod tests {
         core.delete_task(parent.id, DeleteMode::Subtree).unwrap();
 
         let result = core.create_task(NewTask {
-            parent_ids: vec![parent.id],
+            parent_id: Some(parent.id),
             ..minimal_new_task("Child")
         });
 
@@ -1652,23 +1468,6 @@ mod tests {
         core.store
             .transaction(|tx| Ok((tx.list_tasks(&all)?, tx.list_all_child_edges()?)))
             .unwrap()
-    }
-
-    /// A missing second parent leaves no task and no edge to the first.
-    #[test]
-    fn create_task_should_write_nothing_when_a_later_parent_is_missing() {
-        let mut core = new_core();
-        let live = core.create_task(minimal_new_task("Live")).unwrap();
-        let missing = TaskId::new();
-        let before = store_snapshot(&core);
-
-        let result = core.create_task(NewTask {
-            parent_ids: vec![live.id, missing],
-            ..minimal_new_task("Child")
-        });
-
-        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
-        assert_eq!(store_snapshot(&core), before);
     }
 
     /// An unknown type key leaves the store untouched.
@@ -1702,6 +1501,31 @@ mod tests {
         assert_eq!(store_snapshot(&core), before);
     }
 
+    /// A parent that is missing or soft-deleted leaves the store untouched:
+    /// no task row and no parent edge.
+    #[test]
+    fn create_task_should_write_nothing_when_the_parent_is_missing() {
+        let mut core = new_core();
+        let missing_parent = TaskId::new();
+        let deleted_parent = core.create_task(minimal_new_task("Deleted")).unwrap();
+        core.delete_task(deleted_parent.id, DeleteMode::Subtree)
+            .unwrap();
+        let before = store_snapshot(&core);
+
+        let missing = core.create_task(NewTask {
+            parent_id: Some(missing_parent),
+            ..minimal_new_task("Under missing")
+        });
+        let deleted = core.create_task(NewTask {
+            parent_id: Some(deleted_parent.id),
+            ..minimal_new_task("Under deleted")
+        });
+
+        assert!(matches!(missing, Err(CoreError::NotFound(id)) if id == missing_parent));
+        assert!(matches!(deleted, Err(CoreError::NotFound(id)) if id == deleted_parent.id));
+        assert_eq!(store_snapshot(&core), before);
+    }
+
     /// A create with a type, a parent, and an assignee makes every store
     /// call in one transaction.
     #[test]
@@ -1722,7 +1546,7 @@ mod tests {
 
         core.create_task(NewTask {
             type_key: Some("goal".to_owned()),
-            parent_ids: vec![parent.id],
+            parent_id: Some(parent.id),
             assignee_id: Some(assignee.id),
             ..minimal_new_task("Child")
         })
@@ -1735,69 +1559,18 @@ mod tests {
     }
 
     #[test]
-    fn create_task_should_deduplicate_repeated_parent_ids_preserving_first_occurrence_order() {
-        let mut core = new_core();
-        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
-        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
-
-        let child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent_a.id, parent_b.id, parent_a.id],
-                ..minimal_new_task("Child")
-            })
-            .unwrap();
-
-        assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
-        let stored_parents = core
-            .store
-            .transaction(|tx| tx.list_parent_edges(child.id))
-            .unwrap();
-        assert_eq!(stored_parents, vec![parent_a.id, parent_b.id]);
-    }
-
-    #[test]
-    fn create_task_should_record_an_edge_for_each_given_parent() {
-        // Attaching a new task under several parents in one call succeeds
-        // and records one edge per parent, in the given order.
-        let mut core = new_core();
-        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
-        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
-
-        let child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent_a.id, parent_b.id],
-                ..minimal_new_task("Multi-parent child")
-            })
-            .unwrap();
-
-        assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
-        let stored_parents = core
-            .store
-            .transaction(|tx| tx.list_parent_edges(child.id))
-            .unwrap();
-        assert_eq!(stored_parents, vec![parent_a.id, parent_b.id]);
-        for parent in [&parent_a, &parent_b] {
-            let children = core.list_children(parent.id).unwrap();
-            assert_eq!(
-                children.iter().map(|t| t.id).collect::<Vec<_>>(),
-                vec![child.id]
-            );
-        }
-    }
-
-    #[test]
     fn get_tree_should_reflect_updated_child_completion_immediately() {
         let mut core = new_core();
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
         let child_a = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child A")
             })
             .unwrap();
         let _child_b = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child B")
             })
             .unwrap();
@@ -1811,41 +1584,6 @@ mod tests {
         let tree_after = core.get_tree(TreeFilter::default()).unwrap();
         let parent_after = tree_after.iter().find(|t| t.id == parent.id).unwrap();
         assert!((parent_after.progress - 0.5).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn get_tree_should_compute_each_parents_progress_from_its_own_direct_children_when_task_has_multiple_parents()
-     {
-        let mut core = new_core();
-        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
-        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
-
-        // Shared child, Complete, under both parents.
-        let shared = core
-            .create_task(NewTask {
-                parent_ids: vec![parent_a.id, parent_b.id],
-                ..minimal_new_task("Shared child")
-            })
-            .unwrap();
-        core.complete_task(shared.id, false).unwrap();
-
-        // Parent A's other child stays Incomplete -> Parent A averages
-        // 1 of 2 complete = 0.5.
-        core.create_task(NewTask {
-            parent_ids: vec![parent_a.id],
-            ..minimal_new_task("Parent A's other child")
-        })
-        .unwrap();
-
-        // Parent B has no other children -> Parent B averages 1 of 1
-        // complete = 1.0.
-
-        let tree = core.get_tree(TreeFilter::default()).unwrap();
-        let goal_after = tree.iter().find(|t| t.id == parent_a.id).unwrap();
-        let project_after = tree.iter().find(|t| t.id == parent_b.id).unwrap();
-
-        assert!((goal_after.progress - 0.5).abs() < f32::EPSILON);
-        assert!((project_after.progress - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -2304,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn update_task_should_leave_parent_ids_unchanged_when_only_type_key_changes() {
+    fn update_task_should_leave_parent_id_unchanged_when_only_type_key_changes() {
         let mut core = new_core();
         let goal = TaskType {
             key: "goal".to_owned(),
@@ -2316,7 +2054,7 @@ mod tests {
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
         let child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .unwrap();
@@ -2332,7 +2070,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated[0].type_key, "goal");
-        assert_eq!(updated[0].parent_ids, vec![parent.id]);
+        assert_eq!(updated[0].parent_id, Some(parent.id));
     }
 
     #[test]
@@ -2378,7 +2116,7 @@ mod tests {
         let child_due = NaiveDate::from_ymd_opt(2026, 2, 28).unwrap();
         let child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 start_date: Some(child_start),
                 due_date: Some(child_due),
                 ..minimal_new_task("Child")
@@ -2450,27 +2188,81 @@ mod tests {
         assert!(matches!(result, Err(CoreError::NotFound(id)) if id == task.id));
     }
 
+    /// A branching tree to delete from: `root` sits under `above` beside
+    /// `beside`, and holds `descendants` across three levels.
+    struct SubtreeFixture {
+        above: TaskId,
+        beside: TaskId,
+        root: TaskId,
+        descendants: Vec<TaskId>,
+    }
+
+    fn subtree_fixture(core: &mut Core<InMemoryStore>) -> SubtreeFixture {
+        let above = titled_under(core, "Above", None).id;
+        let root = titled_under(core, "Root", Some(above)).id;
+        let beside = titled_under(core, "Beside", Some(above)).id;
+        let a = titled_under(core, "A", Some(root)).id;
+        let b = titled_under(core, "B", Some(root)).id;
+        let a1 = titled_under(core, "A1", Some(a)).id;
+        let a2 = titled_under(core, "A2", Some(a)).id;
+        let deepest = titled_under(core, "Deepest", Some(a2)).id;
+        SubtreeFixture {
+            above,
+            beside,
+            root,
+            descendants: vec![a, b, a1, a2, deepest],
+        }
+    }
+
     #[test]
-    fn delete_task_subtree_should_tombstone_child_with_no_other_parents() {
+    fn delete_task_subtree_should_tombstone_every_descendant() {
         let mut core = new_core();
-        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
-        let child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent.id],
-                ..minimal_new_task("Child")
-            })
-            .unwrap();
+        let fixture = subtree_fixture(&mut core);
 
-        core.delete_task(parent.id, DeleteMode::Subtree).unwrap();
+        let outcome = core.delete_task(fixture.root, DeleteMode::Subtree).unwrap();
 
-        let tree = core
-            .get_tree(TreeFilter {
-                include_deleted: true,
-                ..TreeFilter::default()
-            })
-            .unwrap();
-        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
-        assert!(child_after.deleted_at.is_some());
+        let expected: HashSet<_> = fixture
+            .descendants
+            .iter()
+            .copied()
+            .chain([fixture.root])
+            .collect();
+        let deleted_ids: HashSet<_> = outcome.deleted.iter().map(|t| t.id).collect();
+        assert_eq!(deleted_ids, expected);
+        assert_eq!(outcome.deleted.len(), expected.len());
+        assert!(outcome.deleted.iter().all(|t| t.deleted_at.is_some()));
+
+        // The store agrees: nothing in the subtree is still live, and
+        // nothing outside it was tombstoned.
+        let live: HashSet<_> = core
+            .get_tree(TreeFilter::default())
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(live, HashSet::from([fixture.above, fixture.beside]));
+    }
+
+    #[test]
+    fn delete_task_subtree_should_leave_updated_empty() {
+        let mut core = new_core();
+        let fixture = subtree_fixture(&mut core);
+        let above_before = core.get_task(fixture.above).unwrap().unwrap();
+        let beside_before = core.get_task(fixture.beside).unwrap().unwrap();
+
+        let outcome = core.delete_task(fixture.root, DeleteMode::Subtree).unwrap();
+
+        assert_eq!(outcome.updated, []);
+        // The tasks around the subtree are reported in neither list and
+        // their stored rows are untouched.
+        assert!(
+            outcome
+                .deleted
+                .iter()
+                .all(|t| t.id != fixture.above && t.id != fixture.beside)
+        );
+        assert_eq!(core.get_task(fixture.above).unwrap(), Some(above_before));
+        assert_eq!(core.get_task(fixture.beside).unwrap(), Some(beside_before));
     }
 
     #[test]
@@ -2491,13 +2283,13 @@ mod tests {
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
         let complete_child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Complete child")
             })
             .unwrap();
         core.complete_task(complete_child.id, false).unwrap();
         core.create_task(NewTask {
-            parent_ids: vec![parent.id],
+            parent_id: Some(parent.id),
             ..minimal_new_task("Incomplete child")
         })
         .unwrap();
@@ -2527,13 +2319,13 @@ mod tests {
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
         let complete_child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Complete child")
             })
             .unwrap();
         core.complete_task(complete_child.id, false).unwrap();
         core.create_task(NewTask {
-            parent_ids: vec![parent.id],
+            parent_id: Some(parent.id),
             ..minimal_new_task("Incomplete child")
         })
         .unwrap();
@@ -2555,70 +2347,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_subtree_should_keep_child_reachable_through_other_parent() {
-        let mut core = new_core();
-        let parent_a = core.create_task(minimal_new_task("Goal A")).unwrap();
-        let parent_b = core.create_task(minimal_new_task("Goal B")).unwrap();
-        let child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent_a.id, parent_b.id],
-                ..minimal_new_task("Shared child")
-            })
-            .unwrap();
-
-        core.delete_task(parent_a.id, DeleteMode::Subtree).unwrap();
-
-        let tree = core.get_tree(TreeFilter::default()).unwrap();
-        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
-        assert!(child_after.deleted_at.is_none());
-        assert_eq!(child_after.parent_ids, vec![parent_b.id]);
-    }
-
-    #[test]
-    fn delete_task_subtree_should_recurse_through_multiple_levels() {
-        let mut core = new_core();
-        let root = core.create_task(minimal_new_task("Root")).unwrap();
-        let mid = core
-            .create_task(NewTask {
-                parent_ids: vec![root.id],
-                ..minimal_new_task("Mid")
-            })
-            .unwrap();
-        let leaf = core
-            .create_task(NewTask {
-                parent_ids: vec![mid.id],
-                ..minimal_new_task("Leaf")
-            })
-            .unwrap();
-        let deepest = core
-            .create_task(NewTask {
-                parent_ids: vec![leaf.id],
-                ..minimal_new_task("Deepest")
-            })
-            .unwrap();
-
-        let outcome = core.delete_task(root.id, DeleteMode::Subtree).unwrap();
-
-        let deleted_ids: HashSet<_> = outcome.deleted.iter().map(|t| t.id).collect();
-        assert_eq!(
-            deleted_ids,
-            HashSet::from([root.id, mid.id, leaf.id, deepest.id])
-        );
-        assert_eq!(outcome.updated, []);
-
-        let tree = core
-            .get_tree(TreeFilter {
-                include_deleted: true,
-                ..TreeFilter::default()
-            })
-            .unwrap();
-        for id in [root.id, mid.id, leaf.id, deepest.id] {
-            let task = tree.iter().find(|t| t.id == id).unwrap();
-            assert!(task.deleted_at.is_some(), "{id:?} should be tombstoned");
-        }
-    }
-
-    #[test]
     fn delete_task_subtree_should_not_overflow_the_stack_on_a_deep_chain() {
         // Regression test: `create_task` places no limit on nesting depth,
         // so `tombstone_subtree` must walk an arbitrarily deep chain via an
@@ -2631,7 +2359,7 @@ mod tests {
         for i in 0..5000 {
             let task = core
                 .create_task(NewTask {
-                    parent_ids: vec![current],
+                    parent_id: Some(current),
                     ..minimal_new_task(&format!("Level {i}"))
                 })
                 .unwrap();
@@ -2646,109 +2374,55 @@ mod tests {
     }
 
     #[test]
-    fn delete_task_promote_children_should_reparent_child_to_deleted_tasks_parents() {
+    fn delete_task_promote_children_should_move_children_to_the_deleted_tasks_parent() {
         let mut core = new_core();
-        let grandparent = core.create_task(minimal_new_task("Grandparent")).unwrap();
-        let parent = core
-            .create_task(NewTask {
-                parent_ids: vec![grandparent.id],
-                ..minimal_new_task("Parent")
-            })
-            .unwrap();
-        let child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent.id],
-                ..minimal_new_task("Child")
-            })
+        let grandparent = titled_under(&mut core, "Grandparent", None).id;
+        let parent = titled_under(&mut core, "Parent", Some(grandparent)).id;
+        let uncle = titled_under(&mut core, "Uncle", Some(grandparent)).id;
+        let child_1 = titled_under(&mut core, "Child 1", Some(parent)).id;
+        let child_2 = titled_under(&mut core, "Child 2", Some(parent)).id;
+        let grandchild = titled_under(&mut core, "Grandchild", Some(child_1)).id;
+
+        core.delete_task(parent, DeleteMode::PromoteChildren)
             .unwrap();
 
-        core.delete_task(parent.id, DeleteMode::PromoteChildren)
-            .unwrap();
-
-        let tree = core.get_tree(TreeFilter::default()).unwrap();
-        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
-        assert_eq!(child_after.parent_ids, vec![grandparent.id]);
+        for child in [child_1, child_2] {
+            let stored = core.get_task(child).unwrap().unwrap();
+            assert_eq!(stored.parent_id, Some(grandparent));
+            assert!(stored.deleted_at.is_none());
+        }
+        // The children land after the grandparent's existing children, in
+        // the order they had, and keep their own children.
+        let order = core.sibling_order().unwrap();
+        assert_eq!(
+            order.children_of(Some(grandparent)),
+            [uncle, child_1, child_2]
+        );
+        assert_eq!(order.children_of(Some(child_1)), [grandchild]);
+        let stored_grandchild = core.get_task(grandchild).unwrap().unwrap();
+        assert_eq!(stored_grandchild.parent_id, Some(child_1));
     }
 
     #[test]
-    fn delete_task_promote_children_should_make_child_top_level_when_deleted_task_had_no_parents() {
+    fn delete_task_promote_children_should_make_children_top_level_when_it_had_no_parent() {
         let mut core = new_core();
-        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
-        let child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent.id],
-                ..minimal_new_task("Child")
-            })
+        let parent = titled_under(&mut core, "Parent", None).id;
+        let other = titled_under(&mut core, "Other", None).id;
+        let child_1 = titled_under(&mut core, "Child 1", Some(parent)).id;
+        let child_2 = titled_under(&mut core, "Child 2", Some(parent)).id;
+
+        core.delete_task(parent, DeleteMode::PromoteChildren)
             .unwrap();
 
-        core.delete_task(parent.id, DeleteMode::PromoteChildren)
-            .unwrap();
-
-        let tree = core.get_tree(TreeFilter::default()).unwrap();
-        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
-        assert_eq!(child_after.parent_ids, []);
-    }
-
-    #[test]
-    fn delete_task_promote_children_should_add_parent_alongside_existing_other_parents() {
-        let mut core = new_core();
-        let grandparent = core.create_task(minimal_new_task("Grandparent")).unwrap();
-        let parent = core
-            .create_task(NewTask {
-                parent_ids: vec![grandparent.id],
-                ..minimal_new_task("Parent")
-            })
-            .unwrap();
-        let other_parent = core.create_task(minimal_new_task("Other parent")).unwrap();
-        let child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent.id, other_parent.id],
-                ..minimal_new_task("Child")
-            })
-            .unwrap();
-
-        core.delete_task(parent.id, DeleteMode::PromoteChildren)
-            .unwrap();
-
-        let tree = core.get_tree(TreeFilter::default()).unwrap();
-        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
-        let parents: std::collections::HashSet<_> =
-            child_after.parent_ids.iter().copied().collect();
-        let expected: std::collections::HashSet<_> =
-            [other_parent.id, grandparent.id].into_iter().collect();
-        assert_eq!(parents, expected);
-    }
-
-    #[test]
-    fn delete_task_promote_children_should_not_duplicate_parent_edge_when_child_already_shares_a_grandparent()
-     {
-        // Regression test: `child` already has `grandparent` as a parent
-        // (alongside `parent`, which is being deleted) — `PromoteChildren`
-        // then tries to add a `grandparent -> child` edge that already
-        // exists. `replace_parent_edges` must treat that as a no-op rather than
-        // a duplicate entry, so `parent_ids` still names `grandparent`
-        // exactly once afterward.
-        let mut core = new_core();
-        let grandparent = core.create_task(minimal_new_task("Grandparent")).unwrap();
-        let parent = core
-            .create_task(NewTask {
-                parent_ids: vec![grandparent.id],
-                ..minimal_new_task("Parent")
-            })
-            .unwrap();
-        let child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent.id, grandparent.id],
-                ..minimal_new_task("Child")
-            })
-            .unwrap();
-
-        core.delete_task(parent.id, DeleteMode::PromoteChildren)
-            .unwrap();
-
-        let tree = core.get_tree(TreeFilter::default()).unwrap();
-        let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
-        assert_eq!(child_after.parent_ids, vec![grandparent.id]);
+        for child in [child_1, child_2] {
+            let stored = core.get_task(child).unwrap().unwrap();
+            assert_eq!(stored.parent_id, None);
+            assert!(stored.deleted_at.is_none());
+        }
+        // The children join the top level after its existing tasks, in the
+        // order they had.
+        let order = core.sibling_order().unwrap();
+        assert_eq!(order.children_of(None), [other, child_1, child_2]);
     }
 
     #[test]
@@ -2786,6 +2460,63 @@ mod tests {
         let result = core.restore_task(missing);
 
         assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
+    #[test]
+    fn set_parent_and_promote_delete_should_take_the_current_parent_from_the_fetched_task() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let task = core
+            .create_task(NewTask {
+                parent_id: Some(parent.id),
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+        let parent_lookups = |from: usize| {
+            log.borrow()[from..]
+                .iter()
+                .filter(|&&(_, method)| method == "get_parent_edge")
+                .count()
+        };
+
+        // The task read at the start of each call already carries its
+        // parent, so neither asks the store for that edge again.
+        let start = log.borrow().len();
+        core.set_parent(task.id, Some(parent.id)).unwrap();
+        assert_eq!(parent_lookups(start), 0);
+
+        let start = log.borrow().len();
+        core.delete_task(task.id, DeleteMode::PromoteChildren)
+            .unwrap();
+        assert_eq!(parent_lookups(start), 0);
+    }
+
+    #[test]
+    fn restore_task_should_report_the_parent_edge_of_a_descendant_deleted_with_its_subtree() {
+        let mut core = new_core();
+        let top = titled_under(&mut core, "Top", None);
+        let root = titled_under(&mut core, "Root", None);
+        let child = titled_under(&mut core, "Child", Some(root.id));
+        core.delete_task(root.id, DeleteMode::Subtree).unwrap();
+
+        let restored = core.restore_task(child.id).unwrap();
+
+        // A subtree delete leaves each descendant's edge at the top level,
+        // so that is where the restored task is, and where the moves that
+        // read its parent act.
+        let edge = core
+            .store
+            .transaction(|tx| tx.get_parent_edge(child.id))
+            .unwrap();
+        assert_eq!((restored.parent_id, edge), (None, None));
+        assert!(!core.outdent_task(child.id).unwrap());
+        assert!(core.move_sibling(child.id, Direction::Up).unwrap());
+        assert_eq!(
+            core.sibling_order().unwrap().children_of(None),
+            [child.id, top.id]
+        );
     }
 
     #[test]
@@ -2910,121 +2641,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_task_subtree_should_split_tombstoned_and_surviving_tasks_in_outcome() {
-        let mut core = new_core();
-        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
-        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
-        let shared_child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent_a.id, parent_b.id],
-                ..minimal_new_task("Shared child")
-            })
-            .unwrap();
-        let only_child = core
-            .create_task(NewTask {
-                parent_ids: vec![parent_a.id],
-                ..minimal_new_task("Only child")
-            })
-            .unwrap();
-
-        let outcome = core.delete_task(parent_a.id, DeleteMode::Subtree).unwrap();
-
-        let deleted_ids: HashSet<_> = outcome.deleted.iter().map(|t| t.id).collect();
-        let updated_ids: HashSet<_> = outcome.updated.iter().map(|t| t.id).collect();
-        assert_eq!(deleted_ids, HashSet::from([parent_a.id, only_child.id]));
-        assert_eq!(updated_ids, HashSet::from([shared_child.id]));
-        assert!(!deleted_ids.contains(&parent_b.id));
-        assert!(!updated_ids.contains(&parent_b.id));
-    }
-
-    #[test]
-    fn delete_task_subtree_should_report_child_with_another_parent_as_updated_not_deleted() {
-        let mut core = new_core();
-        let a = core.create_task(minimal_new_task("A")).unwrap();
-        let b = core.create_task(minimal_new_task("B")).unwrap();
-        let c = core
-            .create_task(NewTask {
-                parent_ids: vec![a.id, b.id],
-                ..minimal_new_task("C")
-            })
-            .unwrap();
-
-        let outcome = core.delete_task(a.id, DeleteMode::Subtree).unwrap();
-
-        let deleted_ids: Vec<_> = outcome.deleted.iter().map(|t| t.id).collect();
-        assert_eq!(deleted_ids, vec![a.id]);
-        assert_eq!(outcome.updated.len(), 1);
-        assert_eq!(outcome.updated[0].id, c.id);
-        assert!(outcome.updated[0].deleted_at.is_none());
-        assert_eq!(outcome.updated[0].parent_ids, vec![b.id]);
-
-        let c_after = core.get_task(c.id).unwrap().unwrap();
-        assert!(c_after.deleted_at.is_none());
-        assert_eq!(c_after.parent_ids, vec![b.id]);
-    }
-
-    #[test]
-    fn delete_task_subtree_should_report_a_task_tombstoned_later_in_the_walk_only_as_deleted() {
-        // Diamond A→C, A→D, D→C: dropping A→C leaves C with parent D (so C
-        // first looks like a survivor), but tombstoning D then leaves C
-        // parentless, so C ends up tombstoned too.
-        let mut core = new_core();
-        let a = core.create_task(minimal_new_task("A")).unwrap();
-        let d = core
-            .create_task(NewTask {
-                parent_ids: vec![a.id],
-                ..minimal_new_task("D")
-            })
-            .unwrap();
-        let c = core
-            .create_task(NewTask {
-                parent_ids: vec![a.id, d.id],
-                ..minimal_new_task("C")
-            })
-            .unwrap();
-
-        let outcome = core.delete_task(a.id, DeleteMode::Subtree).unwrap();
-
-        let deleted_ids: HashSet<_> = outcome.deleted.iter().map(|t| t.id).collect();
-        assert_eq!(outcome.deleted.len(), 3);
-        assert_eq!(deleted_ids, HashSet::from([a.id, d.id, c.id]));
-        assert_eq!(outcome.updated, []);
-        assert!(outcome.updated.iter().all(|t| !deleted_ids.contains(&t.id)));
-    }
-
-    #[test]
-    fn delete_task_subtree_should_report_a_child_losing_two_parents_once_in_updated() {
-        // X has parents A, D and E, with A→D. Deleting A drops A→X (X
-        // survives via D and E), then tombstones D, dropping D→X (X still
-        // survives via E). X must appear in `updated` exactly once, at its
-        // final value (parent_ids == [E]).
-        let mut core = new_core();
-        let a = core.create_task(minimal_new_task("A")).unwrap();
-        let d = core
-            .create_task(NewTask {
-                parent_ids: vec![a.id],
-                ..minimal_new_task("D")
-            })
-            .unwrap();
-        let e = core.create_task(minimal_new_task("E")).unwrap();
-        let x = core
-            .create_task(NewTask {
-                parent_ids: vec![a.id, d.id, e.id],
-                ..minimal_new_task("X")
-            })
-            .unwrap();
-
-        let outcome = core.delete_task(a.id, DeleteMode::Subtree).unwrap();
-
-        let deleted_ids: HashSet<_> = outcome.deleted.iter().map(|t| t.id).collect();
-        assert_eq!(deleted_ids, HashSet::from([a.id, d.id]));
-        assert_eq!(outcome.updated.len(), 1);
-        assert_eq!(outcome.updated[0].id, x.id);
-        assert_eq!(outcome.updated[0].parent_ids, vec![e.id]);
-        assert_eq!(outcome.updated[0], core.get_task(x.id).unwrap().unwrap());
-    }
-
-    #[test]
     fn delete_task_subtree_should_not_report_or_re_tombstone_an_already_deleted_child() {
         // A task tombstoned by an earlier call keeps its own parent edge,
         // so it's still listed among its parent's child edges. Deleting
@@ -3034,7 +2650,7 @@ mod tests {
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
         let child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .unwrap();
@@ -3062,19 +2678,19 @@ mod tests {
         let grandparent = core.create_task(minimal_new_task("Grandparent")).unwrap();
         let parent = core
             .create_task(NewTask {
-                parent_ids: vec![grandparent.id],
+                parent_id: Some(grandparent.id),
                 ..minimal_new_task("Parent")
             })
             .unwrap();
         let child_1 = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child 1")
             })
             .unwrap();
         let child_2 = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child 2")
             })
             .unwrap();
@@ -3093,7 +2709,7 @@ mod tests {
             outcome
                 .updated
                 .iter()
-                .all(|t| t.parent_ids == vec![grandparent.id])
+                .all(|t| t.parent_id == Some(grandparent.id))
         );
         assert!(!updated_ids.contains(&grandparent.id));
     }
@@ -3138,7 +2754,7 @@ mod tests {
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
         let child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .unwrap();
@@ -3163,13 +2779,13 @@ mod tests {
         let root = core.create_task(minimal_new_task("Root")).unwrap();
         let mid = core
             .create_task(NewTask {
-                parent_ids: vec![root.id],
+                parent_id: Some(root.id),
                 ..minimal_new_task("Mid")
             })
             .unwrap();
         let leaf = core
             .create_task(NewTask {
-                parent_ids: vec![mid.id],
+                parent_id: Some(mid.id),
                 ..minimal_new_task("Leaf")
             })
             .unwrap();
@@ -3199,13 +2815,13 @@ mod tests {
         let root = core.create_task(minimal_new_task("Root")).unwrap();
         let mid = core
             .create_task(NewTask {
-                parent_ids: vec![root.id],
+                parent_id: Some(root.id),
                 ..minimal_new_task("Mid")
             })
             .unwrap();
         let leaf = core
             .create_task(NewTask {
-                parent_ids: vec![mid.id],
+                parent_id: Some(mid.id),
                 ..minimal_new_task("Leaf")
             })
             .unwrap();
@@ -3226,7 +2842,7 @@ mod tests {
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
         let child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .unwrap();
@@ -3245,13 +2861,13 @@ mod tests {
         let root = core.create_task(minimal_new_task("Root")).unwrap();
         let child_a = core
             .create_task(NewTask {
-                parent_ids: vec![root.id],
+                parent_id: Some(root.id),
                 ..minimal_new_task("Child A")
             })
             .unwrap();
         let child_b = core
             .create_task(NewTask {
-                parent_ids: vec![root.id],
+                parent_id: Some(root.id),
                 ..minimal_new_task("Child B")
             })
             .unwrap();
@@ -3315,7 +2931,7 @@ mod tests {
         for i in 0..5000 {
             let task = core
                 .create_task(NewTask {
-                    parent_ids: vec![current],
+                    parent_id: Some(current),
                     ..minimal_new_task(&format!("Level {i}"))
                 })
                 .unwrap();
@@ -3359,18 +2975,20 @@ mod tests {
         assert!(matches!(result, Ok(None)));
     }
 
-    fn titled_under(core: &mut Core<InMemoryStore>, title: &str, parents: &[TaskId]) -> Task {
-        let mut new = minimal_new_task(title);
-        new.parent_ids = parents.to_vec();
-        core.create_task(new).unwrap()
+    fn titled_under(core: &mut Core<InMemoryStore>, title: &str, parent: Option<TaskId>) -> Task {
+        core.create_task(NewTask {
+            parent_id: parent,
+            ..minimal_new_task(title)
+        })
+        .unwrap()
     }
 
     #[test]
     fn list_children_should_return_creation_order_by_default() {
         let mut core = new_core();
-        let p = titled_under(&mut core, "P", &[]);
+        let p = titled_under(&mut core, "P", None);
         for title in ["a", "b", "c"] {
-            titled_under(&mut core, title, &[p.id]);
+            titled_under(&mut core, title, Some(p.id));
         }
 
         let titles: Vec<_> = core
@@ -3386,10 +3004,10 @@ mod tests {
     #[test]
     fn get_tree_should_respect_sibling_order() {
         let mut core = new_core();
-        let p = titled_under(&mut core, "P", &[]);
-        let a = titled_under(&mut core, "a", &[p.id]);
-        let b = titled_under(&mut core, "b", &[p.id]);
-        let q = titled_under(&mut core, "Q", &[]);
+        let p = titled_under(&mut core, "P", None);
+        let a = titled_under(&mut core, "a", Some(p.id));
+        let b = titled_under(&mut core, "b", Some(p.id));
+        let q = titled_under(&mut core, "Q", None);
 
         let ids: Vec<_> = core
             .get_tree(TreeFilter::default())
@@ -3404,9 +3022,9 @@ mod tests {
     #[test]
     fn sibling_order_should_key_top_level_under_none() {
         let mut core = new_core();
-        let r1 = titled_under(&mut core, "r1", &[]);
-        let r2 = titled_under(&mut core, "r2", &[]);
-        let child = titled_under(&mut core, "c", &[r1.id]);
+        let r1 = titled_under(&mut core, "r1", None);
+        let r2 = titled_under(&mut core, "r2", None);
+        let child = titled_under(&mut core, "c", Some(r1.id));
 
         let order = core.sibling_order().unwrap();
 
@@ -3418,8 +3036,8 @@ mod tests {
     #[test]
     fn sibling_order_should_skip_deleted_tasks() {
         let mut core = new_core();
-        let r1 = titled_under(&mut core, "r1", &[]);
-        let r2 = titled_under(&mut core, "r2", &[]);
+        let r1 = titled_under(&mut core, "r1", None);
+        let r2 = titled_under(&mut core, "r2", None);
         core.delete_task(r1.id, DeleteMode::Subtree).unwrap();
 
         let order = core.sibling_order().unwrap();
@@ -3427,31 +3045,10 @@ mod tests {
         assert_eq!(order.children_of(None), [r2.id]);
     }
 
-    #[test]
-    fn sibling_order_should_hold_independent_order_per_parent_for_shared_task() {
-        let mut core = new_core();
-        let t1 = titled_under(&mut core, "t1", &[]);
-        let t2 = titled_under(&mut core, "t2", &[]);
-        let a = titled_under(&mut core, "a", &[t1.id]);
-        let x = titled_under(&mut core, "x", &[t1.id]);
-        let b = titled_under(&mut core, "b", &[t2.id]);
-        core.set_parents(x.id, vec![t1.id, t2.id]).unwrap();
-        let c = titled_under(&mut core, "c", &[t1.id]);
-        core.set_parents(a.id, vec![t1.id, t2.id]).unwrap();
-
-        let order = core.sibling_order().unwrap();
-
-        assert_eq!(order.children_of(Some(t1.id)), [a.id, x.id, c.id]);
-        assert_eq!(order.children_of(Some(t2.id)), [b.id, x.id, a.id]);
-    }
-
     /// Creates `n` top-level-or-under-`parent` tasks titled a, b, c, ...
     fn siblings(core: &mut Core<InMemoryStore>, parent: Option<TaskId>, n: usize) -> Vec<TaskId> {
         (0..n)
-            .map(|i| {
-                let parents: Vec<TaskId> = parent.into_iter().collect();
-                titled_under(core, &format!("t{i}"), &parents).id
-            })
+            .map(|i| titled_under(core, &format!("t{i}"), parent).id)
             .collect()
     }
 
@@ -3461,7 +3058,7 @@ mod tests {
         let p = core.create_task(minimal_new_task("p")).unwrap().id;
         let s = siblings(&mut core, Some(p), 3);
 
-        let moved = core.move_sibling(Some(p), s[0], Direction::Down).unwrap();
+        let moved = core.move_sibling(s[0], Direction::Down).unwrap();
 
         assert!(moved);
         let order = core.sibling_order().unwrap();
@@ -3474,7 +3071,7 @@ mod tests {
         let p = core.create_task(minimal_new_task("p")).unwrap().id;
         let s = siblings(&mut core, Some(p), 3);
 
-        let moved = core.move_sibling(Some(p), s[2], Direction::Up).unwrap();
+        let moved = core.move_sibling(s[2], Direction::Up).unwrap();
 
         assert!(moved);
         let order = core.sibling_order().unwrap();
@@ -3488,7 +3085,7 @@ mod tests {
         let s = siblings(&mut core, Some(p), 3);
         core.delete_task(s[1], DeleteMode::PromoteChildren).unwrap();
 
-        core.move_sibling(Some(p), s[0], Direction::Down).unwrap();
+        core.move_sibling(s[0], Direction::Down).unwrap();
 
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(p)), [s[2], s[0]]);
@@ -3501,8 +3098,8 @@ mod tests {
         let s = siblings(&mut core, Some(p), 2);
         let before = core.get_task(s[0]).unwrap().unwrap();
 
-        let up = core.move_sibling(Some(p), s[0], Direction::Up).unwrap();
-        let down = core.move_sibling(Some(p), s[1], Direction::Down).unwrap();
+        let up = core.move_sibling(s[0], Direction::Up).unwrap();
+        let down = core.move_sibling(s[1], Direction::Down).unwrap();
 
         assert!(!up && !down);
         let order = core.sibling_order().unwrap();
@@ -3511,53 +3108,14 @@ mod tests {
     }
 
     #[test]
-    fn move_sibling_should_only_change_order_under_given_parent() {
-        let mut core = new_core();
-        let p = core.create_task(minimal_new_task("p")).unwrap().id;
-        let q = core.create_task(minimal_new_task("q")).unwrap().id;
-        let first = titled_under(&mut core, "a", &[p]).id;
-        let other = titled_under(&mut core, "b", &[q]).id;
-        let x = titled_under(&mut core, "x", &[p]).id;
-        core.set_parents(x, vec![p, q]).unwrap();
-
-        core.move_sibling(Some(p), x, Direction::Up).unwrap();
-
-        let order = core.sibling_order().unwrap();
-        assert_eq!(order.children_of(Some(p)), [x, first]);
-        assert_eq!(order.children_of(Some(q)), [other, x]);
-    }
-
-    #[test]
-    fn move_sibling_should_reorder_top_level_when_parent_is_none() {
+    fn move_sibling_should_reorder_top_level_for_a_top_level_task() {
         let mut core = new_core();
         let s = siblings(&mut core, None, 3);
 
-        core.move_sibling(None, s[2], Direction::Up).unwrap();
+        core.move_sibling(s[2], Direction::Up).unwrap();
 
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(None), [s[0], s[2], s[1]]);
-    }
-
-    #[test]
-    fn move_sibling_should_reject_task_not_under_parent() {
-        let mut core = new_core();
-        let p = core.create_task(minimal_new_task("p")).unwrap().id;
-        let other = core.create_task(minimal_new_task("other")).unwrap().id;
-
-        let under_wrong = core.move_sibling(Some(p), other, Direction::Up);
-        let top_but_nested = {
-            let child = titled_under(&mut core, "child", &[p]).id;
-            core.move_sibling(None, child, Direction::Up)
-        };
-
-        assert!(matches!(
-            under_wrong,
-            Err(CoreError::NotUnderParent { task, parent: Some(pp) }) if task == other && pp == p
-        ));
-        assert!(matches!(
-            top_but_nested,
-            Err(CoreError::NotUnderParent { parent: None, .. })
-        ));
     }
 
     #[test]
@@ -3565,7 +3123,7 @@ mod tests {
         let mut core = new_core();
         let missing = TaskId::new();
 
-        let result = core.move_sibling(None, missing, Direction::Up);
+        let result = core.move_sibling(missing, Direction::Up);
 
         assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
     }
@@ -3574,15 +3132,15 @@ mod tests {
     fn indent_task_should_become_last_child_of_previous_sibling() {
         let mut core = new_core();
         let s = siblings(&mut core, None, 3);
-        let existing = titled_under(&mut core, "kid", &[s[0]]).id;
+        let existing = titled_under(&mut core, "kid", Some(s[0])).id;
 
-        let changed = core.indent_task(None, s[1]).unwrap();
+        let changed = core.indent_task(s[1]).unwrap();
 
         assert!(changed);
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(None), [s[0], s[2]]);
         assert_eq!(order.children_of(Some(s[0])), [existing, s[1]]);
-        assert_eq!(core.get_task(s[1]).unwrap().unwrap().parent_ids, [s[0]]);
+        assert_eq!(core.get_task(s[1]).unwrap().unwrap().parent_id, Some(s[0]));
     }
 
     #[test]
@@ -3591,7 +3149,7 @@ mod tests {
         let s = siblings(&mut core, None, 2);
         let before = core.get_task(s[0]).unwrap().unwrap();
 
-        let changed = core.indent_task(None, s[0]).unwrap();
+        let changed = core.indent_task(s[0]).unwrap();
 
         assert!(!changed);
         assert_eq!(
@@ -3608,7 +3166,7 @@ mod tests {
         let s = siblings(&mut core, Some(p), 3);
         core.delete_task(s[1], DeleteMode::PromoteChildren).unwrap();
 
-        core.indent_task(Some(p), s[2]).unwrap();
+        core.indent_task(s[2]).unwrap();
 
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(s[0])), [s[2]]);
@@ -3618,10 +3176,10 @@ mod tests {
     fn indent_task_should_keep_subtree_intact() {
         let mut core = new_core();
         let s = siblings(&mut core, None, 2);
-        let kid = titled_under(&mut core, "kid", &[s[1]]).id;
-        let grandkid = titled_under(&mut core, "gk", &[kid]).id;
+        let kid = titled_under(&mut core, "kid", Some(s[1])).id;
+        let grandkid = titled_under(&mut core, "gk", Some(kid)).id;
 
-        core.indent_task(None, s[1]).unwrap();
+        core.indent_task(s[1]).unwrap();
 
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(s[1])), [kid]);
@@ -3629,62 +3187,30 @@ mod tests {
     }
 
     #[test]
-    fn indent_task_should_not_duplicate_parent_already_held() {
+    fn indent_task_should_reject_unknown_task() {
         let mut core = new_core();
-        let p = core.create_task(minimal_new_task("p")).unwrap().id;
-        let t = titled_under(&mut core, "t", &[p]).id;
-        let x = titled_under(&mut core, "x", &[p]).id;
-        // `x` is already a child of `t` as well as of `p`.
-        core.set_parents(x, vec![p, t]).unwrap();
+        let missing = TaskId::new();
 
-        core.indent_task(Some(p), x).unwrap();
+        let result = core.indent_task(missing);
 
-        let stored = core.get_task(x).unwrap().unwrap();
-        assert_eq!(stored.parent_ids, vec![t]);
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
     }
 
     #[test]
-    fn indent_task_should_reject_cycle_with_circular_hierarchy() {
-        let mut core = new_core();
-        let p = core.create_task(minimal_new_task("p")).unwrap().id;
-        let prev = titled_under(&mut core, "prev", &[p]).id;
-        let x = titled_under(&mut core, "x", &[p]).id;
-        // `prev` is also a child (descendant) of `x`.
-        core.set_parents(prev, vec![p, x]).unwrap();
-
-        let result = core.indent_task(Some(p), x);
-
-        assert!(matches!(result, Err(CoreError::CircularHierarchy { .. })));
-        let order = core.sibling_order().unwrap();
-        assert_eq!(order.children_of(Some(p)), [prev, x]);
-    }
-
-    #[test]
-    fn indent_task_should_reject_task_not_under_parent() {
-        let mut core = new_core();
-        let p = core.create_task(minimal_new_task("p")).unwrap().id;
-        let other = core.create_task(minimal_new_task("o")).unwrap().id;
-
-        let result = core.indent_task(Some(p), other);
-
-        assert!(matches!(result, Err(CoreError::NotUnderParent { .. })));
-    }
-
-    #[test]
-    fn outdent_task_should_land_immediately_after_old_parent() {
+    fn outdent_task_should_land_right_after_its_old_parent() {
         let mut core = new_core();
         let g = core.create_task(minimal_new_task("g")).unwrap().id;
-        let p = titled_under(&mut core, "p", &[g]).id;
-        let after = titled_under(&mut core, "after", &[g]).id;
-        let x = titled_under(&mut core, "x", &[p]).id;
+        let p = titled_under(&mut core, "p", Some(g)).id;
+        let after = titled_under(&mut core, "after", Some(g)).id;
+        let x = titled_under(&mut core, "x", Some(p)).id;
 
-        let changed = core.outdent_task(Some(p), Some(g), x).unwrap();
+        let changed = core.outdent_task(x).unwrap();
 
         assert!(changed);
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(g)), [p, x, after]);
         assert_eq!(order.children_of(Some(p)), []);
-        assert_eq!(core.get_task(x).unwrap().unwrap().parent_ids, [g]);
+        assert_eq!(core.get_task(x).unwrap().unwrap().parent_id, Some(g));
     }
 
     #[test]
@@ -3692,23 +3218,23 @@ mod tests {
         let mut core = new_core();
         let p = core.create_task(minimal_new_task("p")).unwrap().id;
         let next = core.create_task(minimal_new_task("next")).unwrap().id;
-        let x = titled_under(&mut core, "x", &[p]).id;
+        let x = titled_under(&mut core, "x", Some(p)).id;
 
-        let changed = core.outdent_task(Some(p), None, x).unwrap();
+        let changed = core.outdent_task(x).unwrap();
 
         assert!(changed);
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(None), [p, x, next]);
-        assert_eq!(core.get_task(x).unwrap().unwrap().parent_ids, []);
+        assert_eq!(core.get_task(x).unwrap().unwrap().parent_id, None);
     }
 
     #[test]
-    fn outdent_task_should_be_noop_at_top_level() {
+    fn outdent_task_should_be_a_no_op_at_top_level() {
         let mut core = new_core();
         let s = siblings(&mut core, None, 2);
         let before = core.get_task(s[1]).unwrap().unwrap();
 
-        let changed = core.outdent_task(None, None, s[1]).unwrap();
+        let changed = core.outdent_task(s[1]).unwrap();
 
         assert!(!changed);
         assert_eq!(
@@ -3719,56 +3245,15 @@ mod tests {
     }
 
     #[test]
-    fn outdent_task_should_only_replace_the_given_parent_when_task_has_several() {
-        let mut core = new_core();
-        let g = core.create_task(minimal_new_task("g")).unwrap().id;
-        let p = titled_under(&mut core, "p", &[g]).id;
-        let q = core.create_task(minimal_new_task("q")).unwrap().id;
-        let x = titled_under(&mut core, "x", &[p]).id;
-        core.set_parents(x, vec![p, q]).unwrap();
-
-        core.outdent_task(Some(p), Some(g), x).unwrap();
-
-        let order = core.sibling_order().unwrap();
-        assert_eq!(order.children_of(Some(g)), [p, x]);
-        assert_eq!(order.children_of(Some(q)), [x]);
-        assert_eq!(order.children_of(Some(p)), []);
-    }
-
-    #[test]
-    fn outdent_task_should_only_drop_parent_when_top_level_target_and_other_parents_remain() {
+    fn outdent_task_should_reject_deleted_task() {
         let mut core = new_core();
         let p = core.create_task(minimal_new_task("p")).unwrap().id;
-        let q = core.create_task(minimal_new_task("q")).unwrap().id;
-        let x = titled_under(&mut core, "x", &[p]).id;
-        core.set_parents(x, vec![p, q]).unwrap();
+        let x = titled_under(&mut core, "x", Some(p)).id;
+        core.delete_task(x, DeleteMode::Subtree).unwrap();
 
-        core.outdent_task(Some(p), None, x).unwrap();
+        let result = core.outdent_task(x);
 
-        let order = core.sibling_order().unwrap();
-        assert_eq!(order.children_of(Some(q)), [x]);
-        assert_eq!(order.children_of(Some(p)), []);
-        assert!(!order.children_of(None).contains(&x));
-    }
-
-    #[test]
-    fn outdent_task_should_reject_bad_path() {
-        let mut core = new_core();
-        let g = core.create_task(minimal_new_task("g")).unwrap().id;
-        let p = core.create_task(minimal_new_task("p")).unwrap().id;
-        let x = titled_under(&mut core, "x", &[p]).id;
-
-        let wrong_parent = core.outdent_task(Some(g), None, x);
-        let wrong_grandparent = core.outdent_task(Some(p), Some(g), x);
-
-        assert!(matches!(
-            wrong_parent,
-            Err(CoreError::NotUnderParent { task, .. }) if task == x
-        ));
-        assert!(matches!(
-            wrong_grandparent,
-            Err(CoreError::NotUnderParent { task, parent: Some(pp) }) if task == p && pp == g
-        ));
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == x));
     }
 
     #[test]
@@ -3787,12 +3272,12 @@ mod tests {
         let root = core.create_task(minimal_new_task("Root")).unwrap();
         let mid = core
             .create_task(NewTask {
-                parent_ids: vec![root.id],
+                parent_id: Some(root.id),
                 ..minimal_new_task("Mid")
             })
             .unwrap();
         core.create_task(NewTask {
-            parent_ids: vec![mid.id],
+            parent_id: Some(mid.id),
             ..minimal_new_task("Leaf")
         })
         .unwrap();
@@ -3813,68 +3298,78 @@ mod tests {
     }
 
     #[test]
-    fn set_parents_should_reject_when_task_not_found() {
+    fn set_parent_should_reject_when_task_not_found() {
         let mut core = new_core();
         let missing = TaskId::new();
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
 
-        let result = core.set_parents(missing, vec![parent.id]);
+        let result = core.set_parent(missing, Some(parent.id));
 
         assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
     }
 
     #[test]
-    fn set_parents_should_reject_when_new_parent_does_not_exist() {
+    fn set_parent_should_reject_missing_parent() {
         let mut core = new_core();
         let task = core.create_task(minimal_new_task("Task")).unwrap();
         let missing_parent = TaskId::new();
 
-        let result = core.set_parents(task.id, vec![missing_parent]);
-
-        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing_parent));
-    }
-
-    #[test]
-    fn set_parents_should_replace_existing_parents_with_new_ones() {
-        let mut core = new_core();
-        let old_parent = core.create_task(minimal_new_task("Old parent")).unwrap();
-        let new_parent = core.create_task(minimal_new_task("New parent")).unwrap();
-        let task = core
-            .create_task(NewTask {
-                parent_ids: vec![old_parent.id],
-                ..minimal_new_task("Task")
-            })
+        let deleted_parent = core.create_task(minimal_new_task("Deleted")).unwrap();
+        core.delete_task(deleted_parent.id, DeleteMode::Subtree)
             .unwrap();
+        let before = store_snapshot(&core);
 
-        let updated = core.set_parents(task.id, vec![new_parent.id]).unwrap();
+        let missing = core.set_parent(task.id, Some(missing_parent));
+        let deleted = core.set_parent(task.id, Some(deleted_parent.id));
 
-        assert_eq!(updated.parent_ids, vec![new_parent.id]);
-        let old_parent_children = core.list_children(old_parent.id).unwrap();
-        assert!(!old_parent_children.iter().any(|t| t.id == task.id));
-        let new_parent_children = core.list_children(new_parent.id).unwrap();
-        assert!(new_parent_children.iter().any(|t| t.id == task.id));
+        assert!(matches!(missing, Err(CoreError::NotFound(id)) if id == missing_parent));
+        assert!(matches!(deleted, Err(CoreError::NotFound(id)) if id == deleted_parent.id));
+        assert_eq!(store_snapshot(&core), before);
     }
 
     #[test]
-    fn set_parents_should_promote_task_to_top_level_when_given_empty_list() {
+    fn set_parent_should_move_task_under_new_parent() {
         let mut core = new_core();
-        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
-        let task = core
-            .create_task(NewTask {
-                parent_ids: vec![parent.id],
-                ..minimal_new_task("Task")
-            })
-            .unwrap();
+        let old_parent = titled_under(&mut core, "Old parent", None);
+        let new_parent = titled_under(&mut core, "New parent", None);
+        let existing = titled_under(&mut core, "Existing", Some(new_parent.id));
+        let task = titled_under(&mut core, "Task", Some(old_parent.id));
 
-        let updated = core.set_parents(task.id, Vec::new()).unwrap();
+        let updated = core.set_parent(task.id, Some(new_parent.id)).unwrap();
 
-        assert_eq!(updated.parent_ids, []);
-        let parent_children = core.list_children(parent.id).unwrap();
-        assert!(!parent_children.iter().any(|t| t.id == task.id));
+        assert_eq!(updated.parent_id, Some(new_parent.id));
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.parent_id, Some(new_parent.id));
+        // The task leaves its old parent and lands after the new parent's
+        // existing children.
+        let order = core.sibling_order().unwrap();
+        assert_eq!(order.children_of(Some(old_parent.id)), []);
+        assert_eq!(
+            order.children_of(Some(new_parent.id)),
+            [existing.id, task.id]
+        );
     }
 
     #[test]
-    fn set_parents_should_allow_parent_and_child_of_different_task_types() {
+    fn set_parent_should_promote_to_top_level_when_none() {
+        let mut core = new_core();
+        let parent = titled_under(&mut core, "Parent", None);
+        let task = titled_under(&mut core, "Task", Some(parent.id));
+        let other_root = titled_under(&mut core, "Other root", None);
+
+        let updated = core.set_parent(task.id, None).unwrap();
+
+        assert_eq!(updated.parent_id, None);
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.parent_id, None);
+        // The task leaves its parent and lands after the existing roots.
+        let order = core.sibling_order().unwrap();
+        assert_eq!(order.children_of(Some(parent.id)), []);
+        assert_eq!(order.children_of(None), [parent.id, other_root.id, task.id]);
+    }
+
+    #[test]
+    fn set_parent_should_allow_parent_and_child_of_different_task_types() {
         let mut core = new_core();
         let goal = TaskType {
             key: "goal".to_owned(),
@@ -3892,18 +3387,18 @@ mod tests {
         let child = core.create_task(minimal_new_task("Child")).unwrap();
         assert_ne!(parent.type_key, child.type_key);
 
-        let result = core.set_parents(child.id, vec![parent.id]);
+        let result = core.set_parent(child.id, Some(parent.id));
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().parent_ids, vec![parent.id]);
+        assert_eq!(result.unwrap().parent_id, Some(parent.id));
     }
 
     #[test]
-    fn set_parents_should_reject_self_parenting_with_circular_hierarchy_error() {
+    fn set_parent_should_reject_self_parenting_with_circular_hierarchy_error() {
         let mut core = new_core();
         let task = core.create_task(minimal_new_task("Task")).unwrap();
 
-        let result = core.set_parents(task.id, vec![task.id]);
+        let result = core.set_parent(task.id, Some(task.id));
 
         assert!(matches!(
             result,
@@ -3913,83 +3408,60 @@ mod tests {
     }
 
     #[test]
-    fn set_parents_should_reject_when_candidate_is_a_descendant_of_the_task() {
+    fn set_parent_should_reject_making_a_task_its_own_ancestor() {
         let mut core = new_core();
-        let task = core.create_task(minimal_new_task("Task")).unwrap();
-        let descendant = core
-            .create_task(NewTask {
-                parent_ids: vec![task.id],
-                ..minimal_new_task("Descendant")
-            })
-            .unwrap();
+        let root = titled_under(&mut core, "Root", None);
+        let task = titled_under(&mut core, "Task", Some(root.id));
+        let child = titled_under(&mut core, "Child", Some(task.id));
+        let grandchild = titled_under(&mut core, "Grandchild", Some(child.id));
+        let before = store_snapshot(&core);
 
-        let result = core.set_parents(task.id, vec![descendant.id]);
+        let under_child = core.set_parent(task.id, Some(child.id));
+        let under_grandchild = core.set_parent(task.id, Some(grandchild.id));
 
         assert!(matches!(
-            result,
+            under_child,
             Err(CoreError::CircularHierarchy { task: t, attempted_parent })
-                if t == task.id && attempted_parent == descendant.id
+                if t == task.id && attempted_parent == child.id
         ));
+        assert!(matches!(
+            under_grandchild,
+            Err(CoreError::CircularHierarchy { task: t, attempted_parent })
+                if t == task.id && attempted_parent == grandchild.id
+        ));
+        // A rejected move changes nothing: no row and no edge.
+        assert_eq!(store_snapshot(&core), before);
     }
 
     #[test]
-    fn set_parents_should_leave_existing_parents_unchanged_when_one_of_several_candidates_creates_a_cycle()
-     {
+    fn set_parent_should_change_nothing_when_parent_is_unchanged() {
         let mut core = new_core();
-        let original_parent = core
-            .create_task(minimal_new_task("Original parent"))
-            .unwrap();
-        let fine_candidate = core
-            .create_task(minimal_new_task("Fine candidate"))
-            .unwrap();
-        let task = core
-            .create_task(NewTask {
-                parent_ids: vec![original_parent.id],
-                ..minimal_new_task("Task")
-            })
-            .unwrap();
-        let cycle_candidate = core
-            .create_task(NewTask {
-                parent_ids: vec![task.id],
-                ..minimal_new_task("Cycle candidate")
-            })
-            .unwrap();
+        let parent = titled_under(&mut core, "Parent", None);
+        let task = titled_under(&mut core, "Task", Some(parent.id));
+        titled_under(&mut core, "Later sibling", Some(parent.id));
+        let root = titled_under(&mut core, "Root", None);
+        titled_under(&mut core, "Later root", None);
+        let before = store_snapshot(&core);
 
-        let result = core.set_parents(task.id, vec![fine_candidate.id, cycle_candidate.id]);
+        let under_same_parent = core.set_parent(task.id, Some(parent.id)).unwrap();
+        let still_top_level = core.set_parent(root.id, None).unwrap();
 
-        assert!(matches!(result, Err(CoreError::CircularHierarchy { .. })));
-        let current = core.get_task(task.id).unwrap().unwrap();
-        assert_eq!(current.parent_ids, vec![original_parent.id]);
-        let original_parent_children = core.list_children(original_parent.id).unwrap();
-        assert!(original_parent_children.iter().any(|t| t.id == task.id));
-        let fine_candidate_children = core.list_children(fine_candidate.id).unwrap();
-        assert!(!fine_candidate_children.iter().any(|t| t.id == task.id));
+        // Neither `updated_at` nor the position among the siblings moves.
+        assert_eq!(under_same_parent, task);
+        assert_eq!(still_top_level, root);
+        assert_eq!(store_snapshot(&core), before);
     }
 
     #[test]
-    fn set_parents_should_bump_updated_at() {
+    fn set_parent_should_bump_updated_at() {
         let mut core = new_core();
         let task = core.create_task(minimal_new_task("Task")).unwrap();
         let new_parent = core.create_task(minimal_new_task("New parent")).unwrap();
 
-        let updated = core.set_parents(task.id, vec![new_parent.id]).unwrap();
+        let updated = core.set_parent(task.id, Some(new_parent.id)).unwrap();
 
         assert_eq!(updated.created_at, task.created_at);
         assert!(updated.updated_at >= task.updated_at);
-    }
-
-    #[test]
-    fn set_parents_should_deduplicate_repeated_parent_ids_preserving_first_occurrence_order() {
-        let mut core = new_core();
-        let task = core.create_task(minimal_new_task("Task")).unwrap();
-        let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
-        let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
-
-        let updated = core
-            .set_parents(task.id, vec![parent_a.id, parent_b.id, parent_a.id])
-            .unwrap();
-
-        assert_eq!(updated.parent_ids, vec![parent_a.id, parent_b.id]);
     }
 
     #[test]
@@ -3998,13 +3470,13 @@ mod tests {
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
         let child_a = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child A")
             })
             .unwrap();
         core.complete_task(child_a.id, false).unwrap();
         core.create_task(NewTask {
-            parent_ids: vec![parent.id],
+            parent_id: Some(parent.id),
             ..minimal_new_task("Child B")
         })
         .unwrap();
@@ -4020,13 +3492,13 @@ mod tests {
         let root = core.create_task(minimal_new_task("Root")).unwrap();
         let mid = core
             .create_task(NewTask {
-                parent_ids: vec![root.id],
+                parent_id: Some(root.id),
                 ..minimal_new_task("Mid")
             })
             .unwrap();
         let grandchild = core
             .create_task(NewTask {
-                parent_ids: vec![mid.id],
+                parent_id: Some(mid.id),
                 ..minimal_new_task("Grandchild")
             })
             .unwrap();
@@ -4048,7 +3520,7 @@ mod tests {
         let parent = core.create_task(minimal_new_task("Parent")).unwrap();
         let child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .unwrap();
@@ -4074,13 +3546,13 @@ mod tests {
         let root = core.create_task(minimal_new_task("Root")).unwrap();
         let mid = core
             .create_task(NewTask {
-                parent_ids: vec![root.id],
+                parent_id: Some(root.id),
                 ..minimal_new_task("Mid")
             })
             .unwrap();
         let leaf = core
             .create_task(NewTask {
-                parent_ids: vec![mid.id],
+                parent_id: Some(mid.id),
                 ..minimal_new_task("Leaf")
             })
             .unwrap();
@@ -4098,26 +3570,26 @@ mod tests {
     }
 
     #[test]
-    fn set_parents_should_leave_siblings_progress_unaffected_by_reparenting() {
+    fn set_parent_should_leave_siblings_progress_unaffected_by_reparenting() {
         let mut core = new_core();
         let old_parent = core.create_task(minimal_new_task("Old parent")).unwrap();
         let new_parent = core.create_task(minimal_new_task("New parent")).unwrap();
         let task = core
             .create_task(NewTask {
-                parent_ids: vec![old_parent.id],
+                parent_id: Some(old_parent.id),
                 ..minimal_new_task("Task")
             })
             .unwrap();
         let sibling = core
             .create_task(NewTask {
-                parent_ids: vec![old_parent.id],
+                parent_id: Some(old_parent.id),
                 ..minimal_new_task("Sibling")
             })
             .unwrap();
         core.complete_task(sibling.id, false).unwrap();
         let sibling_progress_before = core.get_task(sibling.id).unwrap().unwrap().progress;
 
-        core.set_parents(task.id, vec![new_parent.id]).unwrap();
+        core.set_parent(task.id, Some(new_parent.id)).unwrap();
 
         let sibling_progress_after = core.get_task(sibling.id).unwrap().unwrap().progress;
         assert!((sibling_progress_after - sibling_progress_before).abs() < f32::EPSILON);
@@ -4281,12 +3753,12 @@ mod tests {
         let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
         let done_child = core
             .create_task(NewTask {
-                parent_ids: vec![task.id],
+                parent_id: Some(task.id),
                 ..minimal_new_task("Done child")
             })
             .unwrap();
         core.create_task(NewTask {
-            parent_ids: vec![task.id],
+            parent_id: Some(task.id),
             ..minimal_new_task("Open child")
         })
         .unwrap();
@@ -4316,8 +3788,8 @@ mod tests {
     #[test]
     fn add_dependency_should_reject_direct_parent_as_predecessor() {
         let mut core = new_core();
-        let parent = titled_under(&mut core, "Parent", &[]);
-        let task = titled_under(&mut core, "Task", &[parent.id]);
+        let parent = titled_under(&mut core, "Parent", None);
+        let task = titled_under(&mut core, "Task", Some(parent.id));
 
         let result = core.add_dependency(task.id, parent.id, DependencyType::FinishToStart);
 
@@ -4331,10 +3803,10 @@ mod tests {
     #[test]
     fn add_dependency_should_reject_distant_ancestor_as_predecessor() {
         let mut core = new_core();
-        let great_grandparent = titled_under(&mut core, "Great-grandparent", &[]);
-        let grandparent = titled_under(&mut core, "Grandparent", &[great_grandparent.id]);
-        let parent = titled_under(&mut core, "Parent", &[grandparent.id]);
-        let task = titled_under(&mut core, "Task", &[parent.id]);
+        let great_grandparent = titled_under(&mut core, "Great-grandparent", None);
+        let grandparent = titled_under(&mut core, "Grandparent", Some(great_grandparent.id));
+        let parent = titled_under(&mut core, "Parent", Some(grandparent.id));
+        let task = titled_under(&mut core, "Task", Some(parent.id));
 
         let result =
             core.add_dependency(task.id, great_grandparent.id, DependencyType::FinishToStart);
@@ -4349,9 +3821,9 @@ mod tests {
     #[test]
     fn add_dependency_should_reject_descendant_as_predecessor() {
         let mut core = new_core();
-        let task = titled_under(&mut core, "Task", &[]);
-        let child = titled_under(&mut core, "Child", &[task.id]);
-        let grandchild = titled_under(&mut core, "Grandchild", &[child.id]);
+        let task = titled_under(&mut core, "Task", None);
+        let child = titled_under(&mut core, "Child", Some(task.id));
+        let grandchild = titled_under(&mut core, "Grandchild", Some(child.id));
 
         let result = core.add_dependency(task.id, grandchild.id, DependencyType::FinishToStart);
 
@@ -4363,51 +3835,11 @@ mod tests {
     }
 
     #[test]
-    fn add_dependency_should_reject_descendant_reachable_only_through_second_parent() {
-        // `descendant`'s first parent is outside `task`'s subtree; only its
-        // second parent sits under `task`, so a walk up from `descendant`
-        // that followed just the first parent of each task would miss it.
-        let mut core = new_core();
-        let task = titled_under(&mut core, "Task", &[]);
-        let outsider = titled_under(&mut core, "Outsider", &[]);
-        let child = titled_under(&mut core, "Child", &[task.id]);
-        let descendant = titled_under(&mut core, "Descendant", &[outsider.id, child.id]);
-
-        let result = core.add_dependency(task.id, descendant.id, DependencyType::FinishToStart);
-
-        assert!(matches!(
-            result,
-            Err(CoreError::DependsOnRelative { task: t, other })
-                if t == task.id && other == descendant.id
-        ));
-    }
-
-    #[test]
-    fn add_dependency_should_reject_ancestor_reachable_only_through_second_parent() {
-        // `task` has two parents; only the second one sits under
-        // `grandparent`, so a walk that followed just the first parent of
-        // each task would never reach it.
-        let mut core = new_core();
-        let first_parent = titled_under(&mut core, "First parent", &[]);
-        let grandparent = titled_under(&mut core, "Grandparent", &[]);
-        let second_parent = titled_under(&mut core, "Second parent", &[grandparent.id]);
-        let task = titled_under(&mut core, "Task", &[first_parent.id, second_parent.id]);
-
-        let result = core.add_dependency(task.id, grandparent.id, DependencyType::FinishToStart);
-
-        assert!(matches!(
-            result,
-            Err(CoreError::DependsOnRelative { task: t, other })
-                if t == task.id && other == grandparent.id
-        ));
-    }
-
-    #[test]
     fn add_dependency_should_allow_sibling_as_predecessor() {
         let mut core = new_core();
-        let parent = titled_under(&mut core, "Parent", &[]);
-        let sibling = titled_under(&mut core, "Sibling", &[parent.id]);
-        let task = titled_under(&mut core, "Task", &[parent.id]);
+        let parent = titled_under(&mut core, "Parent", None);
+        let sibling = titled_under(&mut core, "Sibling", Some(parent.id));
+        let task = titled_under(&mut core, "Task", Some(parent.id));
 
         let updated = core
             .add_dependency(task.id, sibling.id, DependencyType::FinishToStart)
@@ -4425,8 +3857,8 @@ mod tests {
     #[test]
     fn add_dependency_should_write_no_edge_when_rejected() {
         let mut core = new_core();
-        let parent = titled_under(&mut core, "Parent", &[]);
-        let task = titled_under(&mut core, "Task", &[parent.id]);
+        let parent = titled_under(&mut core, "Parent", None);
+        let task = titled_under(&mut core, "Task", Some(parent.id));
         let parent_before = core.get_task(parent.id).unwrap().unwrap();
         let task_before = core.get_task(task.id).unwrap().unwrap();
 
@@ -4676,12 +4108,12 @@ mod tests {
         let unrelated = core.create_task(minimal_new_task("Unrelated")).unwrap();
         let done_child = core
             .create_task(NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Done child")
             })
             .unwrap();
         core.create_task(NewTask {
-            parent_ids: vec![parent.id],
+            parent_id: Some(parent.id),
             ..minimal_new_task("Open child")
         })
         .unwrap();

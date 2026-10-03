@@ -112,6 +112,37 @@ fn task_add_with_parent_should_nest_under_it_in_ls_output() {
 }
 
 #[test]
+fn task_add_with_repeated_parent_should_fail_usage_and_create_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a_id = add_task(&db_path, &["--title", "Goal A"]);
+    let b_id = add_task(&db_path, &["--title", "Goal B"]);
+
+    bala_cmd(&db_path)
+        .args([
+            "task",
+            "add",
+            "--title",
+            "Shared child",
+            "--parent",
+            &a_id,
+            "--parent",
+            &b_id,
+        ])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(contains("--parent"));
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("Shared child").not());
+}
+
+#[test]
 fn user_add_then_ls_shows_created_user() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("bala.db");
@@ -413,54 +444,89 @@ fn task_delete_task_with_subtasks_and_cascade_should_remove_child_from_ls_too() 
         );
 }
 
+/// Runs `bala task ls` and returns its stdout.
+fn task_ls(db_path: &std::path::Path) -> String {
+    let output = bala_cmd(db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).unwrap()
+}
+
+/// The `task ls` lines naming `title`.
+fn lines_naming<'a>(ls_text: &'a str, title: &str) -> Vec<&'a str> {
+    ls_text
+        .lines()
+        .filter(|line| line.contains(title))
+        .collect()
+}
+
 #[test]
-fn task_delete_task_with_subtasks_and_promote_children_should_keep_child_visible() {
+fn task_delete_promote_children_should_move_children_to_top_level_without_a_grandparent() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("bala.db");
 
     let parent_id = add_task(&db_path, &["--title", "Parent task"]);
-    add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+    add_task(&db_path, &["--title", "Child one", "--parent", &parent_id]);
+    add_task(&db_path, &["--title", "Child two", "--parent", &parent_id]);
 
     bala_cmd(&db_path)
         .args(["task", "delete", &parent_id, "--promote-children", "--yes"])
         .assert()
         .success();
 
-    bala_cmd(&db_path)
-        .args(["task", "ls"])
-        .assert()
-        .success()
-        .stdout(contains("Parent task").not().and(contains("Child task")));
+    let ls_text = task_ls(&db_path);
+    assert!(!ls_text.contains("Parent task"), "{ls_text}");
+    for title in ["Child one", "Child two"] {
+        let lines = lines_naming(&ls_text, title);
+        assert_eq!(lines.len(), 1, "{title} listed once: {ls_text}");
+        assert!(
+            lines[0].starts_with('['),
+            "{title} should be top level (unindented): {ls_text}"
+        );
+    }
 }
 
 #[test]
-fn task_delete_cascade_should_print_only_deleted_ids_not_a_surviving_child() {
+fn task_delete_promote_children_should_move_children_to_the_grandparent() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("bala.db");
 
-    let a_id = add_task(&db_path, &["--title", "Goal A"]);
-    let b_id = add_task(&db_path, &["--title", "Goal B"]);
-    add_task(
+    let grandparent_id = add_task(&db_path, &["--title", "Grandparent task"]);
+    let parent_id = add_task(
         &db_path,
-        &[
-            "--title",
-            "Shared child",
-            "--parent",
-            &a_id,
-            "--parent",
-            &b_id,
-        ],
+        &["--title", "Parent task", "--parent", &grandparent_id],
     );
+    add_task(&db_path, &["--title", "Child one", "--parent", &parent_id]);
+    add_task(&db_path, &["--title", "Child two", "--parent", &parent_id]);
 
-    let output = bala_cmd(&db_path)
-        .args(["task", "delete", &a_id, "--cascade", "--yes"])
+    bala_cmd(&db_path)
+        .args(["task", "delete", &parent_id, "--promote-children", "--yes"])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
+        .success();
 
-    assert_eq!(String::from_utf8(output).unwrap(), format!("{a_id}\n"));
+    let ls_text = task_ls(&db_path);
+    assert!(!ls_text.contains("Parent task"), "{ls_text}");
+    for title in ["Child one", "Child two"] {
+        let lines = lines_naming(&ls_text, title);
+        assert_eq!(lines.len(), 1, "{title} listed once: {ls_text}");
+        assert!(
+            lines[0].starts_with("  ["),
+            "{title} should still be nested: {ls_text}"
+        );
+    }
+
+    // `task ls` indents every subtask alike, so the listing alone doesn't
+    // say whose children they now are: a mode-less delete of the
+    // grandparent refuses and names its direct subtasks.
+    bala_cmd(&db_path)
+        .args(["task", "delete", &grandparent_id, "--yes"])
+        .assert()
+        .failure()
+        .stderr(contains("Child one").and(contains("Child two")));
 }
 
 #[test]
@@ -538,55 +604,42 @@ fn task_delete_with_yes_should_still_print_the_dependents_warning() {
 }
 
 #[test]
-fn task_delete_cascade_should_warn_about_dependents_of_descendants() {
+fn task_delete_cascade_should_warn_about_every_dependent_outside_the_subtree() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("bala.db");
 
-    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
-    let child_id = add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
-    let dependent_id = add_task(&db_path, &["--title", "Dependent task"]);
-    add_dependency(&db_path, &dependent_id, &child_id);
+    let root_id = add_task(&db_path, &["--title", "Subtree root"]);
+    let child_id = add_task(
+        &db_path,
+        &["--title", "Subtree child", "--parent", &root_id],
+    );
+    let grandchild_id = add_task(
+        &db_path,
+        &["--title", "Subtree grandchild", "--parent", &child_id],
+    );
+    let inside_id = add_task(
+        &db_path,
+        &["--title", "Subtree dependent", "--parent", &root_id],
+    );
+    add_dependency(&db_path, &inside_id, &grandchild_id);
+    let on_root_id = add_task(&db_path, &["--title", "Depends on root"]);
+    add_dependency(&db_path, &on_root_id, &root_id);
+    let on_grandchild_id = add_task(&db_path, &["--title", "Depends on grandchild"]);
+    add_dependency(&db_path, &on_grandchild_id, &grandchild_id);
 
     bala_cmd(&db_path)
-        .args(["task", "delete", &parent_id, "--cascade", "--yes"])
+        .args(["task", "delete", &root_id, "--cascade", "--yes"])
         .assert()
         .success()
-        .stderr(contains("1 task(s) depend on what this deletes:"))
-        .stderr(contains(format!("  {dependent_id} Dependent task")));
-}
+        .stderr(contains("2 task(s) depend on what this deletes:"))
+        .stderr(contains(format!("  {on_root_id} Depends on root")).count(1))
+        .stderr(contains(format!("  {on_grandchild_id} Depends on grandchild")).count(1))
+        .stderr(contains(inside_id).not());
 
-#[test]
-fn task_delete_cascade_should_warn_about_surviving_subtask_depending_on_deleted_one() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("bala.db");
-
-    let target_id = add_task(&db_path, &["--title", "Target task"]);
-    let other_parent_id = add_task(&db_path, &["--title", "Other parent"]);
-    let doomed_id = add_task(
-        &db_path,
-        &["--title", "Doomed child", "--parent", &target_id],
-    );
-    let survivor_id = add_task(
-        &db_path,
-        &[
-            "--title",
-            "Survivor child",
-            "--parent",
-            &target_id,
-            "--parent",
-            &other_parent_id,
-        ],
-    );
-    add_dependency(&db_path, &survivor_id, &doomed_id);
-
-    bala_cmd(&db_path)
-        .args(["task", "delete", &target_id, "--cascade", "--yes"])
-        .assert()
-        .success()
-        .stdout(contains(doomed_id))
-        .stdout(contains(survivor_id.clone()).not())
-        .stderr(contains("1 task(s) depend on what this deletes:"))
-        .stderr(contains(format!("  {survivor_id} Survivor child")));
+    let ls_text = task_ls(&db_path);
+    assert!(!ls_text.contains("Subtree"), "no survivors: {ls_text}");
+    assert!(ls_text.contains("Depends on root"), "{ls_text}");
+    assert!(ls_text.contains("Depends on grandchild"), "{ls_text}");
 }
 
 #[test]
@@ -832,7 +885,7 @@ fn task_ls_should_show_incomplete_marker_for_a_new_task() {
 }
 
 #[test]
-fn task_mv_should_reparent_task_and_show_new_parent_in_ls() {
+fn task_mv_with_parent_should_reparent_task() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("bala.db");
 
@@ -840,7 +893,7 @@ fn task_mv_should_reparent_task_and_show_new_parent_in_ls() {
     let new_parent_id = add_task(&db_path, &["--title", "Task B"]);
 
     bala_cmd(&db_path)
-        .args(["task", "mv", &movable_id, "--parents", &new_parent_id])
+        .args(["task", "mv", &movable_id, "--parent", &new_parent_id])
         .assert()
         .success();
 
@@ -871,7 +924,7 @@ fn task_mv_should_reparent_task_and_show_new_parent_in_ls() {
 }
 
 #[test]
-fn task_mv_with_empty_parents_should_promote_to_top_level() {
+fn task_mv_without_parent_should_promote_to_top_level() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("bala.db");
 
@@ -1074,9 +1127,44 @@ fn task_mv_with_circular_parent_should_fail_with_nonzero_exit() {
     let task_id = add_task(&db_path, &["--title", "Task A"]);
 
     bala_cmd(&db_path)
-        .args(["task", "mv", &task_id, "--parents", &task_id])
+        .args(["task", "mv", &task_id, "--parent", &task_id])
         .assert()
-        .failure();
+        .failure()
+        .stderr(contains("would make it its own ancestor"));
+}
+
+#[test]
+fn task_mv_with_parents_flag_should_fail_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    let child_id = add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+    let other_id = add_task(&db_path, &["--title", "Other task"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "mv", &child_id, "--parents", &other_id])
+        .assert()
+        .code(2)
+        .stderr(contains("--parents"));
+
+    // The rejected move left the child under its original parent.
+    let ls_output = bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ls_text = String::from_utf8(ls_output).unwrap();
+    let child_line = ls_text
+        .lines()
+        .find(|line| line.contains("Child task"))
+        .expect("child line present");
+    assert!(
+        child_line.starts_with("  "),
+        "expected child to stay nested: {child_line:?}"
+    );
 }
 
 #[test]
@@ -1123,6 +1211,40 @@ fn task_ls_with_type_filter_for_unused_type_should_show_no_tasks() {
         .assert()
         .success()
         .stdout(contains("Some task").not());
+}
+
+#[test]
+fn task_ls_should_print_one_line_per_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let goal_id = add_task(&db_path, &["--title", "Goal"]);
+    let left_id = add_task(&db_path, &["--title", "Left", "--parent", &goal_id]);
+    let right_id = add_task(&db_path, &["--title", "Right", "--parent", &goal_id]);
+    let left_leaf_id = add_task(&db_path, &["--title", "Left leaf", "--parent", &left_id]);
+    let right_leaf_id = add_task(&db_path, &["--title", "Right leaf", "--parent", &right_id]);
+    let deep_id = add_task(&db_path, &["--title", "Deep", "--parent", &right_leaf_id]);
+    let other_id = add_task(&db_path, &["--title", "Other root"]);
+    let ids = [
+        goal_id,
+        left_id,
+        right_id,
+        left_leaf_id,
+        right_leaf_id,
+        deep_id,
+        other_id,
+    ];
+
+    let ls_text = task_ls(&db_path);
+
+    assert_eq!(ls_text.lines().count(), ids.len(), "{ls_text}");
+    for id in &ids {
+        assert_eq!(
+            lines_naming(&ls_text, id).len(),
+            1,
+            "{id} should be on exactly one line: {ls_text}"
+        );
+    }
 }
 
 #[test]

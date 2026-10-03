@@ -51,7 +51,7 @@ mod tests {
             id: TaskId::new(),
             title: "Task".to_owned(),
             description: None,
-            parent_ids: Vec::new(),
+            parent_id: None,
             type_key: "task".to_owned(),
             status,
             progress: match status {

@@ -5,7 +5,7 @@
 //! never read back into a `Task`, since `Task` has nowhere to put it yet.
 //! `assignee_id`, `deleted_at`, and `completed_at` *are* read/written.
 //!
-//! `parent_ids` and `depends_on` are not columns: reads fill them from the
+//! `parent_id` and `depends_on` are not columns: reads fill them from the
 //! `parent_edges` and `dependency_edges` tables, and `put_task` writes
 //! neither, so the edge tables are their only source.
 
@@ -21,7 +21,7 @@ use crate::edges;
 const SELECT_COLUMNS: &str = "id, title, description, type_key, status, start_date, due_date, \
     assignee_id, created_at, updated_at, completed_at, deleted_at";
 
-/// Builds a [`Task`] from a row of [`SELECT_COLUMNS`], leaving `parent_ids`
+/// Builds a [`Task`] from a row of [`SELECT_COLUMNS`], leaving `parent_id`
 /// and `depends_on` empty — callers fill them in with [`fill_edges`] (edges
 /// live in distinct tables, not embedded in the row).
 fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
@@ -43,7 +43,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
             id: blob_to_task_id(&id_blob)?,
             title,
             description,
-            parent_ids: Vec::new(),
+            parent_id: None,
             type_key,
             status: status_from_text(&status_text)?,
             // Not a stored column — `Core` always overwrites this on every
@@ -61,10 +61,10 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
     })())
 }
 
-/// Fills `task`'s edge-backed fields: `parent_ids` from `parent_edges` and
+/// Fills `task`'s edge-backed fields: `parent_id` from `parent_edges` and
 /// `depends_on` from `dependency_edges`.
 fn fill_edges(tx: &Transaction, task: &mut Task) -> Result<(), StoreError> {
-    task.parent_ids = edges::list_parent_edges(tx, task.id)?;
+    task.parent_id = edges::get_parent_edge(tx, task.id)?;
     task.depends_on = edges::list_dependency_edges(tx, task.id)?;
     Ok(())
 }

@@ -134,8 +134,10 @@ pub struct Task {
     pub id: TaskId,
     pub title: String,
     pub description: Option<String>,
-    /// A task may sit under multiple parents; empty means top-level.
-    pub parent_ids: Vec<TaskId>,
+    /// A task sits under at most one parent; `None` means top-level.
+    /// Filled by the store from the task's parent edge on every read;
+    /// `StoreTx::put_task` ignores it, so the edge is its only source.
+    pub parent_id: Option<TaskId>,
     /// FK into `TaskType::key`; defaults to `"task"`.
     pub type_key: String,
     pub status: TaskStatus,
@@ -175,10 +177,11 @@ pub struct Task {
 /// §Method Contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeleteMode {
-    /// Soft-delete the task and every descendant beneath it.
+    /// Soft-delete the task and every descendant beneath it; nothing in
+    /// the subtree survives.
     Subtree,
     /// Soft-delete only the task itself; its children are reparented to
-    /// its parents (or become top-level if it had none).
+    /// its parent (or become top-level if it had none).
     PromoteChildren,
 }
 
@@ -189,9 +192,9 @@ pub enum DeleteMode {
 ///
 /// - `deleted`: every task the call tombstoned (`deleted_at` set).
 /// - `updated`: every surviving task whose own fields changed without
-///   being tombstoned — a child that lost a parent edge but is still
-///   reachable through another live parent, or a child reparented under
-///   [`DeleteMode::PromoteChildren`].
+///   being tombstoned — the children reparented under
+///   [`DeleteMode::PromoteChildren`]. Always empty under
+///   [`DeleteMode::Subtree`], which leaves no survivor to change.
 ///
 /// No id appears in both lists. A task whose rolled-up `progress` changed
 /// only because its children changed (e.g. a surviving parent that lost a
@@ -207,7 +210,8 @@ pub struct DeleteOutcome {
 pub struct NewTask {
     pub title: String,
     pub description: Option<String>,
-    pub parent_ids: Vec<TaskId>,
+    /// `None` means top-level; `Some` must name an existing task.
+    pub parent_id: Option<TaskId>,
     /// `None` means default to `"task"`.
     pub type_key: Option<String>,
     pub start_date: Option<NaiveDate>,
@@ -260,8 +264,8 @@ pub enum Field<T> {
 /// [`TaskPatch::default`], touching only what changed, e.g.
 /// `TaskPatch { title: Field::Set("New title".into()), ..Default::default() }`.
 ///
-/// `parent_ids` and dependency edits are intentionally not here — those go
-/// through their own dedicated methods (`set_parents`,
+/// `parent_id` and dependency edits are intentionally not here — those go
+/// through their own dedicated methods (`set_parent`,
 /// `add_dependency`/`remove_dependency`) because each carries its own
 /// invariant check that a generic patch would obscure.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -278,50 +282,14 @@ pub struct TaskPatch {
     pub type_key: Field<String>,
 }
 
-/// The complete set of parents a task sits under, as written by
-/// [`StoreTx::replace_parent_edges`](crate::StoreTx::replace_parent_edges).
-///
-/// `Under` holds at least one id; use [`Parents::from_ids`] to build one from
-/// a possibly-empty list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Parents {
-    /// No parent: the task is at the top level.
-    TopLevel,
-    /// One or more parents (never empty).
-    Under(Vec<TaskId>),
-}
-
-impl Parents {
-    /// Builds `TopLevel` from an empty list and `Under` otherwise.
-    #[must_use]
-    pub fn from_ids(ids: Vec<TaskId>) -> Self {
-        if ids.is_empty() {
-            Self::TopLevel
-        } else {
-            Self::Under(ids)
-        }
-    }
-
-    /// The parent ids: empty for `TopLevel`.
-    #[must_use]
-    pub fn ids(&self) -> &[TaskId] {
-        match self {
-            Self::TopLevel => &[],
-            Self::Under(ids) => ids,
-        }
-    }
-}
-
 /// Where a re-parented task lands among its new siblings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     /// After all existing siblings.
     End,
-    /// Immediately after the given sibling, in each newly added parent's
-    /// children that contains it. For a parent whose children do not include
-    /// the sibling (or when the sibling is the child itself) this falls back
-    /// to [`Placement::End`]. Parents the child already has keep their
-    /// position.
+    /// Immediately after the given sibling among the new parent's children.
+    /// If the new parent's children do not include the sibling (or the
+    /// sibling is the child itself) this falls back to [`Placement::End`].
     After(TaskId),
 }
 
@@ -428,7 +396,7 @@ mod tests {
             id: TaskId::new(),
             title: "Write tests".to_owned(),
             description: None,
-            parent_ids: Vec::new(),
+            parent_id: None,
             type_key: "task".to_owned(),
             status: TaskStatus::Incomplete,
             progress: 0.0,
@@ -444,7 +412,7 @@ mod tests {
 
         assert_eq!(task.title, "Write tests");
         assert_eq!(task.status, TaskStatus::Incomplete);
-        assert_eq!(task.parent_ids, []);
+        assert_eq!(task.parent_id, None);
         assert!((task.progress - 0.0).abs() < f32::EPSILON);
     }
 
@@ -455,7 +423,7 @@ mod tests {
             id: TaskId::new(),
             title: "Task".to_owned(),
             description: Some("desc".to_owned()),
-            parent_ids: vec![TaskId::new()],
+            parent_id: Some(TaskId::new()),
             type_key: "task".to_owned(),
             status: TaskStatus::Complete,
             progress: 1.0,
@@ -477,7 +445,7 @@ mod tests {
         let new_task = NewTask {
             title: "Title".to_owned(),
             description: None,
-            parent_ids: Vec::new(),
+            parent_id: None,
             type_key: None,
             start_date: None,
             due_date: None,

@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::path::Path;
 
 use bala_core::{
-    Dependency, DependencyType, Parents, Placement, Store, StoreError, StoreTx, Task, TaskId,
-    TaskType, TreeFilter, User, UserId,
+    Dependency, DependencyType, Placement, Store, StoreError, StoreTx, Task, TaskId, TaskType,
+    TreeFilter, User, UserId,
 };
 use refinery::Runner;
 use rusqlite::Connection;
@@ -192,17 +192,17 @@ impl StoreTx for SqliteTx<'_> {
         task::list_tasks(&self.tx, filter)
     }
 
-    fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
-        edges::list_parent_edges(&self.tx, id)
+    fn get_parent_edge(&mut self, id: TaskId) -> Result<Option<TaskId>, StoreError> {
+        edges::get_parent_edge(&self.tx, id)
     }
 
-    fn replace_parent_edges(
+    fn set_parent_edge(
         &mut self,
         child: TaskId,
-        parents: &Parents,
+        parent: Option<TaskId>,
         placement: Placement,
     ) -> Result<(), StoreError> {
-        edges::replace_parent_edges(&self.tx, child, parents, placement)
+        edges::set_parent_edge(&self.tx, child, parent, placement)
     }
 
     fn swap_child_positions(
@@ -277,7 +277,7 @@ mod tests {
             id: TaskId::new(),
             title: "Title".to_owned(),
             description: None,
-            parent_ids: Vec::new(),
+            parent_id: None,
             type_key: type_key.to_owned(),
             status,
             // `bala-store` never persists `progress` (`task_from_row`
@@ -418,12 +418,12 @@ mod tests {
     }
 
     #[test]
-    fn list_parent_edges_for_task_with_no_parents_returns_empty() {
+    fn get_parent_edge_for_task_with_no_parent_returns_none() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let edges = store
-            .transaction(|tx| tx.list_parent_edges(TaskId::new()))
+        let edge = store
+            .transaction(|tx| tx.get_parent_edge(TaskId::new()))
             .unwrap();
-        assert_eq!(edges, []);
+        assert_eq!(edge, None);
     }
 
     // Unlike the `InMemoryStore` equivalent, these edge tests insert real
@@ -434,7 +434,7 @@ mod tests {
     // succeeding the way the in-memory fake's `HashMap` does.
 
     #[test]
-    fn replace_parent_edges_then_list_parent_edges_returns_it() {
+    fn set_parent_edge_then_get_parent_edge_returns_it() {
         let store = SqliteStore::open_in_memory().unwrap();
         let parent = sample_task("task", TaskStatus::Incomplete);
         let child = sample_task("task", TaskStatus::Incomplete);
@@ -443,14 +443,61 @@ mod tests {
             .transaction(|tx| {
                 tx.put_task(&parent)?;
                 tx.put_task(&child)?;
-                tx.replace_parent_edges(child.id, &Parents::Under(vec![parent.id]), Placement::End)
+                tx.set_parent_edge(child.id, Some(parent.id), Placement::End)
             })
             .unwrap();
 
-        let edges = store
-            .transaction(|tx| tx.list_parent_edges(child.id))
+        let edge = store
+            .transaction(|tx| tx.get_parent_edge(child.id))
             .unwrap();
-        assert_eq!(edges, vec![parent.id]);
+        assert_eq!(edge, Some(parent.id));
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn set_parent_edge_should_replace_the_previous_parent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let v = put_tasks(&store, 6);
+        let (p, q, a, child, b, c) = (v[0], v[1], v[2], v[3], v[4], v[5]);
+        store
+            .transaction(|tx| {
+                append(tx, a, Some(p), Placement::End);
+                append(tx, child, Some(p), Placement::End);
+                append(tx, b, Some(p), Placement::End);
+                append(tx, c, Some(q), Placement::End);
+                Ok(())
+            })
+            .unwrap();
+
+        store
+            .transaction(|tx| tx.set_parent_edge(child, Some(q), Placement::End))
+            .unwrap();
+
+        // One edge, to the new parent: the old one is gone, the former
+        // siblings keep their order, and the child lands at the end.
+        let children = |parent| store.transaction(|tx| tx.list_child_edges(parent)).unwrap();
+        let parent_of = |id| store.transaction(|tx| tx.get_parent_edge(id)).unwrap();
+        assert_eq!(parent_of(child), Some(q));
+        assert_eq!(edge_count(&store, child), 1);
+        assert_eq!(children(Some(p)), [a, b]);
+        assert_eq!(children(Some(q)), [c, child]);
+
+        // Moving to the top level replaces the real edge with the NULL one,
+        // and moving back under a parent replaces the NULL one.
+        store
+            .transaction(|tx| tx.set_parent_edge(child, None, Placement::End))
+            .unwrap();
+        assert_eq!(parent_of(child), None);
+        assert_eq!(edge_count(&store, child), 1);
+        assert_eq!(children(Some(q)), [c]);
+        assert_eq!(children(None), [child]);
+        store
+            .transaction(|tx| tx.set_parent_edge(child, Some(p), Placement::After(a)))
+            .unwrap();
+        assert_eq!(parent_of(child), Some(p));
+        assert_eq!(edge_count(&store, child), 1);
+        assert_eq!(children(None), []);
+        assert_eq!(children(Some(p)), [a, child, b]);
     }
 
     fn put_tasks(store: &SqliteStore, n: usize) -> Vec<TaskId> {
@@ -461,6 +508,19 @@ mod tests {
             .transaction(|tx| tasks.iter().try_for_each(|t| tx.put_task(t)))
             .unwrap();
         tasks.iter().map(|t| t.id).collect()
+    }
+
+    /// How many `parent_edges` rows `child` has, NULL-parent or real.
+    fn edge_count(store: &SqliteStore, child: TaskId) -> i64 {
+        store
+            .conn
+            .borrow()
+            .query_row(
+                "SELECT COUNT(*) FROM parent_edges WHERE child_id = ?1",
+                [crate::convert::id_to_blob(child).as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn null_edge_count(store: &SqliteStore, child: TaskId) -> i64 {
@@ -482,45 +542,123 @@ mod tests {
         let (a, p) = (ids[0], ids[1]);
         for _ in 0..2 {
             store
-                .transaction(|tx| tx.replace_parent_edges(a, &Parents::TopLevel, Placement::End))
+                .transaction(|tx| tx.set_parent_edge(a, None, Placement::End))
                 .unwrap();
         }
         assert_eq!(null_edge_count(&store, a), 1);
-        assert_eq!(store.transaction(|tx| tx.list_parent_edges(a)).unwrap(), []);
+        assert_eq!(store.transaction(|tx| tx.get_parent_edge(a)).unwrap(), None);
         assert_eq!(
             store.transaction(|tx| tx.list_child_edges(None)).unwrap(),
             vec![a]
         );
         // Under a real parent: NULL edge gone; back to top level: one again.
         store
-            .transaction(|tx| tx.replace_parent_edges(a, &Parents::Under(vec![p]), Placement::End))
+            .transaction(|tx| tx.set_parent_edge(a, Some(p), Placement::End))
             .unwrap();
         assert_eq!(null_edge_count(&store, a), 0);
         store
-            .transaction(|tx| tx.replace_parent_edges(a, &Parents::TopLevel, Placement::End))
+            .transaction(|tx| tx.set_parent_edge(a, None, Placement::End))
             .unwrap();
         assert_eq!(null_edge_count(&store, a), 1);
     }
 
+    /// Inserts a `parent_edges` row with raw SQL, bypassing the trait.
+    fn insert_raw_edge(
+        store: &SqliteStore,
+        parent: Option<TaskId>,
+        child: TaskId,
+    ) -> rusqlite::Result<usize> {
+        let parent_blob = parent.map(crate::convert::id_to_blob);
+        store.conn.borrow().execute(
+            "INSERT INTO parent_edges (parent_id, child_id, position) VALUES (?1, ?2, 99)",
+            rusqlite::params![
+                parent_blob.as_ref().map(<[u8; 16]>::as_slice),
+                crate::convert::id_to_blob(child).as_slice()
+            ],
+        )
+    }
+
     #[test]
-    fn replace_parent_edges_should_reject_second_null_edge() {
+    fn parent_edges_should_reject_a_second_edge_for_a_child() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let a = put_tasks(&store, 1)[0];
+        let ids = put_tasks(&store, 4);
+        let (p, q, nested, top) = (ids[0], ids[1], ids[2], ids[3]);
         store
-            .transaction(|tx| tx.replace_parent_edges(a, &Parents::TopLevel, Placement::End))
+            .transaction(|tx| {
+                tx.set_parent_edge(nested, Some(p), Placement::End)?;
+                tx.set_parent_edge(top, None, Placement::End)
+            })
             .unwrap();
-        // A raw second NULL edge (unreachable through the trait) must be
-        // rejected by the partial unique index.
-        let err = store
-            .conn
-            .borrow()
-            .execute(
-                "INSERT INTO parent_edges (parent_id, child_id, position) VALUES (NULL, ?1, 99)",
-                [crate::convert::id_to_blob(a).as_slice()],
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("UNIQUE"), "{err}");
-        assert_eq!(null_edge_count(&store, a), 1);
+
+        // A second row for a child that already has one (unreachable
+        // through the trait) is rejected by the unique index on `child_id`,
+        // whatever parent either row names.
+        for (child, second_parent) in [
+            (nested, Some(q)),
+            (nested, Some(p)),
+            (nested, None),
+            (top, Some(p)),
+            (top, None),
+        ] {
+            let err = insert_raw_edge(&store, second_parent, child).unwrap_err();
+            assert_eq!(
+                err.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::ConstraintViolation),
+                "second parent {second_parent:?}: {err}"
+            );
+            assert!(err.to_string().contains("UNIQUE"), "{err}");
+            assert_eq!(edge_count(&store, child), 1);
+        }
+        let parent_of = |id| store.transaction(|tx| tx.get_parent_edge(id)).unwrap();
+        assert_eq!(parent_of(nested), Some(p));
+        assert_eq!(parent_of(top), None);
+    }
+
+    #[test]
+    fn every_task_should_have_exactly_one_parent_edge_row() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ids = put_tasks(&store, 4);
+        let (p, q, top, moved) = (ids[0], ids[1], ids[2], ids[3]);
+        // Created at the top level or under a parent, then moved to another
+        // parent, to the top level and back, and to the parent it already
+        // has.
+        let steps = [
+            (p, None),
+            (q, None),
+            (top, None),
+            (moved, Some(p)),
+            (moved, Some(q)),
+            (moved, None),
+            (moved, None),
+            (moved, Some(p)),
+            (moved, Some(p)),
+            (top, Some(q)),
+            (top, Some(q)),
+        ];
+        store
+            .transaction(|tx| {
+                steps.iter().try_for_each(|&(child, parent)| {
+                    tx.set_parent_edge(child, parent, Placement::End)
+                })
+            })
+            .unwrap();
+
+        let conn = store.conn.borrow();
+        let mut stmt = conn
+            .prepare("SELECT child_id, COUNT(*) FROM parent_edges GROUP BY child_id")
+            .unwrap();
+        let mut counts: Vec<(Vec<u8>, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        counts.sort();
+        let mut expected: Vec<(Vec<u8>, i64)> = ids
+            .iter()
+            .map(|&id| (crate::convert::id_to_blob(id).to_vec(), 1))
+            .collect();
+        expected.sort();
+        assert_eq!(counts, expected);
     }
 
     #[test]
@@ -531,9 +669,9 @@ mod tests {
         let order = [ids[2], ids[0], ids[1]];
         store
             .transaction(|tx| {
-                order.iter().try_for_each(|&id| {
-                    tx.replace_parent_edges(id, &Parents::TopLevel, Placement::End)
-                })
+                order
+                    .iter()
+                    .try_for_each(|&id| tx.set_parent_edge(id, None, Placement::End))
             })
             .unwrap();
         assert_eq!(
@@ -543,101 +681,14 @@ mod tests {
     }
 
     #[test]
-    fn replace_parent_edges_should_replace_whole_set_atomically() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        let a = sample_task("task", TaskStatus::Incomplete);
-        let b = sample_task("task", TaskStatus::Incomplete);
-        let c = sample_task("task", TaskStatus::Incomplete);
-        let child = sample_task("task", TaskStatus::Incomplete);
-        store
-            .transaction(|tx| {
-                for t in [&a, &b, &c, &child] {
-                    tx.put_task(t)?;
-                }
-                tx.replace_parent_edges(child.id, &Parents::Under(vec![a.id, b.id]), Placement::End)
-            })
-            .unwrap();
-
-        store
-            .transaction(|tx| {
-                tx.replace_parent_edges(child.id, &Parents::Under(vec![c.id]), Placement::End)
-            })
-            .unwrap();
-
-        let edges = store
-            .transaction(|tx| tx.list_parent_edges(child.id))
-            .unwrap();
-        assert_eq!(edges, vec![c.id]);
-        assert_eq!(
-            store
-                .transaction(|tx| tx.list_child_edges(Some(a.id)))
-                .unwrap(),
-            []
-        );
-
-        store
-            .transaction(|tx| tx.replace_parent_edges(child.id, &Parents::TopLevel, Placement::End))
-            .unwrap();
-        let edges = store
-            .transaction(|tx| tx.list_parent_edges(child.id))
-            .unwrap();
-        assert_eq!(edges, []);
-    }
-
-    #[test]
-    fn replace_parent_edges_should_keep_edges_it_was_asked_to_keep() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        let a = sample_task("task", TaskStatus::Incomplete);
-        let b = sample_task("task", TaskStatus::Incomplete);
-        let c = sample_task("task", TaskStatus::Incomplete);
-        let child = sample_task("task", TaskStatus::Incomplete);
-        store
-            .transaction(|tx| {
-                for t in [&a, &b, &c, &child] {
-                    tx.put_task(t)?;
-                }
-                tx.replace_parent_edges(child.id, &Parents::Under(vec![a.id, b.id]), Placement::End)
-            })
-            .unwrap();
-
-        store
-            .transaction(|tx| {
-                tx.replace_parent_edges(
-                    child.id,
-                    &Parents::Under(vec![b.id, c.id, b.id]),
-                    Placement::End,
-                )
-            })
-            .unwrap();
-
-        let mut edges = store
-            .transaction(|tx| tx.list_parent_edges(child.id))
-            .unwrap();
-        edges.sort_by_key(|&id| Uuid::from(id));
-        let mut expected = vec![b.id, c.id];
-        expected.sort_by_key(|&id| Uuid::from(id));
-        assert_eq!(edges, expected);
-        assert_eq!(
-            store
-                .transaction(|tx| tx.list_child_edges(Some(b.id)))
-                .unwrap(),
-            vec![child.id]
-        );
-    }
-
-    #[test]
-    fn replace_parent_edges_referencing_nonexistent_task_fails_foreign_key_check() {
+    fn set_parent_edge_referencing_nonexistent_task_fails_foreign_key_check() {
         // Confirms `PRAGMA foreign_keys = ON` is actually enabled per
         // connection (LLD-2 §Testing Strategy's foreign-key smoke test) —
         // a common rusqlite footgun is setting it once but not on every
         // new connection.
         let store = SqliteStore::open_in_memory().unwrap();
         let result = store.transaction(|tx| {
-            tx.replace_parent_edges(
-                TaskId::new(),
-                &Parents::Under(vec![TaskId::new()]),
-                Placement::End,
-            )
+            tx.set_parent_edge(TaskId::new(), Some(TaskId::new()), Placement::End)
         });
         assert!(result.is_err());
     }
@@ -975,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn list_child_edges_then_replace_parent_edges_reflects_removal() {
+    fn list_child_edges_then_set_parent_edge_reflects_removal() {
         let store = SqliteStore::open_in_memory().unwrap();
         let parent = sample_task("task", TaskStatus::Incomplete);
         let child = sample_task("task", TaskStatus::Incomplete);
@@ -984,7 +1035,7 @@ mod tests {
             .transaction(|tx| {
                 tx.put_task(&parent)?;
                 tx.put_task(&child)?;
-                tx.replace_parent_edges(child.id, &Parents::Under(vec![parent.id]), Placement::End)
+                tx.set_parent_edge(child.id, Some(parent.id), Placement::End)
             })
             .unwrap();
 
@@ -994,7 +1045,7 @@ mod tests {
         assert_eq!(children, vec![child.id]);
 
         store
-            .transaction(|tx| tx.replace_parent_edges(child.id, &Parents::TopLevel, Placement::End))
+            .transaction(|tx| tx.set_parent_edge(child.id, None, Placement::End))
             .unwrap();
 
         let children = store
@@ -1007,7 +1058,7 @@ mod tests {
     fn put_task_should_fail_when_assignee_id_references_nonexistent_user() {
         // Confirms the FK `tasks.assignee_id BLOB REFERENCES users(id)`
         // (`migrations/V1__init.sql`) is actually enforced,
-        // mirroring `replace_parent_edges_referencing_nonexistent_task_fails_foreign_key_check`'s
+        // mirroring `set_parent_edge_referencing_nonexistent_task_fails_foreign_key_check`'s
         // reasoning: `PRAGMA foreign_keys = ON` is set on every connection
         // (LLD-2 §Schema), so a task naming a user id that was never
         // `put_user`'d fails the foreign-key constraint.
@@ -1019,22 +1070,23 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn append(tx: &mut dyn StoreTx, child: TaskId, parents: &Parents, at: Placement) {
-        tx.replace_parent_edges(child, parents, at).unwrap();
+    fn append(tx: &mut dyn StoreTx, child: TaskId, parent: Option<TaskId>, at: Placement) {
+        tx.set_parent_edge(child, parent, at).unwrap();
     }
 
     #[test]
     #[allow(clippy::many_single_char_names)]
-    fn replace_parent_edges_should_keep_position_of_retained_parents() {
+    fn set_parent_edge_should_keep_position_when_parent_is_unchanged() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let v = put_tasks(&store, 5);
-        let (p, q, y, child, z) = (v[0], v[1], v[2], v[3], v[4]);
+        let v = put_tasks(&store, 4);
+        let (p, y, child, z) = (v[0], v[1], v[2], v[3]);
         store
             .transaction(|tx| {
-                append(tx, y, &Parents::Under(vec![p]), Placement::End);
-                append(tx, child, &Parents::Under(vec![p]), Placement::End);
-                append(tx, z, &Parents::Under(vec![p]), Placement::End);
-                append(tx, child, &Parents::Under(vec![p, q]), Placement::After(z));
+                append(tx, y, Some(p), Placement::End);
+                append(tx, child, Some(p), Placement::End);
+                append(tx, z, Some(p), Placement::End);
+                append(tx, child, Some(p), Placement::After(z));
+                append(tx, child, Some(p), Placement::End);
                 Ok(())
             })
             .unwrap();
@@ -1042,28 +1094,24 @@ mod tests {
         let under_p = store
             .transaction(|tx| tx.list_child_edges(Some(p)))
             .unwrap();
-        let under_q = store
-            .transaction(|tx| tx.list_child_edges(Some(q)))
-            .unwrap();
 
         assert_eq!(under_p, [y, child, z]);
-        assert_eq!(under_q, [child]);
     }
 
     #[test]
     #[allow(clippy::many_single_char_names)]
-    fn replace_parent_edges_should_place_after_given_sibling() {
+    fn set_parent_edge_should_place_after_given_sibling() {
         let store = SqliteStore::open_in_memory().unwrap();
         let v = put_tasks(&store, 7);
         let (p, q, a, b, c, child, other) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
         store
             .transaction(|tx| {
-                append(tx, a, &Parents::Under(vec![p]), Placement::End);
-                append(tx, b, &Parents::Under(vec![p]), Placement::End);
-                append(tx, c, &Parents::Under(vec![q]), Placement::End);
-                append(tx, child, &Parents::Under(vec![p, q]), Placement::After(a));
+                append(tx, a, Some(p), Placement::End);
+                append(tx, b, Some(p), Placement::End);
+                append(tx, c, Some(q), Placement::End);
+                append(tx, child, Some(p), Placement::After(a));
                 // Sibling not under the parent: falls back to End.
-                append(tx, other, &Parents::Under(vec![p]), Placement::After(c));
+                append(tx, other, Some(p), Placement::After(c));
                 Ok(())
             })
             .unwrap();
@@ -1071,24 +1119,20 @@ mod tests {
         let under_p = store
             .transaction(|tx| tx.list_child_edges(Some(p)))
             .unwrap();
-        let under_q = store
-            .transaction(|tx| tx.list_child_edges(Some(q)))
-            .unwrap();
 
         assert_eq!(under_p, [a, child, b, other]);
-        assert_eq!(under_q, [c, child]);
     }
 
     #[test]
-    fn replace_parent_edges_should_place_top_level_after_given_root() {
+    fn set_parent_edge_should_place_top_level_after_given_root() {
         let store = SqliteStore::open_in_memory().unwrap();
         let v = put_tasks(&store, 3);
         let (a, b, child) = (v[0], v[1], v[2]);
         store
             .transaction(|tx| {
-                append(tx, a, &Parents::TopLevel, Placement::End);
-                append(tx, b, &Parents::TopLevel, Placement::End);
-                append(tx, child, &Parents::TopLevel, Placement::After(a));
+                append(tx, a, None, Placement::End);
+                append(tx, b, None, Placement::End);
+                append(tx, child, None, Placement::After(a));
                 Ok(())
             })
             .unwrap();
@@ -1106,10 +1150,10 @@ mod tests {
         let (p, a, b, r) = (v[0], v[1], v[2], v[3]);
         store
             .transaction(|tx| {
-                append(tx, p, &Parents::TopLevel, Placement::End);
-                append(tx, a, &Parents::Under(vec![p]), Placement::End);
-                append(tx, b, &Parents::Under(vec![p]), Placement::End);
-                append(tx, r, &Parents::TopLevel, Placement::End);
+                append(tx, p, None, Placement::End);
+                append(tx, a, Some(p), Placement::End);
+                append(tx, b, Some(p), Placement::End);
+                append(tx, r, None, Placement::End);
                 Ok(())
             })
             .unwrap();
@@ -1128,15 +1172,15 @@ mod tests {
 
     #[test]
     #[allow(clippy::many_single_char_names)]
-    fn swap_child_positions_should_swap_only_the_given_parent() {
+    fn swap_child_positions_should_swap_the_two_children() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let v = put_tasks(&store, 5);
-        let (p, q, a, b, c) = (v[0], v[1], v[2], v[3], v[4]);
+        let v = put_tasks(&store, 4);
+        let (p, a, b, c) = (v[0], v[1], v[2], v[3]);
         store
             .transaction(|tx| {
-                append(tx, a, &Parents::Under(vec![p, q]), Placement::End);
-                append(tx, b, &Parents::Under(vec![p, q]), Placement::End);
-                append(tx, c, &Parents::Under(vec![p]), Placement::End);
+                append(tx, a, Some(p), Placement::End);
+                append(tx, b, Some(p), Placement::End);
+                append(tx, c, Some(p), Placement::End);
                 tx.swap_child_positions(Some(p), a, c)
             })
             .unwrap();
@@ -1144,12 +1188,8 @@ mod tests {
         let under_p = store
             .transaction(|tx| tx.list_child_edges(Some(p)))
             .unwrap();
-        let under_q = store
-            .transaction(|tx| tx.list_child_edges(Some(q)))
-            .unwrap();
 
         assert_eq!(under_p, [c, b, a]);
-        assert_eq!(under_q, [a, b]);
     }
 
     #[test]
@@ -1159,7 +1199,7 @@ mod tests {
         let (p, a, b) = (v[0], v[1], v[2]);
         store
             .transaction(|tx| {
-                append(tx, a, &Parents::Under(vec![p]), Placement::End);
+                append(tx, a, Some(p), Placement::End);
                 tx.swap_child_positions(Some(p), a, b)
             })
             .unwrap();

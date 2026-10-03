@@ -274,7 +274,7 @@ impl App {
     /// always survives those two rebuilds. `CollapseAll`, however, can
     /// collapse an *ancestor* of the focused row too, hiding the focused
     /// row itself — in that case `select_id_or_nearest_visible_ancestor`
-    /// walks up `parent_ids` to reselect the nearest still-visible ancestor
+    /// walks up `parent_id` to reselect the nearest still-visible ancestor
     /// instead of leaving `self.selected` as a stale index into the old
     /// (differently-shaped) `rows`.
     fn rebuild_rows(&mut self) {
@@ -292,7 +292,7 @@ impl App {
     }
 
     /// Selects the row for `id` if it's present in `self.rows`; otherwise
-    /// walks up `id`'s `parent_ids` (in `self.tasks`) looking for the
+    /// walks up `id`'s `parent_id` (in `self.tasks`) looking for the
     /// nearest ancestor that IS present, and selects that instead — an
     /// ancestor only disappears from `rows` by being collapsed, and a
     /// collapsed task's own row is always still rendered, so this walk
@@ -309,7 +309,7 @@ impl App {
             let Some(task) = self.tasks.iter().find(|task| task.id == id) else {
                 break;
             };
-            let Some(&parent_id) = task.parent_ids.first() else {
+            let Some(parent_id) = task.parent_id else {
                 break;
             };
             id = parent_id;
@@ -348,9 +348,9 @@ pub fn handle_key<S: Store>(app: &mut App, core: &mut Core<S>, key: KeyEvent) ->
 /// `StartEditDescription` enter `Mode::Insert` prefilled with the selected
 /// task's current title/description (empty string when there's no
 /// description). `StartReparent` enters `Mode::Insert` scoped to
-/// `EditableField::Parents`, prefilled with the selected task's current
-/// parent ids (fetched fresh via `Core::get_task`), and `SubmitInsert` for
-/// that field calls `Core::set_parents`. `StartSetType` enters `Mode::Insert`
+/// `EditableField::Parent`, prefilled with the selected task's current
+/// parent id (fetched fresh via `Core::get_task`), and `SubmitInsert` for
+/// that field calls `Core::set_parent`. `StartSetType` enters `Mode::Insert`
 /// scoped to `EditableField::TypeKey`, prefilled with the selected task's
 /// current `type_key` (fetched fresh via `Core::get_task`), and
 /// `SubmitInsert` for that field calls `Core::update_task` with a
@@ -527,31 +527,21 @@ pub fn apply_action<S: Store>(
 }
 
 /// Handles `Action::MoveTaskDown`/`MoveTaskUp`: swaps the focused task with
-/// its neighbor among the siblings of the parent it is *rendered under*
-/// (`row.parent_id`), via `Core::move_sibling`. The swap uses the full
-/// sibling order, so with a type filter active the neighbor may be hidden
-/// and a press can look like a no-op. On success the tree is refetched and
-/// selection stays on the moved task under the same parent (a task shown
-/// under several parents may have several rows). At either end of the
+/// its neighbor among its siblings, via `Core::move_sibling`. The swap uses
+/// the full sibling order, so with a type filter active the neighbor may be
+/// hidden and a press can look like a no-op. On success the tree is
+/// refetched and selection stays on the moved task. At either end of the
 /// sibling list nothing changes and no error is shown; Core errors are
 /// surfaced via `app.error`.
 fn move_focused_task<S: Store>(app: &mut App, core: &mut Core<S>, direction: bala_core::Direction) {
-    let Some(row) = app.selected_row() else {
+    let Some(id) = app.selected_row().map(|row| row.id) else {
         return;
     };
-    let (id, parent) = (row.id, row.parent_id);
-    match core.move_sibling(parent, id, direction) {
+    match core.move_sibling(id, direction) {
         Ok(false) => {}
         Ok(true) => {
             app.error = None;
             refresh_rows_from_tree(app, core, Some(id));
-            if let Some(pos) = app
-                .rows
-                .iter()
-                .position(|r| r.id == id && r.parent_id == parent)
-            {
-                app.selected = Some(pos);
-            }
         }
         Err(err) => app.error = Some(err.to_string()),
     }
@@ -565,52 +555,55 @@ enum Reparent {
 }
 
 /// Handles `Action::IndentTask`/`OutdentTask` via `Core::indent_task` /
-/// `Core::outdent_task`, using the focused row's rendered path
-/// (`parent_id`, `grandparent_id`). On indent the new parent (the previous
-/// live sibling, read from the pre-move sibling order) is expanded so the
-/// moved task stays visible. Selection follows the task to its row under
-/// the new parent. `Ok(false)` is a silent no-op; Core errors (e.g.
-/// circular hierarchy) are surfaced via `app.error`.
+/// `Core::outdent_task`, which read the task's parent themselves. A row
+/// rendered under a different parent than the task's own (its parent is
+/// hidden by the type filter, so it shows as a root) is left alone: nothing
+/// is written and no error is shown, because Core would move the task
+/// through levels the list does not display. On indent the new parent (the
+/// previous live sibling, read from the pre-move sibling order) is expanded
+/// so the moved task stays visible. Selection follows the task to its new
+/// row. `Ok(false)` is a silent no-op; Core errors are surfaced via
+/// `app.error`.
 fn reparent_focused_task<S: Store>(app: &mut App, core: &mut Core<S>, kind: Reparent) {
-    let Some(row) = app.selected_row() else {
+    let Some((id, rendered_parent)) = app.selected_row().map(|row| (row.id, row.parent_id)) else {
         return;
     };
-    let (id, parent, grandparent) = (row.id, row.parent_id, row.grandparent_id);
-    let (result, new_parent) = match kind {
+    let parent = app
+        .tasks
+        .iter()
+        .find(|task| task.id == id)
+        .and_then(|task| task.parent_id);
+    if rendered_parent != parent {
+        return;
+    }
+    let (result, expand) = match kind {
         Reparent::Indent => {
             // Re-read the order rather than trusting `app.sibling_order`,
-            // which paths like delete leave stale, so the row expanded and
-            // selected is the parent Core will actually pick.
+            // which paths like delete leave stale, so the row expanded is
+            // the parent Core will actually pick.
             if let Ok(order) = core.sibling_order() {
                 app.sibling_order = order;
             }
+            // The row is rendered under the task's own parent here, so the
+            // siblings Core indents among are that parent's children.
             let siblings = app.sibling_order.children_of(parent);
             let target = siblings
                 .iter()
                 .position(|&s| s == id)
                 .and_then(|i| i.checked_sub(1))
                 .map(|i| siblings[i]);
-            (core.indent_task(parent, id), target)
+            (core.indent_task(id), target)
         }
-        Reparent::Outdent => (core.outdent_task(parent, grandparent, id), grandparent),
+        Reparent::Outdent => (core.outdent_task(id), None),
     };
     match result {
         Ok(false) => {}
         Ok(true) => {
             app.error = None;
-            if matches!(kind, Reparent::Indent)
-                && let Some(target) = new_parent
-            {
+            if let Some(target) = expand {
                 app.collapsed.remove(&target);
             }
             refresh_rows_from_tree(app, core, Some(id));
-            if let Some(pos) = app
-                .rows
-                .iter()
-                .position(|r| r.id == id && r.parent_id == new_parent)
-            {
-                app.selected = Some(pos);
-            }
         }
         Err(err) => app.error = Some(err.to_string()),
     }
@@ -659,13 +652,10 @@ fn expand_all(app: &mut App) {
 
 /// Handles `Action::CollapseAll`: sets `app.collapsed` to every `TaskId` in
 /// `app.tasks` that has at least one child (i.e. is named in some other
-/// task's `parent_ids`), then rebuilds `app.rows`.
+/// task's `parent_id`), then rebuilds `app.rows`.
 fn collapse_all(app: &mut App) {
-    let parents_with_children: HashSet<TaskId> = app
-        .tasks
-        .iter()
-        .flat_map(|task| task.parent_ids.iter().copied())
-        .collect();
+    let parents_with_children: HashSet<TaskId> =
+        app.tasks.iter().filter_map(|task| task.parent_id).collect();
     app.collapsed = parents_with_children;
     app.rebuild_rows();
 }
@@ -739,11 +729,10 @@ fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
     }
 }
 
-/// Updates `app.rows`' `status` field for every task in `touched`, matched
-/// by id. A task with several parents is rendered once per parent path, so
-/// every rendered row of the task is patched, not just the first. Shared by
+/// Updates the `status` of each task in `touched` on its row in `app.rows`,
+/// matched by id (a task has one row, or none while hidden). Shared by
 /// [`handle_toggle_complete`] and [`confirm_yes`]'s `CompleteCascade` arm so
-/// both "refresh every row a `Core` call actually touched" call sites use the
+/// both "refresh the rows a `Core` call actually touched" call sites use the
 /// same lookup-by-id loop.
 ///
 /// Also updates the matching entries in `app.tasks`, not just `app.rows`:
@@ -755,7 +744,7 @@ fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
 /// collapsed parent.
 fn refresh_row_statuses(app: &mut App, touched: &[bala_core::Task]) {
     for task in touched {
-        for row in app.rows.iter_mut().filter(|row| row.id == task.id) {
+        if let Some(row) = app.rows.iter_mut().find(|row| row.id == task.id) {
             row.status = task.status;
         }
         if let Some(cached) = app.tasks.iter_mut().find(|cached| cached.id == task.id) {
@@ -815,9 +804,8 @@ fn start_insert_new_subtask(app: &mut App) {
 }
 
 /// Handles `Action::StartReparent`: enters `Mode::Insert` scoped to the
-/// selected task, prefilled with its current parent ids as a
-/// comma-separated list of UUIDs (empty string when it's already
-/// top-level). No-op when there's no selection, or when a fresh
+/// selected task, prefilled with its current parent id (empty string when
+/// it's already top-level). No-op when there's no selection, or when a fresh
 /// `Core::get_task` fetch for the selected id comes back `Ok(None)` (the
 /// task vanished out from under the list — nothing sensible to prefill, so
 /// we leave `app` in `Mode::Normal` rather than entering Insert with stale
@@ -838,14 +826,12 @@ fn start_reparent<S: Store>(app: &mut App, core: &Core<S>) {
     };
 
     let buffer = task
-        .parent_ids
-        .iter()
-        .map(|parent_id| uuid::Uuid::from(*parent_id).to_string())
-        .collect::<Vec<_>>()
-        .join(",");
+        .parent_id
+        .map(|parent_id| uuid::Uuid::from(parent_id).to_string())
+        .unwrap_or_default();
 
     app.mode = Mode::Insert {
-        field: EditableField::Parents(id),
+        field: EditableField::Parent(id),
         buffer,
     };
     app.error = None;
@@ -1008,18 +994,15 @@ fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
 /// `DeleteMode::PromoteChildren`) and `ConfirmDelete(mode)` on a
 /// `PendingAction::Delete` or `PendingAction::DeleteWithChildren`.
 ///
-/// With `DeleteMode::Subtree`, every descendant that has no other live
-/// parent is deleted too (a child shared with another parent just loses its
-/// edge to the deleted one and survives). With `DeleteMode::PromoteChildren`
-/// only `id` is deleted and its children are reparented to `id`'s own
-/// parents, or made top-level if it had none.
+/// With `DeleteMode::Subtree`, every descendant of `id` is deleted too.
+/// With `DeleteMode::PromoteChildren` only `id` is deleted and its children
+/// are reparented to `id`'s own parent, or made top-level if it had none.
 ///
 /// On success, `app.rows` is rebuilt from a fresh tree via
-/// `refresh_rows_from_tree` rather than patched: in a multi-parent tree a
-/// shared child is rendered under several parents, promoted children move
-/// to a new position, and a surviving parent's `has_children` flag and
-/// rolled-up progress can change, so only a full re-render gets every row
-/// right. `app.error` is cleared before that refresh, so an error the
+/// `refresh_rows_from_tree` rather than patched: promoted children move to
+/// a new position and depth, and a surviving parent's `has_children` flag
+/// and rolled-up progress can change, so only a full re-render gets the
+/// affected rows right. `app.error` is cleared before that refresh, so an error the
 /// refresh itself sets (e.g. the follow-up `get_tree` failing after the
 /// delete committed) is preserved; in that case the cached rows are stale,
 /// so the tasks in `DeleteOutcome::deleted` are dropped from them rather
@@ -1120,18 +1103,20 @@ fn submit_insert<S: Store>(app: &mut App, core: &mut Core<S>) {
         EditableField::NewSubtaskTitle(parent_id) => {
             submit_new_subtask(app, core, parent_id, buffer.clone());
         }
-        EditableField::Parents(id) => submit_reparent(app, core, id, &buffer.clone()),
+        EditableField::Parent(id) => submit_reparent(app, core, id, &buffer.clone()),
         EditableField::TypeKey(id) => submit_set_type(app, core, id, &buffer.clone()),
     }
 }
 
-/// `EditableField::Parents(id)`: parses `buffer` as a comma-separated list
-/// of UUIDs (an empty/whitespace-only buffer means "no parents", i.e.
-/// promote `id` to top-level) and calls `Core::set_parents`. On success,
+/// `EditableField::Parent(id)`: parses `buffer` as a single parent UUID (an
+/// empty/whitespace-only buffer means "no parent", i.e. promote `id` to
+/// top-level) and calls `Core::set_parent` with it. On success,
 /// refreshes `app.rows` from the full tree via `refresh_rows_from_tree` so
 /// `id` reappears at its new nested (or top-level) position, and returns to
-/// `Mode::Normal`. On a parse failure (an entry that isn't a valid UUID) or
-/// a `CoreError` from `set_parents` (e.g. `CircularHierarchy`), sets
+/// `Mode::Normal`. On more than one id (entries separated by commas or
+/// whitespace — a task has at most one parent), a parse failure (an entry
+/// that isn't a valid UUID) or a `CoreError` from `set_parent` (e.g.
+/// `CircularHierarchy`), sets
 /// `app.error` and leaves `app.mode` untouched so the buffer survives for
 /// correction — matching `submit_new_title`'s/`submit_new_subtask`'s
 /// existing "failure leaves mode untouched" convention. Any error
@@ -1139,22 +1124,25 @@ fn submit_insert<S: Store>(app: &mut App, core: &mut Core<S>) {
 /// not immediately cleared — the reparent already committed, so the user
 /// still needs to see that the displayed rows may now be stale.
 fn submit_reparent<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buffer: &str) {
-    let trimmed = buffer.trim();
-    let parse_result: Result<Vec<TaskId>, uuid::Error> = if trimmed.is_empty() {
-        Ok(Vec::new())
-    } else {
-        trimmed
-            .split(',')
-            .map(|entry| entry.trim().parse::<uuid::Uuid>().map(TaskId::from))
-            .collect()
+    let mut entries = buffer
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|entry| !entry.is_empty());
+    let new_parent = match (entries.next(), entries.next()) {
+        (None, _) => None,
+        (Some(_), Some(_)) => {
+            app.error = Some("a task can have only one parent".to_string());
+            return;
+        }
+        (Some(entry), None) => {
+            let Ok(parent_id) = entry.parse::<uuid::Uuid>() else {
+                app.error = Some("invalid parent task id".to_string());
+                return;
+            };
+            Some(TaskId::from(parent_id))
+        }
     };
 
-    let Ok(new_parents) = parse_result else {
-        app.error = Some("invalid task id in parent list".to_string());
-        return;
-    };
-
-    match core.set_parents(id, new_parents) {
+    match core.set_parent(id, new_parent) {
         Ok(_) => {
             app.error = None;
             refresh_rows_from_tree(app, core, Some(id));
@@ -1248,7 +1236,7 @@ fn refresh_rows_from_tree<S: Store>(app: &mut App, core: &mut Core<S>, select_id
 }
 
 /// `EditableField::NewSubtaskTitle(parent_id)`: calls `Core::create_task`
-/// with `parent_ids: vec![parent_id]`. On success, refreshes `app.rows` from
+/// with `parent_id: Some(parent_id)`. On success, refreshes `app.rows` from
 /// the full tree (so the new subtask lands nested under its parent) and
 /// selects it — any error `refresh_rows_from_tree` itself sets is
 /// preserved, not immediately cleared, since the task already committed. If
@@ -1270,7 +1258,7 @@ fn submit_new_subtask<S: Store>(
     let new_task = NewTask {
         title: buffer,
         description: None,
-        parent_ids: vec![parent_id],
+        parent_id: Some(parent_id),
         type_key: None,
         start_date: None,
         due_date: None,
@@ -1324,7 +1312,7 @@ fn submit_new_title<S: Store>(app: &mut App, core: &mut Core<S>, buffer: String)
     let new_task = NewTask {
         title: buffer,
         description: None,
-        parent_ids: Vec::new(),
+        parent_id: None,
         type_key: None,
         start_date: None,
         due_date: None,
@@ -1344,9 +1332,8 @@ fn submit_new_title<S: Store>(app: &mut App, core: &mut Core<S>, buffer: String)
 }
 
 /// `EditableField::Title(id)`: calls `Core::update_task` with `buffer` as
-/// the new title. On success refreshes the displayed title of every
-/// rendered row of the task (a multi-parent task has one row per parent
-/// path) and the cached task; on failure (e.g. an empty title) sets
+/// the new title. On success refreshes the displayed title on the task's
+/// row and on the cached task; on failure (e.g. an empty title) sets
 /// `app.error`.
 fn submit_edit_title<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buffer: String) {
     let patch = TaskPatch {
@@ -1356,7 +1343,7 @@ fn submit_edit_title<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, bu
     match core.update_task(id, patch) {
         Ok(tasks) => {
             if let Some(updated) = tasks.iter().find(|task| task.id == id) {
-                for row in app.rows.iter_mut().filter(|row| row.id == id) {
+                if let Some(row) = app.rows.iter_mut().find(|row| row.id == id) {
                     row.title.clone_from(&updated.title);
                 }
                 if let Some(cached) = app.tasks.iter_mut().find(|cached| cached.id == id) {
@@ -1425,7 +1412,6 @@ mod tests {
             collapsed: false,
             direct_summary: None,
             parent_id: None,
-            grandparent_id: None,
         }
     }
 
@@ -1754,7 +1740,7 @@ mod tests {
             .create_task(bala_core::NewTask {
                 title: "Old title".to_string(),
                 description: None,
-                parent_ids: Vec::new(),
+                parent_id: None,
                 type_key: None,
                 start_date: None,
                 due_date: None,
@@ -1780,48 +1766,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_action_submit_insert_edit_title_should_update_every_row_of_multi_parent_task() {
-        let mut core = core();
-        let a = core.create_task(minimal_new_task("A")).expect("create");
-        let b = core.create_task(minimal_new_task("B")).expect("create");
-        let c = child_of(&mut core, "C", a.id);
-        core.set_parents(c.id, vec![a.id, b.id])
-            .expect("set_parents should succeed");
-        let mut app = app_from_core(&mut core);
-        select_under(&mut app, c.id, Some(b.id));
-        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
-        let _ = apply_action(&mut app, &mut core, Action::StartEditTitle);
-        assert_eq!(
-            app.mode(),
-            &Mode::Insert {
-                field: EditableField::Title(c.id),
-                buffer: "C".to_string(),
-            },
-            "editing from the second copy should target C's title"
-        );
-        let _ = apply_action(&mut app, &mut core, Action::Backspace);
-        for ch in "Renamed".chars() {
-            let _ = apply_action(&mut app, &mut core, Action::InsertChar(ch));
-        }
-
-        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
-
-        assert_eq!(app.mode(), &Mode::Normal);
-        assert_eq!(app.error(), None);
-        let titles: Vec<&str> = app
-            .rows()
-            .iter()
-            .filter(|row| row.id == c.id)
-            .map(|row| row.title.as_str())
-            .collect();
-        assert_eq!(
-            titles,
-            vec!["Renamed", "Renamed"],
-            "every rendered copy of C should show the new title"
-        );
-    }
-
-    #[test]
     fn apply_action_submit_insert_edit_title_with_empty_buffer_should_show_inline_error_and_stay_in_insert_mode()
      {
         let mut core = core();
@@ -1829,7 +1773,7 @@ mod tests {
             .create_task(bala_core::NewTask {
                 title: "Old title".to_string(),
                 description: None,
-                parent_ids: Vec::new(),
+                parent_id: None,
                 type_key: None,
                 start_date: None,
                 due_date: None,
@@ -1865,7 +1809,7 @@ mod tests {
             .create_task(bala_core::NewTask {
                 title: "Task".to_string(),
                 description: None,
-                parent_ids: Vec::new(),
+                parent_id: None,
                 type_key: None,
                 start_date: None,
                 due_date: None,
@@ -1903,7 +1847,7 @@ mod tests {
             .create_task(bala_core::NewTask {
                 title: "Old title".to_string(),
                 description: None,
-                parent_ids: Vec::new(),
+                parent_id: None,
                 type_key: None,
                 start_date: None,
                 due_date: None,
@@ -2054,7 +1998,7 @@ mod tests {
             .create_task(bala_core::NewTask {
                 title: "Write docs".to_string(),
                 description: None,
-                parent_ids: Vec::new(),
+                parent_id: None,
                 type_key: None,
                 start_date: None,
                 due_date: None,
@@ -2075,35 +2019,6 @@ mod tests {
             .get_tree(bala_core::TreeFilter::default())
             .expect("get_tree should succeed");
         assert!(!tasks.iter().any(|task| task.id == id));
-    }
-
-    #[test]
-    fn apply_action_confirm_delete_subtree_should_keep_row_of_child_with_another_parent() {
-        let mut core = core();
-        let a = core.create_task(minimal_new_task("A")).expect("create");
-        let b = core.create_task(minimal_new_task("B")).expect("create");
-        let c = child_of(&mut core, "C", a.id);
-        core.set_parents(c.id, vec![a.id, b.id])
-            .expect("set_parents should succeed");
-        let mut app = app_from_core(&mut core);
-        app.select_by_id(Some(a.id));
-        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
-        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
-
-        let _ = apply_action(
-            &mut app,
-            &mut core,
-            Action::ConfirmDelete(DeleteMode::Subtree),
-        );
-
-        assert_eq!(app.error(), None);
-        assert_eq!(titles(&app), vec!["B", "C"]);
-        let c_row = &app.rows()[1];
-        assert_eq!(c_row.id, c.id);
-        assert_eq!(c_row.depth, 1);
-        assert_eq!(c_row.parent_id, Some(b.id));
-        let selected = app.selected.expect("a row should stay selected");
-        assert!(selected < app.rows().len());
     }
 
     #[test]
@@ -2162,7 +2077,7 @@ mod tests {
         let b = core.create_task(minimal_new_task("B")).expect("create");
         let c = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![a.id, b.id],
+                parent_id: Some(b.id),
                 ..minimal_new_task("C")
             })
             .expect("create");
@@ -2206,7 +2121,7 @@ mod tests {
             .create_task(bala_core::NewTask {
                 title: "Write docs".to_string(),
                 description: None,
-                parent_ids: Vec::new(),
+                parent_id: None,
                 type_key: None,
                 start_date: None,
                 due_date: None,
@@ -2320,7 +2235,7 @@ mod tests {
             .iter()
             .find(|task| task.id == k.id)
             .expect("a child the prompt never mentioned should survive");
-        assert_eq!(kid.parent_ids, []);
+        assert_eq!(kid.parent_id, None);
         assert!(app.rows().iter().any(|row| row.id == k.id));
     }
 
@@ -2358,7 +2273,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_delete_subtree_should_delete_parent_and_sole_parent_children() {
+    fn confirm_delete_subtree_should_delete_parent_and_its_children() {
         let mut core = core();
         let p = core.create_task(minimal_new_task("P")).expect("create");
         let k = child_of(&mut core, "K", p.id);
@@ -2382,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_delete_promote_should_reparent_children_to_deleted_tasks_parents_and_show_them() {
+    fn confirm_delete_promote_should_reparent_children_to_deleted_tasks_parent_and_show_them() {
         let mut core = core();
         let g = core.create_task(minimal_new_task("G")).expect("create");
         let p = child_of(&mut core, "P", g.id);
@@ -2403,7 +2318,7 @@ mod tests {
         assert!(!tasks.iter().any(|t| t.id == p.id));
         for kid in [k1.id, k2.id] {
             let task = tasks.iter().find(|t| t.id == kid).expect("child survives");
-            assert_eq!(task.parent_ids, vec![g.id]);
+            assert_eq!(task.parent_id, Some(g.id));
         }
         assert!(!app.rows().iter().any(|r| r.id == p.id));
         for kid in [k1.id, k2.id] {
@@ -2437,7 +2352,7 @@ mod tests {
         assert_eq!(app.error(), None);
         let tasks = live_tasks(&core);
         let task = tasks.iter().find(|t| t.id == k.id).expect("child survives");
-        assert_eq!(task.parent_ids, []);
+        assert_eq!(task.parent_id, None);
         assert_eq!(titles(&app), vec!["K"]);
         let row = &app.rows()[0];
         assert_eq!(row.id, k.id);
@@ -2463,7 +2378,7 @@ mod tests {
             let tasks = live_tasks(&core);
             assert!(tasks.iter().any(|t| t.id == p.id), "{code:?}");
             let kid = tasks.iter().find(|t| t.id == k.id).expect("child survives");
-            assert_eq!(kid.parent_ids, vec![p.id], "{code:?}");
+            assert_eq!(kid.parent_id, Some(p.id), "{code:?}");
         }
     }
 
@@ -2565,58 +2480,9 @@ mod tests {
         assert_eq!(app.error(), None);
     }
 
-    #[test]
-    fn move_key_should_act_on_the_path_the_row_is_rendered_under() {
-        let mut core = core();
-        let p1 = core.create_task(minimal_new_task("P1")).expect("create");
-        let p2 = core.create_task(minimal_new_task("P2")).expect("create");
-        let x = core
-            .create_task(bala_core::NewTask {
-                parent_ids: vec![p1.id, p2.id],
-                ..minimal_new_task("X")
-            })
-            .expect("create");
-        let _y1 = core
-            .create_task(bala_core::NewTask {
-                parent_ids: vec![p1.id],
-                ..minimal_new_task("Y1")
-            })
-            .expect("create");
-        let _y2 = core
-            .create_task(bala_core::NewTask {
-                parent_ids: vec![p2.id],
-                ..minimal_new_task("Y2")
-            })
-            .expect("create");
-        let mut app = app_from_core(&mut core);
-        // Select X under P2 (the second rendered X row).
-        let idx = app
-            .rows()
-            .iter()
-            .position(|r| r.id == x.id && r.parent_id == Some(p2.id))
-            .expect("X under P2");
-        app.selected = Some(idx);
-
-        let _ = handle_key(&mut app, &mut core, shift_key('J'));
-
-        assert_eq!(titles(&app), vec!["P1", "X", "Y1", "P2", "Y2", "X"]);
-        let sel = app.selected_row().expect("selection");
-        assert_eq!((sel.id, sel.parent_id), (x.id, Some(p2.id)));
-    }
-
-    /// Selects the row for `id` rendered under `parent`.
-    fn select_under(app: &mut App, id: TaskId, parent: Option<TaskId>) {
-        let idx = app
-            .rows()
-            .iter()
-            .position(|r| r.id == id && r.parent_id == parent)
-            .expect("row under parent");
-        app.selected = Some(idx);
-    }
-
     fn child_of(core: &mut Core<InMemoryStore>, title: &str, parent: TaskId) -> bala_core::Task {
         core.create_task(bala_core::NewTask {
-            parent_ids: vec![parent],
+            parent_id: Some(parent),
             ..minimal_new_task(title)
         })
         .expect("create")
@@ -2674,6 +2540,96 @@ mod tests {
         assert_eq!((sel.id, sel.parent_id), (c.id, Some(a.id)));
     }
 
+    /// Builds a `goal` with two `task` children, A then B, and an `App`
+    /// filtered to `task` rows: the goal is hidden, so A and B render as
+    /// roots though their parent is still the goal. Returns
+    /// `(app, goal, a, b)`.
+    fn app_with_parent_hidden_by_the_filter(
+        core: &mut Core<InMemoryStore>,
+    ) -> (App, TaskId, TaskId, TaskId) {
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .expect("upsert_task_type should succeed");
+        let goal = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal")
+            })
+            .expect("create");
+        let a = child_of(core, "A", goal.id);
+        let b = child_of(core, "B", goal.id);
+        let mut app = App::new(vec![])
+            .with_type_filter_state(Some("task".to_string()), vec!["task".to_string()]);
+        super::refresh_rows_from_tree(&mut app, core, None);
+        (app, goal.id, a.id, b.id)
+    }
+
+    #[test]
+    fn outdent_key_should_be_a_no_op_when_the_parent_is_hidden_by_the_filter() {
+        let mut core = core();
+        let (mut app, goal, a, b) = app_with_parent_hidden_by_the_filter(&mut core);
+        app.select_by_id(Some(b));
+        let rendered = app.selected_row().expect("selection");
+        assert_eq!((rendered.parent_id, rendered.depth), (None, 0));
+        let before = core.get_task(b).expect("get_task").expect("task exists");
+
+        let _ = handle_key(&mut app, &mut core, shift_key('H'));
+
+        let after = core.get_task(b).expect("get_task").expect("task exists");
+        assert_eq!(after.parent_id, Some(goal));
+        assert_eq!(after, before);
+        let order = core.sibling_order().expect("sibling_order");
+        assert_eq!(order.children_of(Some(goal)), [a, b]);
+        assert_eq!(order.children_of(None), [goal]);
+        assert_eq!(titles(&app), vec!["A", "B"]);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(b));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn indent_key_should_be_a_no_op_when_the_parent_is_hidden_by_the_filter() {
+        let mut core = core();
+        let (mut app, goal, a, b) = app_with_parent_hidden_by_the_filter(&mut core);
+        app.collapsed.insert(a);
+        app.select_by_id(Some(b));
+        let before = core.get_task(b).expect("get_task").expect("task exists");
+
+        let _ = handle_key(&mut app, &mut core, shift_key('L'));
+
+        let after = core.get_task(b).expect("get_task").expect("task exists");
+        assert_eq!(after.parent_id, Some(goal));
+        assert_eq!(after, before);
+        let order = core.sibling_order().expect("sibling_order");
+        assert_eq!(order.children_of(Some(goal)), [a, b]);
+        assert_eq!(order.children_of(Some(a)), []);
+        assert!(app.collapsed.contains(&a));
+        assert_eq!(titles(&app), vec!["A", "B"]);
+        let sel = app.selected_row().expect("selection");
+        assert_eq!((sel.id, sel.parent_id, sel.depth), (b, None, 0));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn move_indent_and_outdent_keys_should_show_an_inline_error_when_core_rejects_them() {
+        for key in ['J', 'K', 'L', 'H'] {
+            let mut core = core();
+            let a = core.create_task(minimal_new_task("A")).expect("create");
+            let mut app = app_from_core(&mut core);
+            app.select_by_id(Some(a.id));
+            // The task is deleted behind the list's back, so its row is stale.
+            core.delete_task(a.id, DeleteMode::Subtree).expect("delete");
+
+            let _ = handle_key(&mut app, &mut core, shift_key(key));
+
+            assert!(app.error().is_some(), "key {key} should surface NotFound");
+            assert_eq!(titles(&app), vec!["A"]);
+        }
+    }
+
     #[test]
     fn indent_key_should_be_noop_on_first_sibling() {
         let mut core = core();
@@ -2707,6 +2663,24 @@ mod tests {
     }
 
     #[test]
+    fn outdent_key_should_move_a_nested_task_to_its_grandparent() {
+        let mut core = core();
+        let g = core.create_task(minimal_new_task("G")).expect("create");
+        let p = child_of(&mut core, "P", g.id);
+        let x = child_of(&mut core, "X", p.id);
+        let _q = child_of(&mut core, "Q", g.id);
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(x.id));
+
+        let _ = handle_key(&mut app, &mut core, shift_key('H'));
+
+        assert_eq!(titles(&app), vec!["G", "P", "X", "Q"]);
+        let sel = app.selected_row().expect("selection");
+        assert_eq!((sel.id, sel.parent_id, sel.depth), (x.id, Some(g.id), 1));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
     fn outdent_key_should_be_noop_at_top_level() {
         let mut core = core();
         let a = core.create_task(minimal_new_task("A")).expect("create");
@@ -2718,27 +2692,6 @@ mod tests {
         assert_eq!(titles(&app), vec!["A"]);
         assert_eq!(app.selected_row().map(|r| r.id), Some(a.id));
         assert_eq!(app.error(), None);
-    }
-
-    #[test]
-    fn indent_key_should_show_inline_error_on_circular_hierarchy() {
-        let mut core = core();
-        let p = core.create_task(minimal_new_task("P")).expect("create");
-        let y2 = child_of(&mut core, "Y2", p.id);
-        let x2 = child_of(&mut core, "X2", p.id);
-        // Y2 (previous sibling of X2) is also a child of X2.
-        core.set_parents(y2.id, vec![p.id, x2.id])
-            .expect("set_parents");
-        let mut app = app_from_core(&mut core);
-        select_under(&mut app, x2.id, Some(p.id));
-
-        let _ = handle_key(&mut app, &mut core, shift_key('L'));
-
-        assert!(app.error().is_some());
-        assert_eq!(
-            app.selected_row().map(|r| (r.id, r.parent_id)),
-            Some((x2.id, Some(p.id)))
-        );
     }
 
     fn row_for(task: &bala_core::Task) -> TaskRow {
@@ -2753,7 +2706,6 @@ mod tests {
             collapsed: false,
             direct_summary: None,
             parent_id: None,
-            grandparent_id: None,
         }
     }
 
@@ -2761,7 +2713,7 @@ mod tests {
         bala_core::NewTask {
             title: title.to_string(),
             description: None,
-            parent_ids: Vec::new(),
+            parent_id: None,
             type_key: None,
             start_date: None,
             due_date: None,
@@ -2803,63 +2755,6 @@ mod tests {
         assert_eq!(app.error(), None);
     }
 
-    /// Returns the status of every rendered row of `id`, asserting the task
-    /// is rendered exactly twice (once per parent).
-    fn statuses_of_two_copies(app: &App, id: TaskId) -> Vec<TaskStatus> {
-        let statuses: Vec<TaskStatus> = app
-            .rows()
-            .iter()
-            .filter(|row| row.id == id)
-            .map(|row| row.status)
-            .collect();
-        assert_eq!(statuses.len(), 2, "task should be rendered once per parent");
-        statuses
-    }
-
-    #[test]
-    fn apply_action_toggle_complete_should_update_every_row_of_multi_parent_task() {
-        let mut core = core();
-        let a = core.create_task(minimal_new_task("A")).expect("create");
-        let b = core.create_task(minimal_new_task("B")).expect("create");
-        let c = child_of(&mut core, "C", a.id);
-        core.set_parents(c.id, vec![a.id, b.id])
-            .expect("set_parents should succeed");
-        let mut app = app_from_core(&mut core);
-        select_under(&mut app, c.id, Some(b.id));
-
-        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
-
-        assert_eq!(app.mode(), &Mode::Normal);
-        assert_eq!(app.error(), None);
-        assert_eq!(
-            statuses_of_two_copies(&app, c.id),
-            vec![TaskStatus::Complete, TaskStatus::Complete]
-        );
-    }
-
-    #[test]
-    fn apply_action_toggle_complete_should_reopen_every_row_of_multi_parent_task() {
-        let mut core = core();
-        let a = core.create_task(minimal_new_task("A")).expect("create");
-        let b = core.create_task(minimal_new_task("B")).expect("create");
-        let c = child_of(&mut core, "C", a.id);
-        core.set_parents(c.id, vec![a.id, b.id])
-            .expect("set_parents should succeed");
-        core.complete_task(c.id, false)
-            .expect("complete_task should succeed");
-        let mut app = app_from_core(&mut core);
-        select_under(&mut app, c.id, Some(b.id));
-
-        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
-
-        assert_eq!(app.mode(), &Mode::Normal);
-        assert_eq!(app.error(), None);
-        assert_eq!(
-            statuses_of_two_copies(&app, c.id),
-            vec![TaskStatus::Incomplete, TaskStatus::Incomplete]
-        );
-    }
-
     #[test]
     fn apply_action_toggle_complete_with_incomplete_children_should_enter_confirm_mode_with_cascade_prompt()
      {
@@ -2869,7 +2764,7 @@ mod tests {
             .expect("create_task should succeed");
         let _child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -2899,13 +2794,13 @@ mod tests {
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
         let _grandchild = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![child.id],
+                parent_id: Some(child.id),
                 ..minimal_new_task("Grandchild")
             })
             .expect("create_task should succeed");
@@ -2937,7 +2832,7 @@ mod tests {
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -2955,33 +2850,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_action_confirm_yes_complete_cascade_should_update_every_row_of_multi_parent_descendant()
-     {
-        let mut core = core();
-        let p = core.create_task(minimal_new_task("P")).expect("create");
-        let b = core.create_task(minimal_new_task("B")).expect("create");
-        let c = child_of(&mut core, "C", p.id);
-        core.set_parents(c.id, vec![p.id, b.id])
-            .expect("set_parents should succeed");
-        let mut app = app_from_core(&mut core);
-        assert_eq!(titles(&app), vec!["P", "C", "B", "C"]);
-        select_under(&mut app, p.id, None);
-        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
-        assert!(matches!(app.mode(), Mode::Confirm { .. }));
-
-        let _ = apply_action(&mut app, &mut core, Action::ConfirmYes);
-
-        assert_eq!(app.mode(), &Mode::Normal);
-        assert_eq!(app.error(), None);
-        let p_row = app.rows().iter().find(|row| row.id == p.id).expect("P row");
-        assert_eq!(p_row.status, TaskStatus::Complete);
-        assert_eq!(
-            statuses_of_two_copies(&app, c.id),
-            vec![TaskStatus::Complete, TaskStatus::Complete]
-        );
-    }
-
-    #[test]
     fn apply_action_confirm_no_should_leave_task_incomplete_after_cascade_prompt() {
         let mut core = core();
         let parent = core
@@ -2989,7 +2857,7 @@ mod tests {
             .expect("create_task should succeed");
         let _child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -3096,7 +2964,7 @@ mod tests {
             .iter()
             .find(|task| task.title == "Subtask")
             .expect("subtask should have been created");
-        assert_eq!(child.parent_ids, vec![parent.id]);
+        assert_eq!(child.parent_id, Some(parent.id));
     }
 
     #[test]
@@ -3250,14 +3118,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_action_start_reparent_should_prefill_buffer_with_current_parent_ids() {
+    fn start_reparent_should_prefill_the_current_parent_id() {
         let mut core = core();
         let parent = core
             .create_task(minimal_new_task("Parent"))
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -3267,18 +3135,77 @@ mod tests {
 
         match app.mode() {
             Mode::Insert {
-                field: EditableField::Parents(id),
+                field: EditableField::Parent(id),
                 buffer,
             } => {
                 assert_eq!(*id, child.id);
                 assert_eq!(*buffer, uuid::Uuid::from(parent.id).to_string());
             }
-            other => panic!("expected Mode::Insert with Parents field, got {other:?}"),
+            other => panic!("expected Mode::Insert with Parent field, got {other:?}"),
         }
     }
 
     #[test]
-    fn apply_action_submit_reparent_should_call_set_parents_and_move_task_in_tree() {
+    fn start_reparent_should_prefill_an_empty_buffer_for_a_top_level_task() {
+        let mut core = core();
+        let task = core
+            .create_task(minimal_new_task("Top level"))
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&task)]);
+
+        let _ = apply_action(&mut app, &mut core, Action::StartReparent);
+
+        assert_eq!(
+            app.mode(),
+            &Mode::Insert {
+                field: EditableField::Parent(task.id),
+                buffer: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn submit_reparent_should_reject_more_than_one_id_and_stay_in_insert() {
+        let mut core = core();
+        let task_a = core
+            .create_task(minimal_new_task("A"))
+            .expect("create_task should succeed");
+        let task_b = core
+            .create_task(minimal_new_task("B"))
+            .expect("create_task should succeed");
+        let task_c = core
+            .create_task(minimal_new_task("C"))
+            .expect("create_task should succeed");
+        let mut app = App::new(vec![row_for(&task_a), row_for(&task_b), row_for(&task_c)]);
+        let _ = apply_action(&mut app, &mut core, Action::StartReparent);
+        let typed = format!(
+            "{},{}",
+            uuid::Uuid::from(task_b.id),
+            uuid::Uuid::from(task_c.id)
+        );
+        for c in typed.chars() {
+            let _ = apply_action(&mut app, &mut core, Action::InsertChar(c));
+        }
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert_eq!(
+            app.mode(),
+            &Mode::Insert {
+                field: EditableField::Parent(task_a.id),
+                buffer: typed,
+            }
+        );
+        assert_eq!(app.error(), Some("a task can have only one parent"));
+        let unchanged = core
+            .get_task(task_a.id)
+            .expect("get_task should succeed")
+            .expect("task A should exist");
+        assert_eq!(unchanged.parent_id, None);
+    }
+
+    #[test]
+    fn apply_action_submit_reparent_should_call_set_parent_and_move_task_in_tree() {
         let mut core = core();
         let task_a = core
             .create_task(minimal_new_task("A"))
@@ -3310,14 +3237,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_action_submit_reparent_with_empty_buffer_should_promote_to_top_level() {
+    fn submit_reparent_with_empty_line_should_promote_to_top_level() {
         let mut core = core();
         let parent = core
             .create_task(minimal_new_task("Parent"))
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -3332,14 +3259,14 @@ mod tests {
         let _ = apply_action(&mut app, &mut core, Action::StartReparent);
         let buffer_len = match app.mode() {
             Mode::Insert {
-                field: EditableField::Parents(id),
+                field: EditableField::Parent(id),
                 buffer,
             } => {
                 assert_eq!(*id, child.id);
                 assert_ne!(buffer, "");
                 buffer.chars().count()
             }
-            other => panic!("expected Mode::Insert with Parents field, got {other:?}"),
+            other => panic!("expected Mode::Insert with Parent field, got {other:?}"),
         };
         for _ in 0..buffer_len {
             let _ = apply_action(&mut app, &mut core, Action::Backspace);
@@ -3353,7 +3280,7 @@ mod tests {
             .get_task(child.id)
             .expect("get_task should succeed")
             .expect("child should exist");
-        assert_eq!(updated_child.parent_ids, []);
+        assert_eq!(updated_child.parent_id, None);
         let child_row = app
             .rows()
             .iter()
@@ -3380,7 +3307,7 @@ mod tests {
         assert!(matches!(
             app.mode(),
             Mode::Insert {
-                field: EditableField::Parents(id),
+                field: EditableField::Parent(id),
                 ..
             } if *id == task_a.id
         ));
@@ -3404,7 +3331,7 @@ mod tests {
         assert!(matches!(
             app.mode(),
             Mode::Insert {
-                field: EditableField::Parents(id),
+                field: EditableField::Parent(id),
                 ..
             } if *id == task_a.id
         ));
@@ -3517,7 +3444,7 @@ mod tests {
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -3568,7 +3495,7 @@ mod tests {
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -3597,7 +3524,7 @@ mod tests {
             .expect("create_task should succeed");
         let _child_a = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent_a.id],
+                parent_id: Some(parent_a.id),
                 ..minimal_new_task("Child A")
             })
             .expect("create_task should succeed");
@@ -3606,7 +3533,7 @@ mod tests {
             .expect("create_task should succeed");
         let _child_b = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent_b.id],
+                parent_id: Some(parent_b.id),
                 ..minimal_new_task("Child B")
             })
             .expect("create_task should succeed");
@@ -3642,7 +3569,7 @@ mod tests {
             .expect("create_task should succeed");
         let _child_a = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent_a.id],
+                parent_id: Some(parent_a.id),
                 ..minimal_new_task("Child A")
             })
             .expect("create_task should succeed");
@@ -3651,7 +3578,7 @@ mod tests {
             .expect("create_task should succeed");
         let _child_b = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent_b.id],
+                parent_id: Some(parent_b.id),
                 ..minimal_new_task("Child B")
             })
             .expect("create_task should succeed");
@@ -3701,7 +3628,7 @@ mod tests {
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -3736,7 +3663,7 @@ mod tests {
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -3793,7 +3720,7 @@ mod tests {
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -3833,7 +3760,7 @@ mod tests {
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");
@@ -3892,13 +3819,13 @@ mod tests {
             .expect("create_task should succeed");
         let parent = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![root.id],
+                parent_id: Some(root.id),
                 ..minimal_new_task("Parent")
             })
             .expect("create_task should succeed");
         let child = core
             .create_task(bala_core::NewTask {
-                parent_ids: vec![parent.id],
+                parent_id: Some(parent.id),
                 ..minimal_new_task("Child")
             })
             .expect("create_task should succeed");

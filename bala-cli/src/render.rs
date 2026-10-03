@@ -6,7 +6,7 @@
 //! modules call it after fetching data through `Core`, which
 //! keeps this projection unit-testable without a terminal or a database.
 //!
-//! `subtree_ids`, `subtree_delete_ids` and `dependents_of` are pure scans over the same
+//! `subtree_ids` and `dependents_of` are pure scans over the same
 //! `Core::get_tree()` result, used by `bala task delete` to name the tasks
 //! that depend on what it deletes.
 
@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use bala_core::{SiblingOrder, Task, TaskId, TaskStatus, UserId};
 
 /// One row of the task list view: a task's display-ready fields, plus its
-/// nesting depth under whichever root it's being rendered under.
+/// nesting depth in the tree. Every task has exactly one row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRow {
     pub id: TaskId,
@@ -33,25 +33,23 @@ pub struct TaskRow {
     /// children only (not recursive descendants), present only when the row
     /// is both collapsed and has children; `None` otherwise.
     pub direct_summary: Option<(usize, usize)>,
-    /// The parent this row is rendered under (`None` for a root row).
+    /// The parent this row is rendered under (`None` for a root row). This
+    /// is the task's own parent unless that parent is absent from the input
+    /// (e.g. hidden by a type filter), in which case the row is a root.
     pub parent_id: Option<TaskId>,
-    /// `parent_id`'s own parent on the rendered path (`None` when the row is
-    /// a root or its parent is top-level).
-    pub grandparent_id: Option<TaskId>,
 }
 
 /// Projects every task in `tasks` into a display-ready `TaskRow`, nested
-/// under its parent(s).
+/// under its parent.
 ///
 /// Rows are produced by a pre-order depth-first walk starting from every
-/// "root" task, where a root is a task with no `parent_ids`, or whose
-/// listed parents are all absent from `tasks` (defensive against a partial
+/// "root" task, where a root is a task with no `parent_id`, or whose
+/// parent is absent from `tasks` (defensive against a partial
 /// input — see below). Roots are visited in `sibling_order.children_of(None)`
 /// order, and each task's children in `children_of(Some(parent))` order
-/// (input order is only the fallback for tasks it doesn't list). A task with more than one parent present in `tasks` is
-/// visited — and so emitted as a row — once per present parent, each time
-/// at the depth appropriate to that parent's subtree; the tree is always
-/// fully expanded (no collapse/expand yet).
+/// (input order is only the fallback for tasks it doesn't list). Each task
+/// is emitted as one row, at the depth of its place in its parent's
+/// subtree.
 ///
 /// `tasks` is expected to be a full `Core::get_tree()` result, which always
 /// includes every ancestor of any task it contains. A partial slice missing
@@ -79,8 +77,8 @@ pub fn task_rows(
 
     let mut children_by_parent: HashMap<TaskId, Vec<&Task>> = HashMap::new();
     for task in tasks {
-        for parent_id in &task.parent_ids {
-            children_by_parent.entry(*parent_id).or_default().push(task);
+        if let Some(parent_id) = task.parent_id {
+            children_by_parent.entry(parent_id).or_default().push(task);
         }
     }
 
@@ -93,11 +91,8 @@ pub fn task_rows(
     let root_position = positions(sibling_order.children_of(None));
 
     let is_root = |task: &Task| {
-        task.parent_ids.is_empty()
-            || task
-                .parent_ids
-                .iter()
-                .all(|parent_id| !known_ids.contains(parent_id))
+        task.parent_id
+            .is_none_or(|parent_id| !known_ids.contains(&parent_id))
     };
 
     // Descendants hidden by a collapsed ancestor are deliberately not
@@ -123,11 +118,11 @@ pub fn task_rows(
     }
 
     // Defensive fallback: if every task in `tasks` forms a cycle among
-    // themselves (each one's `parent_ids` names another task also present
+    // themselves (each one's `parent_id` names another task also present
     // in `tasks`), `is_root` is false for all of them and the loop above
     // renders nothing at all, silently disappearing every task rather than
     // just failing to indent it correctly. This should never arise through
-    // `Core::set_parents`'s invariant, but the same defensive posture this
+    // `Core::set_parent`'s invariant, but the same defensive posture this
     // function already takes for a missing parent (see `is_root`'s doc
     // comment) applies here too: any task not reached by a normal root's
     // walk is rendered as its own root instead of vanishing. `rendered_ids`
@@ -175,7 +170,7 @@ fn positions(ids: &[TaskId]) -> HashMap<TaskId, usize> {
 /// length `ancestors_on_path` should be truncated back to before visiting
 /// it, so backtracking to a sibling branch correctly forgets the ancestors
 /// only visible on the branch just finished — a cycle, which should never
-/// occur given `Core::set_parents`'s invariant but would otherwise walk
+/// occur given `Core::set_parent`'s invariant but would otherwise walk
 /// forever if that invariant were ever violated by a bug, is detected via
 /// `ancestors_on_path` and simply stops that path rather than looping.
 fn visit(
@@ -222,10 +217,6 @@ fn visit(
             collapsed: is_collapsed,
             direct_summary,
             parent_id: ancestors_on_path.last().copied(),
-            grandparent_id: ancestors_on_path
-                .len()
-                .checked_sub(2)
-                .map(|index| ancestors_on_path[index]),
         });
 
         if is_collapsed {
@@ -270,9 +261,8 @@ fn mark_hidden(
 }
 
 /// Returns `id` and the id of every task below it at any depth, each once,
-/// found through `tasks`' `parent_ids` (a `Core::get_tree` result).
+/// found through `tasks`' `parent_id` (a `Core::get_tree` result).
 ///
-/// A descendant reachable through more than one parent is listed once.
 /// Iterative, with a `visited` guard, matching `visit`'s convention:
 /// hierarchy depth is unbounded, and a cycle (which should never occur)
 /// can't loop forever.
@@ -280,8 +270,8 @@ fn mark_hidden(
 pub(crate) fn subtree_ids(id: TaskId, tasks: &[Task]) -> Vec<TaskId> {
     let mut children_by_parent: HashMap<TaskId, Vec<TaskId>> = HashMap::new();
     for task in tasks {
-        for parent in &task.parent_ids {
-            children_by_parent.entry(*parent).or_default().push(task.id);
+        if let Some(parent) = task.parent_id {
+            children_by_parent.entry(parent).or_default().push(task.id);
         }
     }
 
@@ -298,42 +288,6 @@ pub(crate) fn subtree_ids(id: TaskId, tasks: &[Task]) -> Vec<TaskId> {
         }
     }
     ids
-}
-
-/// Returns the ids a `DeleteMode::Subtree` delete of `id` tombstones, found
-/// through `tasks`' `parent_ids` (a `Core::get_tree` result): `id` itself,
-/// then every descendant all of whose parents are tombstoned too. A
-/// descendant still under a parent outside that set survives, and so does
-/// everything below it that the set doesn't otherwise reach.
-///
-/// Repeats a pass over `subtree_ids(id, tasks)` until nothing changes, so
-/// it never loops more times than that subtree has tasks.
-#[must_use]
-pub(crate) fn subtree_delete_ids(id: TaskId, tasks: &[Task]) -> Vec<TaskId> {
-    let parents_of: HashMap<TaskId, &[TaskId]> = tasks
-        .iter()
-        .map(|task| (task.id, task.parent_ids.as_slice()))
-        .collect();
-    let candidates = subtree_ids(id, tasks);
-
-    let mut deleted = HashSet::from([id]);
-    let mut ids = vec![id];
-    loop {
-        let before = ids.len();
-        for &candidate in &candidates {
-            let parents = parents_of.get(&candidate).copied().unwrap_or_default();
-            if !parents.is_empty()
-                && !deleted.contains(&candidate)
-                && parents.iter().all(|parent| deleted.contains(parent))
-            {
-                deleted.insert(candidate);
-                ids.push(candidate);
-            }
-        }
-        if ids.len() == before {
-            return ids;
-        }
-    }
 }
 
 /// Returns the tasks in `tasks` whose `depends_on` names any of `ids`,
@@ -361,12 +315,7 @@ pub(crate) fn dependents_of<'a>(ids: &[TaskId], tasks: &'a [Task]) -> Vec<&'a Ta
 pub(crate) fn order_of(tasks: &[Task]) -> SiblingOrder {
     let mut map: HashMap<Option<TaskId>, Vec<TaskId>> = HashMap::new();
     for task in tasks {
-        if task.parent_ids.is_empty() {
-            map.entry(None).or_default().push(task.id);
-        }
-        for parent in &task.parent_ids {
-            map.entry(Some(*parent)).or_default().push(task.id);
-        }
+        map.entry(task.parent_id).or_default().push(task.id);
     }
     SiblingOrder::from(map)
 }
@@ -379,13 +328,13 @@ mod tests {
 
     /// Minimal `Task` fixture: fills required fields with dummy values so
     /// each test only needs to override what it cares about.
-    fn task(id: TaskId, title: &str, parent_ids: Vec<TaskId>) -> Task {
+    fn task(id: TaskId, title: &str, parent_id: Option<TaskId>) -> Task {
         let now = Utc::now();
         Task {
             id,
             title: title.to_string(),
             description: None,
-            parent_ids,
+            parent_id,
             type_key: "task".to_string(),
             status: TaskStatus::Incomplete,
             progress: 0.0,
@@ -421,9 +370,9 @@ mod tests {
 
     #[test]
     fn task_rows_should_order_children_by_sibling_order() {
-        let p = task(TaskId::new(), "P", vec![]);
-        let a = task(TaskId::new(), "A", vec![p.id]);
-        let b = task(TaskId::new(), "B", vec![p.id]);
+        let p = task(TaskId::new(), "P", None);
+        let a = task(TaskId::new(), "A", Some(p.id));
+        let b = task(TaskId::new(), "B", Some(p.id));
         let tasks = vec![p.clone(), a.clone(), b.clone()];
         let o = order(&[(None, &[p.id]), (Some(p.id), &[b.id, a.id])]);
 
@@ -434,8 +383,8 @@ mod tests {
 
     #[test]
     fn task_rows_should_order_roots_by_none_key() {
-        let a = task(TaskId::new(), "A", vec![]);
-        let b = task(TaskId::new(), "B", vec![]);
+        let a = task(TaskId::new(), "A", None);
+        let b = task(TaskId::new(), "B", None);
         let tasks = vec![a.clone(), b.clone()];
         let o = order(&[(None, &[b.id, a.id])]);
 
@@ -445,47 +394,21 @@ mod tests {
     }
 
     #[test]
-    fn task_rows_should_render_shared_task_at_each_parents_position() {
-        let p1 = task(TaskId::new(), "P1", vec![]);
-        let p2 = task(TaskId::new(), "P2", vec![]);
-        let x = task(TaskId::new(), "X", vec![p1.id, p2.id]);
-        let y = task(TaskId::new(), "Y", vec![p1.id]);
-        let z = task(TaskId::new(), "Z", vec![p2.id]);
-        let tasks = vec![p1.clone(), p2.clone(), x.clone(), y.clone(), z.clone()];
-        let o = order(&[
-            (None, &[p1.id, p2.id]),
-            (Some(p1.id), &[x.id, y.id]),
-            (Some(p2.id), &[z.id, x.id]),
-        ]);
-
-        let ids: Vec<_> = rows_of(&tasks, &o).iter().map(|r| r.id).collect();
-
-        assert_eq!(ids, [p1.id, x.id, y.id, p2.id, z.id, x.id]);
-    }
-
-    #[test]
-    fn task_rows_should_expose_parent_and_grandparent_ids() {
-        let r = task(TaskId::new(), "R", vec![]);
-        let m = task(TaskId::new(), "M", vec![r.id]);
-        let l = task(TaskId::new(), "L", vec![m.id]);
+    fn task_rows_should_expose_parent_id() {
+        let r = task(TaskId::new(), "R", None);
+        let m = task(TaskId::new(), "M", Some(r.id));
+        let l = task(TaskId::new(), "L", Some(m.id));
         let tasks = vec![r.clone(), m.clone(), l.clone()];
 
         let rows = rows_of(&tasks, &order_of(&tasks));
 
-        assert_eq!((rows[0].parent_id, rows[0].grandparent_id), (None, None));
-        assert_eq!(
-            (rows[1].parent_id, rows[1].grandparent_id),
-            (Some(r.id), None)
-        );
-        assert_eq!(
-            (rows[2].parent_id, rows[2].grandparent_id),
-            (Some(m.id), Some(r.id))
-        );
+        let parents: Vec<_> = rows.iter().map(|row| row.parent_id).collect();
+        assert_eq!(parents, [None, Some(r.id), Some(m.id)]);
     }
 
     #[test]
     fn task_rows_should_set_depth_zero_for_top_level_tasks() {
-        let top_level = task(TaskId::new(), "Top level", vec![]);
+        let top_level = task(TaskId::new(), "Top level", None);
         let tasks = vec![top_level.clone()];
 
         let rows = task_rows(
@@ -504,8 +427,8 @@ mod tests {
 
     #[test]
     fn task_rows_should_nest_child_directly_after_its_parent_with_depth_one() {
-        let parent = task(TaskId::new(), "Parent", vec![]);
-        let child = task(TaskId::new(), "Child", vec![parent.id]);
+        let parent = task(TaskId::new(), "Parent", None);
+        let child = task(TaskId::new(), "Child", Some(parent.id));
         let tasks = vec![parent.clone(), child.clone()];
 
         let rows = task_rows(
@@ -525,9 +448,9 @@ mod tests {
 
     #[test]
     fn task_rows_should_nest_multiple_levels() {
-        let grandparent = task(TaskId::new(), "Grandparent", vec![]);
-        let parent = task(TaskId::new(), "Parent", vec![grandparent.id]);
-        let child = task(TaskId::new(), "Child", vec![parent.id]);
+        let grandparent = task(TaskId::new(), "Grandparent", None);
+        let parent = task(TaskId::new(), "Parent", Some(grandparent.id));
+        let child = task(TaskId::new(), "Child", Some(parent.id));
         let tasks = vec![grandparent.clone(), parent.clone(), child.clone()];
 
         let rows = task_rows(
@@ -556,11 +479,7 @@ mod tests {
         let mut parent_id = None;
         for i in 0..5000 {
             let id = TaskId::new();
-            tasks.push(task(
-                id,
-                &format!("Task {i}"),
-                parent_id.into_iter().collect(),
-            ));
+            tasks.push(task(id, &format!("Task {i}"), parent_id));
             parent_id = Some(id);
         }
 
@@ -579,43 +498,10 @@ mod tests {
     }
 
     #[test]
-    fn task_rows_should_list_a_multi_parent_task_once_under_each_parent() {
-        let parent_a = task(TaskId::new(), "Parent A", vec![]);
-        let parent_b = task(TaskId::new(), "Parent B", vec![]);
-        let child = task(
-            TaskId::new(),
-            "Shared child",
-            vec![parent_a.id, parent_b.id],
-        );
-        let tasks = vec![parent_a.clone(), parent_b.clone(), child.clone()];
-
-        let rows = task_rows(
-            &tasks,
-            &order_of(&tasks),
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-        );
-
-        // Roots visited in input order (Parent A, then Parent B); each
-        // root's subtree is fully walked (pre-order) before moving to the
-        // next root, so the shared child appears once under each parent.
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].id, parent_a.id);
-        assert_eq!(rows[0].depth, 0);
-        assert_eq!(rows[1].id, child.id);
-        assert_eq!(rows[1].depth, 1);
-        assert_eq!(rows[2].id, parent_b.id);
-        assert_eq!(rows[2].depth, 0);
-        assert_eq!(rows[3].id, child.id);
-        assert_eq!(rows[3].depth, 1);
-    }
-
-    #[test]
     fn task_rows_should_render_orphaned_child_as_root_when_its_parent_is_missing_from_input() {
         let parent_id = TaskId::new();
-        let child_a = task(TaskId::new(), "Child A", vec![parent_id]);
-        let child_b = task(TaskId::new(), "Child B", vec![parent_id]);
+        let child_a = task(TaskId::new(), "Child A", Some(parent_id));
+        let child_b = task(TaskId::new(), "Child B", Some(parent_id));
         let tasks = vec![child_a.clone(), child_b.clone()];
 
         let rows = task_rows(
@@ -635,16 +521,16 @@ mod tests {
 
     #[test]
     fn task_rows_should_render_every_task_once_when_all_tasks_form_a_pure_cycle() {
-        // Defensive regression: `Core::set_parents`'s invariant should make
+        // Defensive regression: `Core::set_parent`'s invariant should make
         // this unreachable through normal use, but `task_rows` shouldn't
         // silently drop every task if it ever is (see the fallback loop's
         // doc comment in `task_rows` itself). A 2-cycle (A's parent is B,
-        // B's parent is A) has no task whose `parent_ids` are empty or
+        // B's parent is A) has no task whose `parent_id` is `None` or
         // wholly absent from the input, so `is_root` is false for both.
         let id_a = TaskId::new();
         let id_b = TaskId::new();
-        let task_a = task(id_a, "A", vec![id_b]);
-        let task_b = task(id_b, "B", vec![id_a]);
+        let task_a = task(id_a, "A", Some(id_b));
+        let task_b = task(id_b, "B", Some(id_a));
         let tasks = vec![task_a, task_b];
 
         let rows = task_rows(
@@ -666,8 +552,48 @@ mod tests {
     }
 
     #[test]
+    fn task_rows_should_emit_each_task_exactly_once() {
+        let goal = task(TaskId::new(), "Goal", None);
+        let left = task(TaskId::new(), "Left", Some(goal.id));
+        let left_leaf = task(TaskId::new(), "Left leaf", Some(left.id));
+        let right = task(TaskId::new(), "Right", Some(goal.id));
+        let right_branch = task(TaskId::new(), "Right branch", Some(right.id));
+        let right_leaf_a = task(TaskId::new(), "Right leaf A", Some(right_branch.id));
+        let right_leaf_b = task(TaskId::new(), "Right leaf B", Some(right_branch.id));
+        let other_root = task(TaskId::new(), "Other root", None);
+        let other_child = task(TaskId::new(), "Other child", Some(other_root.id));
+        // Deliberately not in tree order, so the count can't pass by
+        // echoing the input.
+        let tasks = vec![
+            right_leaf_b,
+            other_child,
+            left,
+            goal,
+            right_branch,
+            other_root,
+            left_leaf,
+            right,
+            right_leaf_a,
+        ];
+
+        let rows = task_rows(
+            &tasks,
+            &order_of(&tasks),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(rows.len(), tasks.len(), "one row per task");
+        for task in &tasks {
+            let count = rows.iter().filter(|row| row.id == task.id).count();
+            assert_eq!(count, 1, "{} should have exactly one row", task.title);
+        }
+    }
+
+    #[test]
     fn task_rows_should_include_title_type_label_and_status() {
-        let mut input = task(TaskId::new(), "Ship the thing", vec![]);
+        let mut input = task(TaskId::new(), "Ship the thing", None);
         input.type_key = "initiative".to_string();
         input.status = TaskStatus::Complete;
         let type_labels: HashMap<String, String> =
@@ -693,7 +619,7 @@ mod tests {
     #[test]
     fn task_rows_should_show_assignee_name_when_assigned() {
         let user_id = UserId::new();
-        let mut input = task(TaskId::new(), "Assigned task", vec![]);
+        let mut input = task(TaskId::new(), "Assigned task", None);
         input.assignee_id = Some(user_id);
         let user_names: HashMap<UserId, String> = [(user_id, "Ada Lovelace".to_string())]
             .into_iter()
@@ -713,7 +639,7 @@ mod tests {
 
     #[test]
     fn task_rows_should_show_unassigned_when_no_assignee() {
-        let input = task(TaskId::new(), "Unassigned task", vec![]);
+        let input = task(TaskId::new(), "Unassigned task", None);
 
         let order = order_of(std::slice::from_ref(&input));
         let rows = task_rows(
@@ -729,8 +655,8 @@ mod tests {
 
     #[test]
     fn task_rows_should_mark_task_with_children_as_has_children() {
-        let parent = task(TaskId::new(), "Parent", vec![]);
-        let child = task(TaskId::new(), "Child", vec![parent.id]);
+        let parent = task(TaskId::new(), "Parent", None);
+        let child = task(TaskId::new(), "Child", Some(parent.id));
         let tasks = vec![parent.clone(), child.clone()];
 
         let rows = task_rows(
@@ -748,9 +674,9 @@ mod tests {
 
     #[test]
     fn task_rows_should_hide_descendants_of_a_collapsed_task() {
-        let parent = task(TaskId::new(), "Parent", vec![]);
-        let child = task(TaskId::new(), "Child", vec![parent.id]);
-        let grandchild = task(TaskId::new(), "Grandchild", vec![child.id]);
+        let parent = task(TaskId::new(), "Parent", None);
+        let child = task(TaskId::new(), "Child", Some(parent.id));
+        let grandchild = task(TaskId::new(), "Grandchild", Some(child.id));
         let tasks = vec![parent.clone(), child.clone(), grandchild.clone()];
         let collapsed: HashSet<TaskId> = [parent.id].into_iter().collect();
 
@@ -770,12 +696,12 @@ mod tests {
 
     #[test]
     fn task_rows_should_compute_direct_child_summary_for_collapsed_parent() {
-        let parent = task(TaskId::new(), "Parent", vec![]);
-        let mut child_a = task(TaskId::new(), "Child A", vec![parent.id]);
+        let parent = task(TaskId::new(), "Parent", None);
+        let mut child_a = task(TaskId::new(), "Child A", Some(parent.id));
         child_a.status = TaskStatus::Complete;
-        let mut child_b = task(TaskId::new(), "Child B", vec![parent.id]);
+        let mut child_b = task(TaskId::new(), "Child B", Some(parent.id));
         child_b.status = TaskStatus::Complete;
-        let child_c = task(TaskId::new(), "Child C", vec![parent.id]);
+        let child_c = task(TaskId::new(), "Child C", Some(parent.id));
         let tasks = vec![
             parent.clone(),
             child_a.clone(),
@@ -798,12 +724,12 @@ mod tests {
 
     #[test]
     fn task_rows_should_leave_expanded_parent_with_no_summary() {
-        let parent = task(TaskId::new(), "Parent", vec![]);
-        let mut child_a = task(TaskId::new(), "Child A", vec![parent.id]);
+        let parent = task(TaskId::new(), "Parent", None);
+        let mut child_a = task(TaskId::new(), "Child A", Some(parent.id));
         child_a.status = TaskStatus::Complete;
-        let mut child_b = task(TaskId::new(), "Child B", vec![parent.id]);
+        let mut child_b = task(TaskId::new(), "Child B", Some(parent.id));
         child_b.status = TaskStatus::Complete;
-        let child_c = task(TaskId::new(), "Child C", vec![parent.id]);
+        let child_c = task(TaskId::new(), "Child C", Some(parent.id));
         let tasks = vec![
             parent.clone(),
             child_a.clone(),
@@ -825,7 +751,7 @@ mod tests {
 
     #[test]
     fn task_rows_should_leave_leaf_task_with_no_summary() {
-        let leaf = task(TaskId::new(), "Leaf", vec![]);
+        let leaf = task(TaskId::new(), "Leaf", None);
         let collapsed: HashSet<TaskId> = [leaf.id].into_iter().collect();
 
         let rows = task_rows(
@@ -851,11 +777,7 @@ mod tests {
         let mut parent_id = None;
         for i in 0..5000 {
             let id = TaskId::new();
-            tasks.push(task(
-                id,
-                &format!("Task {i}"),
-                parent_id.into_iter().collect(),
-            ));
+            tasks.push(task(id, &format!("Task {i}"), parent_id));
             parent_id = Some(id);
         }
         let root_id = tasks[0].id;
@@ -885,11 +807,11 @@ mod tests {
         // complete" computations can't silently drift apart.
         use bala_core::{Core, InMemoryStore, NewTask, TreeFilter};
 
-        fn new_task(title: &str, parent_ids: Vec<TaskId>) -> NewTask {
+        fn new_task(title: &str, parent_id: Option<TaskId>) -> NewTask {
             NewTask {
                 title: title.to_owned(),
                 description: None,
-                parent_ids,
+                parent_id,
                 type_key: None,
                 start_date: None,
                 due_date: None,
@@ -898,14 +820,14 @@ mod tests {
         }
 
         let mut core = Core::new(InMemoryStore::default()).unwrap();
-        let parent = core.create_task(new_task("Parent", vec![])).unwrap();
+        let parent = core.create_task(new_task("Parent", None)).unwrap();
         let child_a = core
-            .create_task(new_task("Child A", vec![parent.id]))
+            .create_task(new_task("Child A", Some(parent.id)))
             .unwrap();
         core.complete_task(child_a.id, false).unwrap();
-        core.create_task(new_task("Child B", vec![parent.id]))
+        core.create_task(new_task("Child B", Some(parent.id)))
             .unwrap();
-        core.create_task(new_task("Child C", vec![parent.id]))
+        core.create_task(new_task("Child C", Some(parent.id)))
             .unwrap();
 
         let core_progress = core.get_task(parent.id).unwrap().unwrap().progress;
@@ -944,15 +866,15 @@ mod tests {
 
     #[test]
     fn dependents_of_should_return_tasks_depending_on_any_given_id() {
-        let a = task(TaskId::new(), "A", vec![]);
-        let b = task(TaskId::new(), "B", vec![]);
-        let mut on_a = task(TaskId::new(), "On A", vec![]);
+        let a = task(TaskId::new(), "A", None);
+        let b = task(TaskId::new(), "B", None);
+        let mut on_a = task(TaskId::new(), "On A", None);
         on_a.depends_on = vec![on(a.id)];
-        let mut on_both = task(TaskId::new(), "On both", vec![]);
+        let mut on_both = task(TaskId::new(), "On both", None);
         on_both.depends_on = vec![on(a.id), on(b.id)];
-        let mut on_b = task(TaskId::new(), "On B", vec![]);
+        let mut on_b = task(TaskId::new(), "On B", None);
         on_b.depends_on = vec![on(b.id)];
-        let unrelated = task(TaskId::new(), "Unrelated", vec![]);
+        let unrelated = task(TaskId::new(), "Unrelated", None);
         let tasks = vec![
             a.clone(),
             b.clone(),
@@ -972,10 +894,10 @@ mod tests {
 
     #[test]
     fn dependents_of_should_skip_tasks_inside_the_given_set() {
-        let a = task(TaskId::new(), "A", vec![]);
-        let mut inside = task(TaskId::new(), "Inside", vec![]);
+        let a = task(TaskId::new(), "A", None);
+        let mut inside = task(TaskId::new(), "Inside", None);
         inside.depends_on = vec![on(a.id)];
-        let mut outside = task(TaskId::new(), "Outside", vec![]);
+        let mut outside = task(TaskId::new(), "Outside", None);
         outside.depends_on = vec![on(a.id)];
         let tasks = vec![a.clone(), inside.clone(), outside.clone()];
 
@@ -989,17 +911,17 @@ mod tests {
 
     #[test]
     fn subtree_ids_should_collect_every_depth_once() {
-        let root = task(TaskId::new(), "Root", vec![]);
-        let left = task(TaskId::new(), "Left", vec![root.id]);
-        let right = task(TaskId::new(), "Right", vec![root.id]);
-        let shared = task(TaskId::new(), "Shared", vec![left.id, right.id]);
-        let grandchild = task(TaskId::new(), "Grandchild", vec![shared.id]);
-        let outside = task(TaskId::new(), "Outside", vec![]);
+        let root = task(TaskId::new(), "Root", None);
+        let left = task(TaskId::new(), "Left", Some(root.id));
+        let right = task(TaskId::new(), "Right", Some(root.id));
+        let nested = task(TaskId::new(), "Nested", Some(left.id));
+        let grandchild = task(TaskId::new(), "Grandchild", Some(nested.id));
+        let outside = task(TaskId::new(), "Outside", None);
         let tasks = vec![
             root.clone(),
             left.clone(),
             right.clone(),
-            shared.clone(),
+            nested.clone(),
             grandchild.clone(),
             outside,
         ];
@@ -1007,33 +929,9 @@ mod tests {
         let ids = subtree_ids(root.id, &tasks);
 
         assert_eq!(ids.len(), 5, "each task appears once: {ids:?}");
-        let expected: HashSet<_> = [root.id, left.id, right.id, shared.id, grandchild.id]
+        let expected: HashSet<_> = [root.id, left.id, right.id, nested.id, grandchild.id]
             .into_iter()
             .collect();
-        assert_eq!(ids.into_iter().collect::<HashSet<_>>(), expected);
-    }
-
-    #[test]
-    fn subtree_delete_ids_should_keep_descendant_with_a_parent_outside_the_subtree() {
-        let root = task(TaskId::new(), "Root", vec![]);
-        let other = task(TaskId::new(), "Other", vec![]);
-        let doomed = task(TaskId::new(), "Doomed", vec![root.id]);
-        let survivor = task(TaskId::new(), "Survivor", vec![root.id, other.id]);
-        let survivor_child = task(TaskId::new(), "Survivor child", vec![survivor.id]);
-        let shared = task(TaskId::new(), "Shared", vec![doomed.id, root.id]);
-        let tasks = vec![
-            root.clone(),
-            other,
-            doomed.clone(),
-            survivor,
-            survivor_child,
-            shared.clone(),
-        ];
-
-        let ids = subtree_delete_ids(root.id, &tasks);
-
-        let expected: HashSet<_> = [root.id, doomed.id, shared.id].into_iter().collect();
-        assert_eq!(ids.len(), expected.len(), "each task appears once: {ids:?}");
         assert_eq!(ids.into_iter().collect::<HashSet<_>>(), expected);
     }
 }

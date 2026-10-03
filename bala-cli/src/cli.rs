@@ -64,8 +64,8 @@ pub enum TaskCommands {
     Complete(CompleteArgs),
     /// Reopen a previously completed task.
     Reopen(ReopenArgs),
-    /// Reparent a task under a new set of parents (or none, to promote it
-    /// to top-level).
+    /// Move a task under a new parent (or none, to promote it to
+    /// top-level).
     Mv(MvArgs),
 }
 
@@ -77,11 +77,10 @@ pub struct AddArgs {
     #[arg(long)]
     pub description: Option<String>,
 
-    /// May be given multiple times to attach the new task under several
-    /// parents; repeating the same id attaches it under that parent only
-    /// once.
-    #[arg(long = "parent")]
-    pub parent: Vec<Uuid>,
+    /// Id of the task to nest the new task under. A task has at most one
+    /// parent, so giving the flag more than once is a usage error.
+    #[arg(long)]
+    pub parent: Option<Uuid>,
 
     #[arg(long)]
     pub start: Option<NaiveDate>,
@@ -93,9 +92,8 @@ pub struct AddArgs {
     #[arg(long)]
     pub assignee: Option<Uuid>,
 
-    /// Copy assignee/dates from the first `--parent` (only meaningful with
-    /// at least one `--parent`; clap enforces that via `requires =
-    /// "parent"`).
+    /// Copy assignee/dates from the `--parent` (only meaningful with
+    /// `--parent`; clap enforces that via `requires = "parent"`).
     #[arg(long, requires = "parent")]
     pub inherit: bool,
 
@@ -170,8 +168,8 @@ pub struct DeleteArgs {
     #[arg(long, conflicts_with = "promote_children")]
     pub cascade: bool,
 
-    /// Reattach the task's children to its own parents instead of deleting
-    /// them.
+    /// Move the task's children to its own parent (or to top level if it
+    /// has none) instead of deleting them.
     #[arg(long)]
     pub promote_children: bool,
 }
@@ -203,11 +201,11 @@ pub struct MvArgs {
     /// Id of the task to reparent.
     pub id: Uuid,
 
-    /// New parent ids, comma-separated. Omit (empty) to promote the task
-    /// to top-level. A repeated id attaches the task under that parent only
-    /// once.
-    #[arg(long, value_delimiter = ',')]
-    pub parents: Vec<Uuid>,
+    /// Id of the new parent. Omit to promote the task to top-level. A
+    /// task has at most one parent, so giving the flag more than once is
+    /// a usage error.
+    #[arg(long)]
+    pub parent: Option<Uuid>,
 }
 
 #[derive(Debug, Args)]
@@ -430,8 +428,8 @@ fn run_task_add(db_path: &Path, args: AddArgs) -> Result<(), CliError> {
     let mut due_date = args.due;
 
     if args.inherit
-        && let Some(&first_parent) = args.parent.first()
-        && let Some(parent) = core.get_task(TaskId::from(first_parent))?
+        && let Some(parent_id) = args.parent
+        && let Some(parent) = core.get_task(TaskId::from(parent_id))?
     {
         assignee_id = assignee_id.or(parent.assignee_id);
         start_date = start_date.or(parent.start_date);
@@ -441,7 +439,7 @@ fn run_task_add(db_path: &Path, args: AddArgs) -> Result<(), CliError> {
     let new_task = NewTask {
         title: args.title,
         description: args.description,
-        parent_ids: args.parent.into_iter().map(TaskId::from).collect(),
+        parent_id: args.parent.map(TaskId::from),
         type_key: args.type_key,
         start_date,
         due_date,
@@ -470,12 +468,12 @@ fn run_task_ls(db_path: &Path, args: &LsArgs) -> Result<(), CliError> {
 /// `restore`/`complete`/`reopen`:
 /// `"{indent}[{marker}] {id} {title}{assignee_suffix}"`, where `marker` is
 /// `x` for a completed task and a space otherwise, and `indent` nests one
-/// level under a task's first parent (if any) so a child visibly nests
+/// level under a task's parent (if any) so a child visibly nests
 /// under it — full recursive tree layout is the TUI's job later. Indent is
 /// derived from the task itself rather than taken as a parameter so every
 /// call site computes it the same way.
 fn format_task_line(task: &Task, names: &HashMap<UserId, String>) -> String {
-    let indent = if task.parent_ids.is_empty() { "" } else { "  " };
+    let indent = if task.parent_id.is_none() { "" } else { "  " };
     let assignee = task
         .assignee_id
         .and_then(|id| names.get(&id))
@@ -549,10 +547,9 @@ fn run_task_delete(db_path: &Path, args: &DeleteArgs) -> Result<(), CliError> {
 
 /// Prints to stderr the live tasks that depend on what deleting `target_id`
 /// under `mode` would delete, and that are not deleted themselves: under
-/// `DeleteMode::Subtree`, the task and every descendant left with no
-/// parent outside the deleted set (a descendant still under another parent
-/// survives); under `DeleteMode::PromoteChildren`, the task alone. Prints
-/// nothing when there are none.
+/// `DeleteMode::Subtree`, the task and every descendant; under
+/// `DeleteMode::PromoteChildren`, the task alone. Prints nothing when there
+/// are none.
 ///
 /// The set is computed client-side from a tree read separate from the
 /// delete, so a concurrent change between the two can make the warning
@@ -564,7 +561,7 @@ fn warn_about_dependents(
 ) -> Result<(), CliError> {
     let tasks = core.get_tree(TreeFilter::default())?;
     let deleted = match mode {
-        DeleteMode::Subtree => render::subtree_delete_ids(target_id, &tasks),
+        DeleteMode::Subtree => render::subtree_ids(target_id, &tasks),
         DeleteMode::PromoteChildren => vec![target_id],
     };
     let dependents = render::dependents_of(&deleted, &tasks);
@@ -619,8 +616,7 @@ fn run_task_reopen(db_path: &Path, args: &ReopenArgs) -> Result<(), CliError> {
 
 fn run_task_mv(db_path: &Path, args: &MvArgs) -> Result<(), CliError> {
     let mut core = open_core(db_path)?;
-    let new_parents = args.parents.iter().copied().map(TaskId::from).collect();
-    let task = core.set_parents(TaskId::from(args.id), new_parents)?;
+    let task = core.set_parent(TaskId::from(args.id), args.parent.map(TaskId::from))?;
     let names = user_names(&core)?;
     println!("{}", format_task_line(&task, &names));
     Ok(())
@@ -794,7 +790,7 @@ mod tests {
     /// `Core::list_children` (bypassing stdout entirely) to directly assert
     /// the date fields were actually copied — not just the assignee.
     #[test]
-    fn run_task_add_with_inherit_should_copy_dates_from_first_parent() {
+    fn run_task_add_with_inherit_should_copy_dates_from_parent() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("bala.db");
 
@@ -805,7 +801,7 @@ mod tests {
             .create_task(NewTask {
                 title: "Parent".to_string(),
                 description: None,
-                parent_ids: Vec::new(),
+                parent_id: None,
                 type_key: None,
                 start_date: Some(start),
                 due_date: Some(due),
@@ -819,7 +815,7 @@ mod tests {
             AddArgs {
                 title: "Child".to_string(),
                 description: None,
-                parent: vec![Uuid::from(parent.id)],
+                parent: Some(Uuid::from(parent.id)),
                 start: None,
                 due: None,
                 assignee: None,

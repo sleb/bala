@@ -1,8 +1,13 @@
 # Bala
 
-Bala is a command-line task tracker, written in Rust. Tasks can have
-multiple parents, start/due dates, and assignees, all stored in a local
-SQLite database.
+Bala is a command-line task tracker, written in Rust. Tasks nest under a
+parent task and can have start/due dates, assignees, and dependencies on
+other tasks, all stored in a local SQLite database.
+
+A task has at most one parent. Work that several goals share lives under
+one of them, and the other goals depend on it instead (`bala dep add`): use
+a finish-to-finish dependency (`--type ff`) to say "goal A is not done until
+this is done".
 
 ## Installation
 
@@ -22,6 +27,9 @@ bala user add --name "Ada Lovelace"
 
 # Add a task
 bala task add --title "Write docs" --due 2026-09-20
+
+# Nest a task under a parent
+bala task add --title "Proofread docs" --parent <task-id>
 
 # List tasks and users
 bala task ls
