@@ -126,9 +126,9 @@ pub enum DependencyType {
 
 /// A task as stored and returned by the core library (LLD §Data Model).
 ///
-/// `progress` and `out_of_sync` are computed by `Core` on every read and
-/// never stored; `parent_id` and `depends_on` are filled by the store from
-/// its edges. `StoreTx::put_task` ignores all four.
+/// `progress`, `out_of_sync` and `blocked_by` are computed by `Core` on
+/// every read and never stored; `parent_id` and `depends_on` are filled by
+/// the store from its edges. `StoreTx::put_task` ignores all five.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: TaskId,
@@ -181,9 +181,18 @@ pub struct Task {
     /// (never set by callers, never persisted): a store always reads it
     /// back `false` and `StoreTx::put_task` ignores it. A dependency
     /// constrains nothing while a date it reads on either side is unset or
-    /// its predecessor is soft-deleted, and a soft-deleted task is never
-    /// out of sync.
+    /// its predecessor is soft-deleted, and a soft-deleted or completed task
+    /// is never out of sync.
     pub out_of_sync: bool,
+    /// The live, incomplete predecessors this task is waiting on, in the
+    /// order of `depends_on`. Computed by the library on every read (never
+    /// set by callers, never persisted): a store always reads it back empty
+    /// and `StoreTx::put_task` ignores it. Every dependency type blocks the
+    /// same way, and dates play no part. A completed or soft-deleted
+    /// predecessor does not block, and a soft-deleted or completed task is
+    /// blocked by nothing. A task a mutation returns carries it as a read after the
+    /// mutation would.
+    pub blocked_by: Vec<TaskId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `Some` means the task is soft-deleted; `None` means live.
@@ -208,8 +217,8 @@ pub struct Schedule {
     /// Every live task that would still break at least one dependency with
     /// the moves applied, at the dates it would then have and with
     /// [`Task::out_of_sync`] `true`. Scheduling never moves a task with
-    /// fixed dates or a completed one, so these are the tasks it could not
-    /// bring into line. In the order the tasks were listed.
+    /// fixed dates, so these are the tasks it could not bring into line. A
+    /// completed task is never listed. In the order the tasks were listed.
     pub out_of_sync: Vec<Task>,
 }
 
@@ -468,6 +477,7 @@ mod tests {
             assignee_id: None,
             depends_on: Vec::new(),
             out_of_sync: false,
+            blocked_by: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -498,6 +508,7 @@ mod tests {
             assignee_id: None,
             depends_on: Vec::new(),
             out_of_sync: false,
+            blocked_by: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,

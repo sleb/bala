@@ -21,7 +21,7 @@ use crate::model::{
     UserId,
 };
 use crate::rollup;
-use crate::scheduling::{self, check_new_dependency, is_out_of_sync};
+use crate::scheduling::{self, check_new_dependency};
 use crate::store::{Store, StoreError, StoreTx};
 
 /// The stable key of the default task type every `Core` seeds on
@@ -152,6 +152,7 @@ impl<S: Store> Core<S> {
             depends_on: Vec::new(),
             // A new task has no dependencies to break.
             out_of_sync: false,
+            blocked_by: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -209,8 +210,8 @@ impl<S: Store> Core<S> {
         Ok(task)
     }
 
-    /// Looks up a task by id, with `progress` and `out_of_sync` computed
-    /// in the same transaction as the read.
+    /// Looks up a task by id, with `progress`, `out_of_sync` and
+    /// `blocked_by` computed in the same transaction as the read.
     ///
     /// A thin pass-through to [`StoreTx::get_task`]: like every other read
     /// in this module (`update_task`, `delete_task`, `complete_task`), a
@@ -227,7 +228,7 @@ impl<S: Store> Core<S> {
                 return Ok(None);
             };
             task.progress = compute_progress(tx, id, task.status)?;
-            task.out_of_sync = is_out_of_sync(tx, &task)?;
+            fill_derived(tx, &mut task)?;
             Ok(Some(task))
         })?)
     }
@@ -255,7 +256,7 @@ impl<S: Store> Core<S> {
                 .collect::<Result<Vec<Task>, StoreError>>()?;
             for child in &mut children {
                 child.progress = compute_progress(tx, child.id, child.status)?;
-                child.out_of_sync = is_out_of_sync(tx, child)?;
+                fill_derived(tx, child)?;
             }
             Ok(children)
         })?)
@@ -271,8 +272,9 @@ impl<S: Store> Core<S> {
     /// still out of scope.
     ///
     /// Each result's `out_of_sync` is filled too (LLD §Algorithm 3), from
-    /// the task's own dependencies. A live predecessor constrains a listed
-    /// task whether or not `filter` lets the predecessor itself into the
+    /// the task's own dependencies, and its `blocked_by` from the same
+    /// predecessors. A live predecessor constrains and blocks a listed task
+    /// whether or not `filter` lets the predecessor itself into the
     /// result.
     ///
     /// The base list and every per-task child or predecessor lookup run
@@ -329,21 +331,26 @@ impl<S: Store> Core<S> {
                     }
                 }
             }
-            let out_of_sync: Vec<bool> = tasks
+            let resolve = |id: TaskId| {
+                let predecessor = listed
+                    .get(&id)
+                    .copied()
+                    .or_else(|| unlisted.get(&id).and_then(Option::as_ref));
+                Ok::<_, Infallible>(predecessor.map(Cow::Borrowed))
+            };
+            let derived: Vec<(bool, Vec<TaskId>)> = tasks
                 .iter()
                 .map(|task| {
-                    let Ok(broken) = scheduling::breaks_a_dependency(task, |id| {
-                        let predecessor = listed
-                            .get(&id)
-                            .copied()
-                            .or_else(|| unlisted.get(&id).and_then(Option::as_ref));
-                        Ok::<_, Infallible>(predecessor.map(Cow::Borrowed))
-                    });
-                    broken
+                    let (Ok(broken), Ok(blockers)) = (
+                        scheduling::breaks_a_dependency(task, resolve),
+                        scheduling::blockers_of(task, resolve),
+                    );
+                    (broken, blockers)
                 })
                 .collect();
-            for (task, out_of_sync) in tasks.iter_mut().zip(out_of_sync) {
+            for (task, (out_of_sync, blocked_by)) in tasks.iter_mut().zip(derived) {
                 task.out_of_sync = out_of_sync;
+                task.blocked_by = blocked_by;
             }
             Ok(tasks)
         })?)
@@ -544,7 +551,7 @@ impl<S: Store> Core<S> {
             // rollup on every write rather than trusted from the fetched
             // `task`.
             task.progress = compute_progress(tx, id, task.status)?;
-            task.out_of_sync = is_out_of_sync(tx, &task)?;
+            fill_derived(tx, &mut task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -663,7 +670,7 @@ impl<S: Store> Core<S> {
                     // child may depend on it, and a soft-deleted
                     // predecessor constrains nothing.
                     for child_task in &mut outcome.updated {
-                        child_task.out_of_sync = is_out_of_sync(tx, child_task)?;
+                        fill_derived(tx, child_task)?;
                     }
                 }
             }
@@ -701,7 +708,7 @@ impl<S: Store> Core<S> {
 
             task.status = TaskStatus::Incomplete;
             task.progress = compute_progress(tx, id, task.status)?;
-            task.out_of_sync = is_out_of_sync(tx, &task)?;
+            fill_derived(tx, &mut task)?;
             task.completed_at = None;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
@@ -746,7 +753,7 @@ impl<S: Store> Core<S> {
             // re-derived rather than trusted from the fetched row — see
             // `update_task`'s matching comment.
             task.progress = compute_progress(tx, id, task.status)?;
-            task.out_of_sync = is_out_of_sync(tx, &task)?;
+            fill_derived(tx, &mut task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -815,7 +822,7 @@ impl<S: Store> Core<S> {
                 // children are already at their final status — no ordering
                 // hazard like `mark_complete_subtree`'s below.
                 task.progress = compute_progress(tx, id, task.status)?;
-                task.out_of_sync = is_out_of_sync(tx, &task)?;
+                fill_derived(tx, &mut task)?;
                 task.completed_at = Some(now);
                 task.updated_at = now;
                 tx.put_task(&task)?;
@@ -861,7 +868,7 @@ impl<S: Store> Core<S> {
 
             if task.parent_id == parent {
                 task.progress = compute_progress(tx, id, task.status)?;
-                task.out_of_sync = is_out_of_sync(tx, &task)?;
+                fill_derived(tx, &mut task)?;
                 return Ok(Ok(task));
             }
 
@@ -876,7 +883,7 @@ impl<S: Store> Core<S> {
             // sibling under the old and new parent untouched — this call
             // never writes any row but `id`'s own.
             task.progress = compute_progress(tx, id, task.status)?;
-            task.out_of_sync = is_out_of_sync(tx, &task)?;
+            fill_derived(tx, &mut task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -1053,7 +1060,7 @@ impl<S: Store> Core<S> {
             };
             if task.depends_on.contains(&unchanged) {
                 task.progress = compute_progress(tx, id, task.status)?;
-                task.out_of_sync = is_out_of_sync(tx, &task)?;
+                fill_derived(tx, &mut task)?;
                 return Ok(Ok(task));
             }
 
@@ -1065,7 +1072,7 @@ impl<S: Store> Core<S> {
                 return Ok(Err(CoreError::NotFound(id)));
             };
             task.progress = compute_progress(tx, id, task.status)?;
-            task.out_of_sync = is_out_of_sync(tx, &task)?;
+            fill_derived(tx, &mut task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -1109,7 +1116,7 @@ impl<S: Store> Core<S> {
                 .any(|dep| dep.predecessor_id == predecessor)
             {
                 task.progress = compute_progress(tx, id, task.status)?;
-                task.out_of_sync = is_out_of_sync(tx, &task)?;
+                fill_derived(tx, &mut task)?;
                 return Ok(Ok(task));
             }
 
@@ -1121,7 +1128,7 @@ impl<S: Store> Core<S> {
                 return Ok(Err(CoreError::NotFound(id)));
             };
             task.progress = compute_progress(tx, id, task.status)?;
-            task.out_of_sync = is_out_of_sync(tx, &task)?;
+            fill_derived(tx, &mut task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -1130,6 +1137,17 @@ impl<S: Store> Core<S> {
 
         Ok(task)
     }
+}
+
+/// Fills the fields `Core` derives from a task's dependencies on every
+/// `Task` it returns: [`Task::out_of_sync`] and [`Task::blocked_by`]. Both are
+/// read in the caller's transaction, so call it after the task's dates,
+/// status and dependency edges are in their final state.
+fn fill_derived(tx: &mut dyn StoreTx, task: &mut Task) -> Result<(), StoreError> {
+    let (out_of_sync, blocked_by) = scheduling::dependency_state(tx, task)?;
+    task.out_of_sync = out_of_sync;
+    task.blocked_by = blocked_by;
+    Ok(())
 }
 
 /// Fetches the live task `id`, or `NotFound`.
@@ -1196,7 +1214,8 @@ fn sibling_order_of(
 }
 
 /// The schedule `scheduling::plan` computes over every live task, read in
-/// `get_tree` order, with `progress` filled on each task it returns. Both
+/// `get_tree` order, with `progress` and `blocked_by` filled on each task it
+/// returns. Both
 /// [`Core::preview_schedule`] and [`Core::reschedule`] take their schedule
 /// from here, so what is previewed is what is committed.
 ///
@@ -1206,6 +1225,23 @@ fn planned_schedule(tx: &mut dyn StoreTx) -> Result<Schedule, StoreError> {
     let mut tasks = tx.list_tasks(&TreeFilter::default())?;
     let live: HashSet<TaskId> = tasks.iter().map(|task| task.id).collect();
     sort_in_sibling_order(&sibling_order_of(tx, &live)?, &mut tasks);
+    // Scheduling moves dates, never a status, so the blockers read here hold
+    // for each task before and after the move; `plan` fills `out_of_sync`.
+    let blockers: Vec<Vec<TaskId>> = {
+        let by_id: HashMap<TaskId, &Task> = tasks.iter().map(|task| (task.id, task)).collect();
+        tasks
+            .iter()
+            .map(|task| {
+                let Ok(blockers) = scheduling::blockers_of(task, |id| {
+                    Ok::<_, Infallible>(by_id.get(&id).copied().map(Cow::Borrowed))
+                });
+                blockers
+            })
+            .collect()
+    };
+    for (task, blocked_by) in tasks.iter_mut().zip(blockers) {
+        task.blocked_by = blocked_by;
+    }
     let mut schedule = scheduling::plan(tasks);
     for moved in &mut schedule.moved {
         moved.before.progress = compute_progress(tx, moved.before.id, moved.before.status)?;
@@ -1340,7 +1376,7 @@ fn mark_complete_subtree(
             continue;
         };
         task.progress = compute_progress(tx, touched_id, task.status)?;
-        task.out_of_sync = is_out_of_sync(tx, &task)?;
+        fill_derived(tx, &mut task)?;
         tx.put_task(&task)?;
         touched.push(task);
     }
@@ -4766,6 +4802,270 @@ mod tests {
         assert!(!in_sync.out_of_sync);
     }
 
+    /// A task with no dates that depends finish-to-start on each of
+    /// `predecessors`, in that order.
+    fn successor_of(core: &mut Core<InMemoryStore>, predecessors: &[&Task]) -> Task {
+        let successor = core.create_task(minimal_new_task("Successor")).unwrap();
+        for predecessor in predecessors {
+            core.add_dependency(successor.id, predecessor.id, DependencyType::FinishToStart)
+                .unwrap();
+        }
+        successor
+    }
+
+    #[test]
+    fn get_task_should_list_incomplete_predecessors_in_blocked_by() {
+        let mut core = new_core();
+        let first = core.create_task(minimal_new_task("First")).unwrap();
+        let second = core.create_task(minimal_new_task("Second")).unwrap();
+        let successor = successor_of(&mut core, &[&second, &first]);
+
+        let fetched = core.get_task(successor.id).unwrap().unwrap();
+
+        assert_eq!(fetched.blocked_by, [second.id, first.id]);
+        let unblocked = core.get_task(first.id).unwrap().unwrap();
+        assert_eq!(unblocked.blocked_by, []);
+    }
+
+    #[test]
+    fn get_task_should_not_list_completed_predecessors_in_blocked_by() {
+        let mut core = new_core();
+        let done = core.create_task(minimal_new_task("Done")).unwrap();
+        let open = core.create_task(minimal_new_task("Open")).unwrap();
+        let successor = successor_of(&mut core, &[&done, &open]);
+        core.complete_task(done.id, false).unwrap();
+
+        let fetched = core.get_task(successor.id).unwrap().unwrap();
+
+        assert_eq!(fetched.blocked_by, [open.id]);
+    }
+
+    #[test]
+    fn get_task_should_not_flag_a_completed_task_out_of_sync() {
+        let mut core = new_core();
+        let (_, successor) = violating_pair(&mut core);
+        assert!(is_flagged(&core, successor.id));
+
+        core.complete_task(successor.id, false).unwrap();
+
+        assert!(!is_flagged(&core, successor.id));
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        assert!(tree.iter().all(|task| !task.out_of_sync));
+    }
+
+    #[test]
+    fn get_task_should_not_report_blocked_by_for_a_completed_task() {
+        let mut core = new_core();
+        let open = core.create_task(minimal_new_task("Open")).unwrap();
+        let successor = successor_of(&mut core, &[&open]);
+        assert_eq!(
+            core.get_task(successor.id).unwrap().unwrap().blocked_by,
+            [open.id]
+        );
+
+        let completed = core.complete_task(successor.id, false).unwrap();
+
+        assert_eq!(completed[0].blocked_by, []);
+        assert_eq!(core.get_task(successor.id).unwrap().unwrap().blocked_by, []);
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+        assert!(tree.iter().all(|task| task.blocked_by.is_empty()));
+    }
+
+    #[test]
+    fn preview_schedule_should_not_list_a_completed_task_as_out_of_sync() {
+        let mut core = new_core();
+        let (_, successor) = violating_pair(&mut core);
+        core.complete_task(successor.id, false).unwrap();
+
+        let schedule = core.preview_schedule().unwrap();
+
+        assert_eq!(schedule.out_of_sync, []);
+        assert_eq!(schedule.moved, []);
+    }
+
+    #[test]
+    fn get_task_should_ignore_soft_deleted_predecessors_in_blocked_by() {
+        let mut core = new_core();
+        let deleted = core.create_task(minimal_new_task("Deleted")).unwrap();
+        let open = core.create_task(minimal_new_task("Open")).unwrap();
+        let successor = successor_of(&mut core, &[&deleted, &open]);
+        core.delete_task(deleted.id, DeleteMode::Subtree).unwrap();
+
+        let fetched = core.get_task(successor.id).unwrap().unwrap();
+
+        assert_eq!(fetched.blocked_by, [open.id]);
+    }
+
+    #[test]
+    fn get_tree_should_report_blocked_by_when_a_type_filter_hides_the_predecessor() {
+        let mut core = new_core();
+        core.upsert_task_type(TaskType {
+            key: "goal".to_owned(),
+            label: "Goal".to_owned(),
+            color: None,
+            sort_order: 1,
+        })
+        .unwrap();
+        let goal = core
+            .create_task(NewTask {
+                type_key: Some("goal".to_owned()),
+                ..minimal_new_task("Goal")
+            })
+            .unwrap();
+        let successor = successor_of(&mut core, &[&goal]);
+
+        let tree = core
+            .get_tree(TreeFilter {
+                type_key: Some("task".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].id, successor.id);
+        assert_eq!(tree[0].blocked_by, [goal.id]);
+    }
+
+    #[test]
+    fn get_tree_should_report_every_dependency_type_as_blocking() {
+        let mut core = new_core();
+        let types = [
+            DependencyType::FinishToStart,
+            DependencyType::StartToStart,
+            DependencyType::FinishToFinish,
+            DependencyType::StartToFinish,
+        ];
+        let mut expected = Vec::new();
+        let successor = core.create_task(minimal_new_task("Successor")).unwrap();
+        for dep_type in types {
+            let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+            core.add_dependency(successor.id, predecessor.id, dep_type)
+                .unwrap();
+            expected.push(predecessor.id);
+        }
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+
+        let listed = tree.iter().find(|task| task.id == successor.id).unwrap();
+        assert_eq!(listed.blocked_by, expected);
+    }
+
+    #[test]
+    fn complete_task_should_clear_blocked_by_on_successors_in_the_touched_set() {
+        let mut core = new_core();
+        let outside = core.create_task(minimal_new_task("Outside")).unwrap();
+        let parent = titled_under(&mut core, "Parent", None);
+        let first = titled_under(&mut core, "First", Some(parent.id));
+        let second = titled_under(&mut core, "Second", Some(parent.id));
+        let third = titled_under(&mut core, "Third", Some(parent.id));
+        core.add_dependency(second.id, first.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.add_dependency(second.id, outside.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.add_dependency(third.id, first.id, DependencyType::FinishToStart)
+            .unwrap();
+        let before = core.get_task(second.id).unwrap().unwrap();
+        assert_eq!(before.blocked_by, [first.id, outside.id]);
+
+        let touched = core.complete_task(parent.id, true).unwrap();
+
+        let find = |id: TaskId| touched.iter().find(|task| task.id == id).unwrap();
+        assert_eq!(touched.len(), 4);
+        assert_eq!(find(second.id).blocked_by, []);
+        assert_eq!(find(third.id).blocked_by, []);
+        for task in &touched {
+            assert_eq!(*task, core.get_task(task.id).unwrap().unwrap());
+        }
+    }
+
+    #[test]
+    fn reopen_task_should_restore_blocked_by_on_successors() {
+        let mut core = new_core();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let successor = successor_of(&mut core, &[&predecessor]);
+        let early = core.create_task(minimal_new_task("Early")).unwrap();
+        core.add_dependency(early.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.complete_task(early.id, false).unwrap();
+        core.complete_task(predecessor.id, false).unwrap();
+        assert_eq!(core.get_task(successor.id).unwrap().unwrap().blocked_by, []);
+
+        core.reopen_task(predecessor.id).unwrap();
+
+        let reopened = core.reopen_task(early.id).unwrap();
+        assert_eq!(reopened.blocked_by, [predecessor.id]);
+        assert_eq!(reopened, core.get_task(early.id).unwrap().unwrap());
+        assert_eq!(
+            core.get_task(successor.id).unwrap().unwrap().blocked_by,
+            [predecessor.id]
+        );
+    }
+
+    #[test]
+    fn add_dependency_should_return_the_task_with_blocked_by_filled() {
+        let mut core = new_core();
+        let first = core.create_task(minimal_new_task("First")).unwrap();
+        let second = core.create_task(minimal_new_task("Second")).unwrap();
+        let successor = core.create_task(minimal_new_task("Successor")).unwrap();
+        core.add_dependency(successor.id, first.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.complete_task(second.id, false).unwrap();
+
+        let added = core
+            .add_dependency(successor.id, second.id, DependencyType::StartToStart)
+            .unwrap();
+        assert_eq!(added.blocked_by, [first.id]);
+
+        let third = core.create_task(minimal_new_task("Third")).unwrap();
+        let added = core
+            .add_dependency(successor.id, third.id, DependencyType::FinishToFinish)
+            .unwrap();
+        assert_eq!(added.blocked_by, [first.id, third.id]);
+        assert_eq!(added, core.get_task(successor.id).unwrap().unwrap());
+    }
+
+    #[test]
+    fn remove_dependency_should_clear_blocked_by() {
+        let mut core = new_core();
+        let first = core.create_task(minimal_new_task("First")).unwrap();
+        let second = core.create_task(minimal_new_task("Second")).unwrap();
+        let successor = successor_of(&mut core, &[&first, &second]);
+
+        let removed = core.remove_dependency(successor.id, first.id).unwrap();
+        assert_eq!(removed.blocked_by, [second.id]);
+
+        let removed = core.remove_dependency(successor.id, second.id).unwrap();
+        assert_eq!(removed.blocked_by, []);
+        assert_eq!(removed, core.get_task(successor.id).unwrap().unwrap());
+    }
+
+    #[test]
+    fn delete_task_should_clear_blocked_by_on_its_dependents() {
+        let mut core = new_core();
+        let deleted = core.create_task(minimal_new_task("Deleted")).unwrap();
+        let other = core.create_task(minimal_new_task("Other")).unwrap();
+        let dependent = successor_of(&mut core, &[&deleted, &other]);
+        // A dependency on its own parent cannot be added, but a task can be
+        // moved under a predecessor it already has.
+        core.set_parent(dependent.id, Some(deleted.id)).unwrap();
+        assert_eq!(
+            core.get_task(dependent.id).unwrap().unwrap().blocked_by,
+            [deleted.id, other.id]
+        );
+
+        let outcome = core
+            .delete_task(deleted.id, DeleteMode::PromoteChildren)
+            .unwrap();
+
+        assert_eq!(outcome.updated.len(), 1);
+        assert_eq!(outcome.updated[0].blocked_by, [other.id]);
+        assert_eq!(outcome.deleted[0].blocked_by, []);
+        assert_eq!(
+            outcome.updated[0],
+            core.get_task(dependent.id).unwrap().unwrap()
+        );
+    }
+
     #[test]
     fn update_task_should_allow_and_flag_a_date_that_breaks_a_dependency() {
         let mut core = new_core();
@@ -4990,8 +5290,23 @@ mod tests {
         assert_eq!(completed[0].id, predecessor.id);
         let successor_after = core.get_task(successor.id).unwrap().unwrap();
         let in_sync_after = core.get_task(in_sync.id).unwrap().unwrap();
-        assert_eq!(successor_after, successor_before);
-        assert_eq!(in_sync_after, in_sync_before);
+        // The completed predecessor no longer blocks; nothing else changes.
+        assert_eq!(successor_before.blocked_by, [predecessor.id]);
+        assert_eq!(successor_after.blocked_by, []);
+        assert_eq!(
+            successor_after,
+            Task {
+                blocked_by: Vec::new(),
+                ..successor_before
+            }
+        );
+        assert_eq!(
+            in_sync_after,
+            Task {
+                blocked_by: Vec::new(),
+                ..in_sync_before
+            }
+        );
         assert!(successor_after.out_of_sync);
         assert!(!in_sync_after.out_of_sync);
     }
@@ -5029,7 +5344,7 @@ mod tests {
         assert!(children[0].out_of_sync);
 
         let completed = core.complete_task(successor.id, false).unwrap();
-        assert!(completed[0].out_of_sync);
+        assert!(!completed[0].out_of_sync);
         let reopened = core.reopen_task(successor.id).unwrap();
         assert!(reopened.out_of_sync);
         let cascaded = core.complete_task(parent.id, true).unwrap();
@@ -5039,8 +5354,9 @@ mod tests {
             .map(|t| t.id)
             .collect();
         assert_eq!(cascaded.len(), 2);
-        assert_eq!(flagged, [successor.id]);
+        assert_eq!(flagged, []);
 
+        core.reopen_task(successor.id).unwrap();
         core.set_parent(parent.id, Some(other_parent.id)).unwrap();
         let outcome = core
             .delete_task(parent.id, DeleteMode::PromoteChildren)
@@ -5105,11 +5421,9 @@ mod tests {
         assert_eq!(schedule.moved, [Rescheduled { before, after }]);
         assert_eq!(
             schedule.out_of_sync,
-            [
-                core.get_task(child.id).unwrap().unwrap(),
-                core.get_task(fixed.id).unwrap().unwrap()
-            ]
+            [core.get_task(fixed.id).unwrap().unwrap()]
         );
+        assert!(!core.get_task(child.id).unwrap().unwrap().out_of_sync);
     }
 
     #[test]

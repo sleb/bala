@@ -1964,6 +1964,25 @@ fn schedule_should_list_tasks_left_out_of_sync() {
 }
 
 #[test]
+fn schedule_should_not_list_a_completed_task_whose_dates_break_a_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let (_a, b) = late_predecessor_fixture(&db_path, false);
+    bala_cmd(&db_path)
+        .args(["task", "complete", &b])
+        .assert()
+        .success();
+
+    let stdout = schedule_stdout(&db_path, &[], "");
+
+    assert_eq!(stdout, "Nothing to move.\n");
+    assert_eq!(
+        ls_line(&db_path, &b),
+        format!("[x] {b} B (type: task) 2026-10-05..2026-10-08 (fixed)")
+    );
+}
+
+#[test]
 fn schedule_should_not_move_a_fixed_task() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("bala.db");

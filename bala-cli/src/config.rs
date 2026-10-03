@@ -67,11 +67,11 @@ pub fn view_state_path() -> Result<PathBuf, ConfigError> {
 }
 
 /// Persisted TUI view state: which task (if any) is currently selected in
-/// the tree, which tasks are collapsed, and the active type filter.
+/// the tree, which tasks are collapsed, the active type filter, and the
+/// active blocked/ready view.
 ///
-/// The design doc's other fields (`gantt_scale`, `gantt_anchor`,
-/// `blocked_only`) are added when the Gantt view and blocked-task filter
-/// exist. They can join without a format break, alongside these in the
+/// The design doc's other fields (`gantt_scale`, `gantt_anchor`) are added
+/// when the Gantt view exists. They can join without a format break, alongside these in the
 /// `[tree]` table or in a sibling table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ViewState {
@@ -80,6 +80,10 @@ pub struct ViewState {
     /// The active TUI type filter (`Action::CycleTypeFilter`, bound to `f`),
     /// or `None` when no filter is applied.
     pub filter_type_key: Option<String>,
+    /// The active blocked/ready view as its label (`"blocked"` or `"ready"`),
+    /// or `None` when every task is listed. Kept as a string, like
+    /// `filter_type_key`, so this module doesn't depend on the TUI types.
+    pub blocked_view: Option<String>,
 }
 
 /// On-disk shape of `view.toml`. Kept private and separate from
@@ -104,6 +108,10 @@ struct TreeShape {
     /// the same tolerance `collapsed` already has.
     #[serde(default)]
     filter_type_key: Option<String>,
+    /// Absent when every task is listed, and from a `view.toml` saved before
+    /// this field existed; both default to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked_view: Option<String>,
 }
 
 impl From<&ViewState> for ViewStateShape {
@@ -113,6 +121,7 @@ impl From<&ViewState> for ViewStateShape {
                 selected: state.selected.map(|id| id.to_string()),
                 collapsed: state.collapsed.iter().map(ToString::to_string).collect(),
                 filter_type_key: state.filter_type_key.clone(),
+                blocked_view: state.blocked_view.clone(),
             },
         }
     }
@@ -129,6 +138,7 @@ impl From<ViewStateShape> for ViewState {
                 .filter_map(|s| s.parse().ok())
                 .collect(),
             filter_type_key: shape.tree.filter_type_key,
+            blocked_view: shape.tree.blocked_view,
         }
     }
 }
@@ -185,6 +195,7 @@ mod tests {
             selected: Some(id),
             collapsed: [collapsed_a, collapsed_b].into_iter().collect(),
             filter_type_key: Some("goal".to_string()),
+            blocked_view: Some("blocked".to_string()),
         };
 
         let shape = ViewStateShape::from(&state);
@@ -246,6 +257,7 @@ mod tests {
                 selected: None,
                 collapsed: [old_id].into_iter().collect(),
                 filter_type_key: None,
+                blocked_view: None,
             },
         )
         .expect("save old state");
@@ -257,6 +269,7 @@ mod tests {
                 selected: None,
                 collapsed: [new_id].into_iter().collect(),
                 filter_type_key: None,
+                blocked_view: None,
             },
         )
         .expect("save new state");
@@ -268,6 +281,7 @@ mod tests {
                 selected: None,
                 collapsed: [new_id].into_iter().collect(),
                 filter_type_key: None,
+                blocked_view: None,
             }
         );
     }
@@ -329,6 +343,7 @@ mod tests {
                 selected: Some(old_id),
                 collapsed: HashSet::new(),
                 filter_type_key: None,
+                blocked_view: None,
             },
         )
         .expect("save old state");
@@ -340,6 +355,7 @@ mod tests {
                 selected: Some(new_id),
                 collapsed: HashSet::new(),
                 filter_type_key: None,
+                blocked_view: None,
             },
         )
         .expect("save new state");
@@ -351,6 +367,7 @@ mod tests {
                 selected: Some(new_id),
                 collapsed: HashSet::new(),
                 filter_type_key: None,
+                blocked_view: None,
             }
         );
     }
@@ -367,5 +384,50 @@ mod tests {
             .map(|entry| entry.expect("dir entry").file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("view.toml")]);
+    }
+
+    #[test]
+    fn save_then_load_view_state_should_round_trip_the_blocked_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+        let state = ViewState {
+            blocked_view: Some("ready".to_string()),
+            ..ViewState::default()
+        };
+
+        save_view_state(&path, &state).expect("save state");
+        let loaded = load_view_state(&path);
+
+        assert_eq!(loaded, state);
+        let text = fs::read_to_string(&path).expect("read view.toml");
+        assert!(text.contains("blocked_view = \"ready\""));
+    }
+
+    #[test]
+    fn save_view_state_should_omit_the_blocked_view_when_all_tasks_are_listed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+
+        save_view_state(&path, &ViewState::default()).expect("save state");
+
+        let text = fs::read_to_string(&path).expect("read view.toml");
+        assert!(!text.contains("blocked_view"));
+    }
+
+    #[test]
+    fn load_view_state_should_default_blocked_view_when_file_predates_the_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.toml");
+        fs::write(
+            &path,
+            "[tree]\nselected = \"00000000-0000-0000-0000-000000000001\"\nfilter_type_key = \"goal\"\n",
+        )
+        .expect("write pre-blocked_view view.toml");
+
+        let state = load_view_state(&path);
+
+        assert_eq!(state.blocked_view, None);
+        assert_eq!(state.filter_type_key.as_deref(), Some("goal"));
+        assert!(state.selected.is_some());
     }
 }

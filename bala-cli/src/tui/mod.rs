@@ -14,7 +14,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
-use bala_core::TreeFilter;
+use bala_core::{Core, Store, TreeFilter};
 use crossterm::event::{Event, KeyEventKind};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
@@ -23,7 +23,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::cli::{self, CliError};
 use crate::config::{self, ViewState};
 use crate::render;
-use app::{App, handle_key};
+use app::{App, BlockedView, handle_key};
 
 /// Runs the interactive TUI against the store at `db_path`.
 ///
@@ -51,8 +51,6 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
     ensure_is_terminal(&std::io::stdout(), "stdout")?;
 
     let mut core = cli::open_core(db_path)?;
-    let users = core.list_users()?;
-    let types = core.list_task_types()?;
 
     // Resolving the view-state path can fail only for a rare OS-level reason
     // (no config directory determinable, or it can't be created) — that's
@@ -73,44 +71,7 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
         .map(config::load_view_state)
         .unwrap_or_default();
 
-    // A restored `filter_type_key` is honored from the first frame, not just
-    // after the next `f` press — matching `refresh_rows_from_tree`'s
-    // behavior once the TUI is running.
-    let tasks = core.get_tree(TreeFilter {
-        type_key: view_state.filter_type_key.clone(),
-        ..Default::default()
-    })?;
-    let sibling_order = core.sibling_order()?;
-    let available_type_keys: Vec<String> = types
-        .iter()
-        .map(|task_type| task_type.key.clone())
-        .collect();
-
-    let user_names: HashMap<_, _> = users.into_iter().map(|user| (user.id, user.name)).collect();
-    let type_labels: HashMap<_, _> = types
-        .into_iter()
-        .map(|task_type| (task_type.key, task_type.label))
-        .collect();
-    let descriptions: HashMap<_, _> = tasks
-        .iter()
-        .map(|task| (task.id, task.description.clone()))
-        .collect();
-    let rows = render::task_rows(
-        &tasks,
-        &sibling_order,
-        &type_labels,
-        &user_names,
-        &std::collections::HashSet::new(),
-    );
-
-    let mut app = App::new(rows)
-        .with_lookup_maps(type_labels, user_names)
-        .with_descriptions(descriptions)
-        .with_sibling_order(sibling_order)
-        .with_tasks(tasks)
-        .with_collapsed(view_state.collapsed)
-        .with_type_filter_state(view_state.filter_type_key, available_type_keys);
-    app.select_by_id(view_state.selected);
+    let mut app = build_app(&core, view_state)?;
 
     install_panic_hook();
     crossterm::terminal::enable_raw_mode().map_err(CliError::TerminalIo)?;
@@ -144,17 +105,81 @@ pub fn run(db_path: &Path) -> Result<(), CliError> {
     }
 
     if let Some(path) = view_state_path.as_deref() {
-        let new_state = ViewState {
-            selected: app.selected_row().map(|row| row.id),
-            collapsed: app.collapsed().clone(),
-            filter_type_key: app.type_filter().map(str::to_owned),
-        };
-        if let Err(err) = config::save_view_state(path, &new_state) {
+        if let Err(err) = config::save_view_state(path, &view_state_of(&app)) {
             eprintln!("warning: failed to save view state: {err}");
         }
     }
 
     Ok(())
+}
+
+/// Builds the [`App`] shown on the first frame: fetches the tree, users and
+/// task types from `core`, then restores `view_state` (type filter,
+/// collapsed set, selection) before anything is drawn.
+fn build_app<S: Store>(core: &Core<S>, view_state: ViewState) -> Result<App, CliError> {
+    let users = core.list_users()?;
+    let types = core.list_task_types()?;
+
+    // A restored `filter_type_key` is honored from the first frame, not just
+    // after the next `f` press — matching `refresh_rows_from_tree`'s
+    // behavior once the TUI is running.
+    let tasks = core.get_tree(TreeFilter {
+        type_key: view_state.filter_type_key.clone(),
+        ..Default::default()
+    })?;
+    // An unrecognized stored view falls back to listing every task rather
+    // than failing startup.
+    let blocked_view = view_state
+        .blocked_view
+        .as_deref()
+        .and_then(BlockedView::from_label)
+        .unwrap_or_default();
+    let sibling_order = core.sibling_order()?;
+    let available_type_keys: Vec<String> = types
+        .iter()
+        .map(|task_type| task_type.key.clone())
+        .collect();
+
+    let user_names: HashMap<_, _> = users.into_iter().map(|user| (user.id, user.name)).collect();
+    let type_labels: HashMap<_, _> = types
+        .into_iter()
+        .map(|task_type| (task_type.key, task_type.label))
+        .collect();
+    let descriptions: HashMap<_, _> = tasks
+        .iter()
+        .map(|task| (task.id, task.description.clone()))
+        .collect();
+    let rows = render::task_rows(
+        &tasks,
+        &sibling_order,
+        &type_labels,
+        &user_names,
+        &std::collections::HashSet::new(),
+    );
+
+    let mut app = App::new(rows)
+        .with_lookup_maps(type_labels, user_names)
+        .with_descriptions(descriptions)
+        .with_sibling_order(sibling_order)
+        .with_tasks(tasks)
+        .with_collapsed(view_state.collapsed)
+        .with_type_filter_state(view_state.filter_type_key, available_type_keys)
+        .with_blocked_view(blocked_view);
+    app.select_by_id(view_state.selected);
+    app::reload_blockers(&mut app, core);
+
+    Ok(app)
+}
+
+/// Captures the persistable parts of `app`'s view.
+fn view_state_of(app: &App) -> ViewState {
+    ViewState {
+        selected: app.selected_row().map(|row| row.id),
+        collapsed: app.collapsed().clone(),
+        filter_type_key: app.type_filter().map(str::to_owned),
+        blocked_view: (app.blocked_view() != BlockedView::All)
+            .then(|| app.blocked_view().label().to_owned()),
+    }
 }
 
 /// Answers whether a stream is a real terminal. A thin, unsealed mirror of
@@ -217,7 +242,11 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliError, TerminalCheck, ensure_is_terminal};
+    use super::{CliError, TerminalCheck, build_app, ensure_is_terminal, screens, view_state_of};
+    use crate::config::ViewState;
+    use bala_core::{Core, DependencyType, InMemoryStore, NewTask};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     /// A fake stream whose answer is fixed at construction, so
     /// `ensure_is_terminal`'s branches can be tested without a real
@@ -240,5 +269,67 @@ mod tests {
         let err = ensure_is_terminal(&FakeStream(false), "stdout").unwrap_err();
         assert!(matches!(err, CliError::TerminalIo(_)));
         assert!(err.to_string().contains("stdout is not a terminal"));
+    }
+
+    fn new_task(title: &str) -> NewTask {
+        NewTask {
+            title: title.to_string(),
+            description: None,
+            parent_id: None,
+            type_key: None,
+            start_date: None,
+            due_date: None,
+            duration_days: None,
+            assignee_id: None,
+        }
+    }
+
+    #[test]
+    fn tui_run_should_restore_the_blocked_view_on_first_frame() {
+        let mut core = Core::new(InMemoryStore::default()).expect("in-memory core");
+        let pred = core.create_task(new_task("Design")).expect("create");
+        let waiting = core.create_task(new_task("Ship it")).expect("create");
+        core.create_task(new_task("Free")).expect("create");
+        core.add_dependency(waiting.id, pred.id, DependencyType::default())
+            .expect("add dependency");
+        let view_state = ViewState {
+            blocked_view: Some("blocked".to_string()),
+            ..ViewState::default()
+        };
+
+        let app = build_app(&core, view_state).expect("build app");
+
+        let titles: Vec<&str> = app.rows().iter().map(|row| row.title.as_str()).collect();
+        assert_eq!(titles, ["Ship it"]);
+        assert_eq!(app.blockers().len(), 1);
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).expect("terminal");
+        terminal
+            .draw(|frame| screens::draw(frame, &app))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("view: blocked"));
+        assert!(!text.contains("Free"));
+        assert_eq!(view_state_of(&app).blocked_view.as_deref(), Some("blocked"));
+    }
+
+    #[test]
+    fn build_app_should_fall_back_to_all_for_an_unknown_blocked_view() {
+        let mut core = Core::new(InMemoryStore::default()).expect("in-memory core");
+        core.create_task(new_task("Free")).expect("create");
+        let view_state = ViewState {
+            blocked_view: Some("garbled".to_string()),
+            ..ViewState::default()
+        };
+
+        let app = build_app(&core, view_state).expect("build app");
+
+        assert_eq!(app.rows().len(), 1);
+        assert_eq!(view_state_of(&app).blocked_view, None);
     }
 }

@@ -67,13 +67,16 @@ exist, the same as for `bala.db`.
 ### What's persisted
 
 Today, the selected task (stored as `selected = "<uuid>"`), the set of
-collapsed tasks (stored as `collapsed = ["<uuid>", ...]`), and the active
+collapsed tasks (stored as `collapsed = ["<uuid>", ...]`), the active
 type filter (stored as `filter_type_key = "<type-key>"`, cycled with `f` in
-the TUI; absent from the file entirely when no filter is applied), all under
-a `[tree]` table. Other view state described in the design (Gantt
-scale/anchor, "blocked only") isn't persisted yet — those are expected to
-join later as additional keys in `[tree]`, or in sibling tables, without
-breaking this file's format. An unparseable entry in `collapsed` is skipped
+the TUI; absent from the file entirely when no filter is applied), and the
+active blocked/ready view (stored as `blocked_view = "blocked"` or
+`blocked_view = "ready"`, cycled with `b`; absent from the file when every
+task is listed), all under a `[tree]` table. An unrecognized `blocked_view`
+value is treated as listing every task. Other view state described in the
+design (Gantt scale/anchor) isn't persisted yet — those are expected to join
+later as additional keys in `[tree]`, or in sibling tables, without breaking
+this file's format. An unparseable entry in `collapsed` is skipped
 rather than failing the whole file, the same tolerance `selected` already
 has.
 

@@ -34,7 +34,10 @@ indented under its parent: a subtask is nested two spaces deeper than its
 parent. A task has at most one parent, so every task appears as exactly one
 row. A task with subtasks shows a `▾` (expanded) or `▸`
 (collapsed) glyph before its checkbox; a collapsed task's row also shows a
-`(complete/total)` summary counting its direct children only. Collapse/
+`(complete/total)` summary counting its direct children only. A task that
+is waiting on an incomplete predecessor shows a red `⊘` right after its
+checkbox; the glyph disappears as soon as the last incomplete predecessor is
+completed. A completed task is never shown as blocked. Collapse/
 expand state persists across sessions in `view.toml` (see
 [config.md](config.md)). An empty task list shows a "No tasks yet." message
 instead of a blank screen.
@@ -54,6 +57,7 @@ instead of a blank screen.
 | `m` (in the list) | Reparent the selected task: opens a text-entry line prefilled with its current parent id (empty when it is top-level). `Enter` submits, `Esc` cancels. |
 | `t` (in the list) | Set the selected task's type: opens a text-entry line prefilled with its current type key. `Enter` submits, `Esc` cancels. |
 | `f` (in the list) | Cycle the active type filter: no filter → the first configured type → the next → ... → back to no filter. Persists across sessions in `view.toml` (see [config.md](config.md)). |
+| `b` (in the list) | Cycle the blocked/ready view: all → blocked (tasks waiting on an incomplete predecessor) → ready (incomplete tasks that are not blocked) → all. Combines with the type filter. The active view shows in a `view: …` status line below the list; a row whose parent the view hides is shown at the top level. |
 | `Enter` (in the list) | Open the Detail pane for the selected task. |
 | `j` / `↓` (in the Detail pane) | Move the field cursor down (Title → Description). |
 | `k` / `↑` (in the Detail pane) | Move the field cursor up (Description → Title). |
@@ -115,6 +119,13 @@ showing the new value, `Esc` discards it. An empty title is rejected the
 same way as in `O`'s new-task entry (inline error, stays in the entry line);
 an empty description is accepted. `Esc` in the Detail pane itself (not
 mid-edit) leaves it and returns to the list.
+
+When the selected task is blocked, the Detail pane also shows a "Blocked by"
+section below the description: one line per task still blocking it, giving
+the blocker's title and status (e.g. `Design (incomplete)`), in dependency
+order. Blockers are looked up directly, so one hidden by the type filter is
+still listed. The section updates as blockers are completed and is omitted
+entirely when the task is not blocked.
 
 Pressing `d` twice in a row on a selected task shows a confirmation prompt
 naming the task, at the bottom of the screen. For a task with no subtasks,
@@ -229,7 +240,8 @@ followed, in this order, by each of these that applies:
 - ` (out of sync)` when the task's dates break one of its dependencies —
   for the default `fs` type, when it starts before a task it depends on is
   due. Starting on that very day is fine. A dependency is not checked while
-  a date it compares is unset or its predecessor is deleted.
+  a date it compares is unset or its predecessor is deleted. A completed
+  task is never marked out of sync, whatever its dates.
 
 A task with no dates and no duration prints none of the last four.
 `<marker>` is `x` for a completed task and a space otherwise. Every task is
@@ -460,7 +472,9 @@ bala schedule [--yes]
 
 Only a *floating* task moves: one whose dates are not fixed (see `--float`
 under [`bala task edit`](#bala-task-edit)). A task with fixed dates is never
-changed, whatever its predecessors do, and neither is a completed one. Tasks
+changed, whatever its predecessors do, and neither is a completed one (a
+completed task is never reported as out of sync either, though its dates
+still decide where its successors go). Tasks
 move predecessors first, so a chain of floating tasks is carried along in
 one run.
 
@@ -489,7 +503,8 @@ Apply? [y/N]
 Each move line shows the task's current dates, then the dates it would move
 to; an unset date prints as `?`, as in `task ls`. The "would stay out of
 sync" section lists the tasks that would still break a dependency after the
-moves (a fixed task that starts before its predecessor finishes, say) and
+moves (a fixed, incomplete task that starts before its predecessor finishes,
+say) and
 is printed only when there are any.
 
 Answering `y` or `yes` applies the moves and prints each moved task, in the

@@ -8,9 +8,10 @@ use bala_core::TaskStatus;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
-use crate::tui::app::App;
+use crate::tui::app::{App, BlockedView};
 use crate::tui::keymap;
 use crate::tui::mode::{DetailField, EditableField, Mode, Pane};
 
@@ -36,6 +37,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     let (content_area, input_area) = split_for_input(app, area);
+    let content_area = if app.pane() == Pane::List && app.blocked_view() != BlockedView::All {
+        let [list_area, status_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(content_area);
+        draw_status_line(frame, app, status_area);
+        list_area
+    } else {
+        content_area
+    };
 
     match app.pane() {
         Pane::List => {
@@ -55,6 +64,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if matches!(app.mode(), Mode::Confirm { .. }) {
         draw_confirm(frame, app, content_area);
     }
+}
+
+/// Renders the one-row status line naming the active blocked/ready view.
+fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
+    let text = format!("view: {}", app.blocked_view().label());
+    frame.render_widget(
+        Paragraph::new(text).style(Style::new().add_modifier(Modifier::BOLD)),
+        area,
+    );
 }
 
 /// Splits `area` into a list area and, when `app` is in `Mode::Insert`, a
@@ -81,6 +99,10 @@ fn split_for_input(app: &App, area: Rect) -> (Rect, Option<Rect>) {
 /// bounds the per-row cost to a constant instead.
 const MAX_INDENT_DEPTH: usize = 40;
 
+/// Marker shown after the checkbox of a task waiting on an incomplete
+/// predecessor.
+const BLOCKED_GLYPH: &str = "⊘";
+
 /// Renders the task list with the selected row highlighted.
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
@@ -104,14 +126,25 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
                 .map_or(String::new(), |(complete, total)| {
                     format!(" ({complete}/{total})")
                 });
-            let line = format!(
-                "{}{glyph}[{marker}] {}{summary}  [{}]  {}",
-                "  ".repeat(row.depth.min(MAX_INDENT_DEPTH)),
+            let head = format!(
+                "{}{glyph}[{marker}] ",
+                "  ".repeat(row.depth.min(MAX_INDENT_DEPTH))
+            );
+            let tail = format!(
+                "{}{summary}  [{}]  {}",
                 row.title,
                 row.type_label,
                 row.assignee_name.as_deref().unwrap_or("Unassigned")
             );
-            let item = ListItem::new(line);
+            let mut spans = vec![Span::raw(head)];
+            if row.blocked {
+                spans.push(Span::styled(
+                    format!("{BLOCKED_GLYPH} "),
+                    Style::new().fg(Color::Red),
+                ));
+            }
+            spans.push(Span::raw(tail));
+            let item = ListItem::new(Line::from(spans));
             if row.status == TaskStatus::Complete {
                 item.style(Style::new().add_modifier(Modifier::DIM))
             } else {
@@ -218,8 +251,18 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     };
     let description = app.description_of(selected.id).unwrap_or("");
 
-    let [title_area, description_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let blockers = app.blockers();
+    let blocked_by_height = if blockers.is_empty() {
+        0
+    } else {
+        u16::try_from(blockers.len() + 1).unwrap_or(u16::MAX)
+    };
+    let [title_area, description_area, blocked_by_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(blocked_by_height),
+    ])
+    .areas(area);
 
     let highlight = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -239,6 +282,26 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let description_line =
         Paragraph::new(format!("Description: {description}")).style(description_style);
     frame.render_widget(description_line, description_area);
+
+    if !blockers.is_empty() {
+        let mut lines = vec![Line::from("Blocked by:")];
+        lines.extend(blockers.iter().map(|blocker| {
+            Line::from(format!(
+                "  {} ({})",
+                blocker.title,
+                status_label(blocker.status)
+            ))
+        }));
+        frame.render_widget(Paragraph::new(lines), blocked_by_area);
+    }
+}
+
+/// Lowercase display name of a task status.
+fn status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Incomplete => "incomplete",
+        TaskStatus::Complete => "complete",
+    }
 }
 
 #[cfg(test)]
@@ -252,7 +315,7 @@ mod tests {
 
     use bala_core::{Core, InMemoryStore};
 
-    use super::{MAX_INDENT_DEPTH, draw};
+    use super::{BLOCKED_GLYPH, MAX_INDENT_DEPTH, draw};
     use crate::render::TaskRow;
     use crate::tui::app::{App, apply_action};
     use crate::tui::keymap::Action;
@@ -269,6 +332,7 @@ mod tests {
             collapsed: false,
             direct_summary: None,
             parent_id: None,
+            blocked: false,
         }
     }
 
@@ -646,6 +710,72 @@ mod tests {
     }
 
     #[test]
+    fn draw_should_render_the_blocked_glyph_on_blocked_rows() {
+        let free = row("Free task", TaskStatus::Incomplete);
+        let mut blocked = row("Blocked task", TaskStatus::Incomplete);
+        blocked.blocked = true;
+        let app = App::new(vec![free, blocked]);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area().width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .collect()
+        };
+        assert!(!row_text(0).contains(BLOCKED_GLYPH));
+        assert!(row_text(1).contains(BLOCKED_GLYPH));
+        assert!(row_text(1).contains("Blocked task"));
+    }
+
+    #[test]
+    fn completing_a_predecessor_should_clear_the_blocked_glyph() {
+        let mut core = core();
+        let new_task = |title: &str| bala_core::NewTask {
+            title: title.to_string(),
+            description: None,
+            parent_id: None,
+            type_key: None,
+            start_date: None,
+            due_date: None,
+            duration_days: None,
+            assignee_id: None,
+        };
+        let predecessor = core.create_task(new_task("Predecessor")).unwrap();
+        let successor = core.create_task(new_task("Successor")).unwrap();
+        core.add_dependency(
+            successor.id,
+            predecessor.id,
+            bala_core::DependencyType::default(),
+        )
+        .unwrap();
+        let tasks = core.get_tree(bala_core::TreeFilter::default()).unwrap();
+        let order = core.sibling_order().unwrap();
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains(BLOCKED_GLYPH));
+        assert!(app.rows()[1].blocked);
+
+        app.select_by_id(Some(predecessor.id));
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        assert!(!app.rows()[1].blocked);
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(!buffer_text(terminal.backend().buffer()).contains(BLOCKED_GLYPH));
+    }
+
+    #[test]
     fn draw_should_render_help_overlay_over_detail_pane_when_help_opened_from_detail() {
         let task_row = row("Write docs", TaskStatus::Incomplete);
         let mut app = App::new(vec![task_row]);
@@ -660,5 +790,114 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("Esc — Leave the Detail pane, back to the list"));
         assert!(text.contains("i — Edit title"));
+    }
+
+    /// An app over a seeded core where "Ship it" depends on a task per
+    /// `blocker_titles`, with "Ship it" selected and its Detail pane open.
+    fn blocked_detail_app(blocker_titles: &[&str]) -> (App, Core<InMemoryStore>) {
+        let mut core = core();
+        let new_task = |title: &str| bala_core::NewTask {
+            title: title.to_string(),
+            description: None,
+            parent_id: None,
+            type_key: None,
+            start_date: None,
+            due_date: None,
+            duration_days: None,
+            assignee_id: None,
+        };
+        let mut preds = Vec::new();
+        for title in blocker_titles {
+            preds.push(core.create_task(new_task(title)).unwrap());
+        }
+        let blocked = core.create_task(new_task("Ship it")).unwrap();
+        for pred in &preds {
+            core.add_dependency(blocked.id, pred.id, bala_core::DependencyType::default())
+                .unwrap();
+        }
+        let tasks = core.get_tree(bala_core::TreeFilter::default()).unwrap();
+        let order = core.sibling_order().unwrap();
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        app.select_by_id(Some(blocked.id));
+        // Reaching the row by navigation is what loads its blockers.
+        let _ = apply_action(&mut app, &mut core, Action::MoveUp);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        (app, core)
+    }
+
+    #[test]
+    fn draw_detail_should_list_each_blocker_with_title_and_status() {
+        let (app, _core) = blocked_detail_app(&["Design", "Review"]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Blocked by"));
+        assert!(text.contains("Design (incomplete)"));
+        assert!(text.contains("Review (incomplete)"));
+    }
+
+    #[test]
+    fn draw_detail_should_omit_the_blocked_by_section_when_unblocked() {
+        let (mut app, mut core) = blocked_detail_app(&["Design"]);
+        // Completing the only blocker unblocks the selected task.
+        let _ = apply_action(&mut app, &mut core, Action::LeaveDetail);
+        let _ = apply_action(&mut app, &mut core, Action::MoveUp);
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        assert_eq!(
+            app.selected_row().map(|r| r.title.as_str()),
+            Some("Ship it")
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Ship it"));
+        assert!(!text.contains("Blocked by"));
+    }
+
+    #[test]
+    fn draw_should_show_the_active_blocked_view_in_the_status_line() {
+        let mut app = App::new(vec![row("Write docs", TaskStatus::Incomplete)]);
+        let mut core = core();
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(!buffer_text(terminal.backend().buffer()).contains("view:"));
+
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("view: blocked"));
+
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("view: ready"));
+    }
+
+    #[test]
+    fn draw_should_list_the_blocked_view_key_in_the_help_overlay() {
+        let mut app = App::new(vec![row("Write docs", TaskStatus::Incomplete)]);
+        let mut core = core();
+        let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("b — Cycle the view: all, blocked, ready"));
     }
 }

@@ -58,8 +58,9 @@ impl Store for InMemoryStore {
 impl State {
     /// Clones a stored task as a read returns it: `parent_id` is taken from
     /// the parent edge and `depends_on` from the dependency edges, whatever
-    /// values `put_task` was handed. `progress` and `out_of_sync` come back
-    /// as the `0.0` and `false` that `put_task` stored.
+    /// values `put_task` was handed. `progress`, `out_of_sync` and
+    /// `blocked_by` come back as the `0.0`, `false` and empty list that
+    /// `put_task` stored.
     fn read_task(&self, task: &Task) -> Task {
         let mut task = task.clone();
         task.parent_id = self.parent_of.get(&task.id).copied().flatten();
@@ -95,9 +96,10 @@ impl StoreTx for State {
     }
 
     fn put_task(&mut self, task: &Task) -> Result<(), StoreError> {
-        // `progress` and `out_of_sync` are library-computed, never
-        // persisted (`bala-store`'s SQLite backend has no column for either
-        // and always reconstructs `0.0` and `false` on read) — reset them
+        // `progress`, `out_of_sync` and `blocked_by` are library-computed,
+        // never persisted (`bala-store`'s SQLite backend has no column for
+        // any of them and always reconstructs `0.0`, `false` and an empty
+        // list on read) — reset them
         // here too, so a caller driving `StoreTx` directly sees the same
         // non-persistence behavior regardless of which `Store` backend is
         // live. `Core` always recomputes the real values before returning a
@@ -106,6 +108,7 @@ impl StoreTx for State {
         let mut task = task.clone();
         task.progress = 0.0;
         task.out_of_sync = false;
+        task.blocked_by.clear();
         self.tasks.insert(task.id, task);
         Ok(())
     }
@@ -283,6 +286,7 @@ mod tests {
             assignee_id: None,
             depends_on: Vec::new(),
             out_of_sync: false,
+            blocked_by: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
