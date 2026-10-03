@@ -423,7 +423,7 @@ mod tests {
         let edges = store
             .transaction(|tx| tx.list_parent_edges(TaskId::new()))
             .unwrap();
-        assert!(edges.is_empty());
+        assert_eq!(edges, []);
     }
 
     // Unlike the `InMemoryStore` equivalent, these edge tests insert real
@@ -486,12 +486,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(null_edge_count(&store, a), 1);
-        assert!(
-            store
-                .transaction(|tx| tx.list_parent_edges(a))
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(store.transaction(|tx| tx.list_parent_edges(a)).unwrap(), []);
         assert_eq!(
             store.transaction(|tx| tx.list_child_edges(None)).unwrap(),
             vec![a]
@@ -573,11 +568,11 @@ mod tests {
             .transaction(|tx| tx.list_parent_edges(child.id))
             .unwrap();
         assert_eq!(edges, vec![c.id]);
-        assert!(
+        assert_eq!(
             store
                 .transaction(|tx| tx.list_child_edges(Some(a.id)))
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            []
         );
 
         store
@@ -586,7 +581,7 @@ mod tests {
         let edges = store
             .transaction(|tx| tx.list_parent_edges(child.id))
             .unwrap();
-        assert!(edges.is_empty());
+        assert_eq!(edges, []);
     }
 
     #[test]
@@ -1005,7 +1000,7 @@ mod tests {
         let children = store
             .transaction(|tx| tx.list_child_edges(Some(parent.id)))
             .unwrap();
-        assert!(children.is_empty());
+        assert_eq!(children, []);
     }
 
     #[test]
@@ -1201,7 +1196,7 @@ mod tests {
         let reverse = store
             .transaction(|tx| tx.list_dependency_edges(pred))
             .unwrap();
-        assert!(reverse.is_empty());
+        assert_eq!(reverse, []);
     }
 
     #[test]
@@ -1282,7 +1277,7 @@ mod tests {
         let of_leaf = store.transaction(|tx| tx.list_successor_edges(c)).unwrap();
 
         assert_eq!(successors, [c, a, b]);
-        assert!(of_leaf.is_empty());
+        assert_eq!(of_leaf, []);
     }
 
     #[test]
@@ -1356,11 +1351,11 @@ mod tests {
 
         assert!(missing_predecessor.is_err());
         assert!(missing_successor.is_err());
-        assert!(
+        assert_eq!(
             store
                 .transaction(|tx| tx.list_successor_edges(existing))
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            []
         );
     }
 
@@ -1391,7 +1386,7 @@ mod tests {
             ]
         );
         // The edge is directed: a predecessor does not depend on its successor.
-        assert!(predecessor.unwrap().depends_on.is_empty());
+        assert_eq!(predecessor.unwrap().depends_on, []);
     }
 
     #[test]
@@ -1456,7 +1451,7 @@ mod tests {
             task.depends_on.clone()
         };
         assert_eq!(listed.len(), 3);
-        assert!(depends_on(a.id).is_empty());
+        assert_eq!(depends_on(a.id), []);
         assert_eq!(depends_on(b.id), [dep(a.id, DependencyType::StartToFinish)]);
         assert_eq!(
             depends_on(c.id),
@@ -1495,7 +1490,7 @@ mod tests {
         let fetched = store.transaction(|tx| tx.get_task(succ.id)).unwrap();
 
         assert_eq!(edges, [dep(pred.id, DependencyType::FinishToStart)]);
-        assert!(of_other.is_empty());
+        assert_eq!(of_other, []);
         assert_eq!(
             fetched.unwrap().depends_on,
             [dep(pred.id, DependencyType::FinishToStart)]

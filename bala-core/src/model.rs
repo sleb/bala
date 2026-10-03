@@ -386,7 +386,7 @@ mod tests {
         let a = TaskId::new();
         let b = a;
         assert_eq!(a, b);
-        assert!(!format!("{a:?}").is_empty());
+        assert_ne!(format!("{a:?}"), "");
     }
 
     #[test]
@@ -444,7 +444,7 @@ mod tests {
 
         assert_eq!(task.title, "Write tests");
         assert_eq!(task.status, TaskStatus::Incomplete);
-        assert!(task.parent_ids.is_empty());
+        assert_eq!(task.parent_ids, []);
         assert!((task.progress - 0.0).abs() < f32::EPSILON);
     }
 

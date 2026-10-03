@@ -399,7 +399,7 @@ mod tests {
         let edges = store
             .transaction(|tx| tx.list_parent_edges(TaskId::new()))
             .unwrap();
-        assert!(edges.is_empty());
+        assert_eq!(edges, []);
     }
 
     #[test]
@@ -429,13 +429,13 @@ mod tests {
             .replace_parent_edges(a, &Parents::TopLevel, Placement::End)
             .unwrap();
         assert_eq!(store.list_child_edges(None).unwrap(), vec![a]);
-        assert!(store.list_parent_edges(a).unwrap().is_empty());
+        assert_eq!(store.list_parent_edges(a).unwrap(), []);
         // Moving under a real parent drops the NULL edge; moving back restores one.
         let p = TaskId::new();
         store
             .replace_parent_edges(a, &Parents::Under(vec![p]), Placement::End)
             .unwrap();
-        assert!(store.list_child_edges(None).unwrap().is_empty());
+        assert_eq!(store.list_child_edges(None).unwrap(), []);
         store
             .replace_parent_edges(a, &Parents::TopLevel, Placement::End)
             .unwrap();
@@ -488,18 +488,18 @@ mod tests {
 
         let edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();
         assert_eq!(edges, vec![c]);
-        assert!(
+        assert_eq!(
             store
                 .transaction(|tx| tx.list_child_edges(Some(a)))
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            []
         );
 
         store
             .transaction(|tx| tx.replace_parent_edges(child, &Parents::TopLevel, Placement::End))
             .unwrap();
         let edges = store.transaction(|tx| tx.list_parent_edges(child)).unwrap();
-        assert!(edges.is_empty());
+        assert_eq!(edges, []);
     }
 
     #[test]
@@ -627,7 +627,7 @@ mod tests {
         let edges = store
             .transaction(|tx| tx.list_child_edges(Some(TaskId::new())))
             .unwrap();
-        assert!(edges.is_empty());
+        assert_eq!(edges, []);
     }
 
     #[test]
@@ -877,7 +877,7 @@ mod tests {
         let reverse = store
             .transaction(|tx| tx.list_dependency_edges(pred))
             .unwrap();
-        assert!(reverse.is_empty());
+        assert_eq!(reverse, []);
     }
 
     #[test]
@@ -958,7 +958,7 @@ mod tests {
         let of_leaf = store.transaction(|tx| tx.list_successor_edges(c)).unwrap();
 
         assert_eq!(successors, [c, a, b]);
-        assert!(of_leaf.is_empty());
+        assert_eq!(of_leaf, []);
     }
 
     #[test]
@@ -1042,7 +1042,7 @@ mod tests {
             ]
         );
         // The edge is directed: a predecessor does not depend on its successor.
-        assert!(predecessor.unwrap().depends_on.is_empty());
+        assert_eq!(predecessor.unwrap().depends_on, []);
     }
 
     #[test]
@@ -1107,7 +1107,7 @@ mod tests {
             task.depends_on.clone()
         };
         assert_eq!(listed.len(), 3);
-        assert!(depends_on(a.id).is_empty());
+        assert_eq!(depends_on(a.id), []);
         assert_eq!(depends_on(b.id), [dep(a.id, DependencyType::StartToFinish)]);
         assert_eq!(
             depends_on(c.id),
@@ -1146,7 +1146,7 @@ mod tests {
         let fetched = store.transaction(|tx| tx.get_task(succ.id)).unwrap();
 
         assert_eq!(edges, [dep(pred.id, DependencyType::FinishToStart)]);
-        assert!(of_other.is_empty());
+        assert_eq!(of_other, []);
         assert_eq!(
             fetched.unwrap().depends_on,
             [dep(pred.id, DependencyType::FinishToStart)]

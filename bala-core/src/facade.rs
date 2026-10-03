@@ -1412,7 +1412,7 @@ mod tests {
 
         let task = core.create_task(minimal_new_task("Top level")).unwrap();
 
-        assert!(task.parent_ids.is_empty());
+        assert_eq!(task.parent_ids, []);
     }
 
     #[test]
@@ -2442,7 +2442,7 @@ mod tests {
         assert_eq!(outcome.deleted.len(), 1);
         assert_eq!(outcome.deleted[0].id, task.id);
         assert!(outcome.deleted[0].deleted_at.is_some());
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
 
         // A second delete on the same (now soft-deleted) task is treated
         // as not-found, not re-tombstoned.
@@ -2604,7 +2604,7 @@ mod tests {
             deleted_ids,
             HashSet::from([root.id, mid.id, leaf.id, deepest.id])
         );
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
 
         let tree = core
             .get_tree(TreeFilter {
@@ -2642,7 +2642,7 @@ mod tests {
 
         assert_eq!(outcome.deleted.len(), 5001);
         assert!(outcome.deleted.iter().all(|t| t.deleted_at.is_some()));
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
     }
 
     #[test]
@@ -2686,7 +2686,7 @@ mod tests {
 
         let tree = core.get_tree(TreeFilter::default()).unwrap();
         let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
-        assert!(child_after.parent_ids.is_empty());
+        assert_eq!(child_after.parent_ids, []);
     }
 
     #[test]
@@ -2988,7 +2988,7 @@ mod tests {
         let deleted_ids: HashSet<_> = outcome.deleted.iter().map(|t| t.id).collect();
         assert_eq!(outcome.deleted.len(), 3);
         assert_eq!(deleted_ids, HashSet::from([a.id, d.id, c.id]));
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
         assert!(outcome.updated.iter().all(|t| !deleted_ids.contains(&t.id)));
     }
 
@@ -3045,7 +3045,7 @@ mod tests {
 
         let deleted_ids: Vec<_> = outcome.deleted.iter().map(|t| t.id).collect();
         assert_eq!(deleted_ids, vec![parent.id]);
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
         let tree = core
             .get_tree(TreeFilter {
                 include_deleted: true,
@@ -3293,7 +3293,7 @@ mod tests {
 
         let second = core.complete_task(task.id, false).unwrap();
 
-        assert!(second.is_empty());
+        assert_eq!(second, []);
         let stored = core
             .get_tree(TreeFilter::default())
             .unwrap()
@@ -3412,7 +3412,7 @@ mod tests {
 
         assert_eq!(order.children_of(None), [r1.id, r2.id]);
         assert_eq!(order.children_of(Some(r1.id)), [child.id]);
-        assert!(order.children_of(Some(r2.id)).is_empty());
+        assert_eq!(order.children_of(Some(r2.id)), []);
     }
 
     #[test]
@@ -3683,7 +3683,7 @@ mod tests {
         assert!(changed);
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(g)), [p, x, after]);
-        assert!(order.children_of(Some(p)).is_empty());
+        assert_eq!(order.children_of(Some(p)), []);
         assert_eq!(core.get_task(x).unwrap().unwrap().parent_ids, [g]);
     }
 
@@ -3699,7 +3699,7 @@ mod tests {
         assert!(changed);
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(None), [p, x, next]);
-        assert!(core.get_task(x).unwrap().unwrap().parent_ids.is_empty());
+        assert_eq!(core.get_task(x).unwrap().unwrap().parent_ids, []);
     }
 
     #[test]
@@ -3732,7 +3732,7 @@ mod tests {
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(g)), [p, x]);
         assert_eq!(order.children_of(Some(q)), [x]);
-        assert!(order.children_of(Some(p)).is_empty());
+        assert_eq!(order.children_of(Some(p)), []);
     }
 
     #[test]
@@ -3747,7 +3747,7 @@ mod tests {
 
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(q)), [x]);
-        assert!(order.children_of(Some(p)).is_empty());
+        assert_eq!(order.children_of(Some(p)), []);
         assert!(!order.children_of(None).contains(&x));
     }
 
@@ -3778,7 +3778,7 @@ mod tests {
 
         let children = core.list_children(task.id).unwrap();
 
-        assert!(children.is_empty());
+        assert_eq!(children, []);
     }
 
     #[test]
@@ -3809,7 +3809,7 @@ mod tests {
 
         let children = core.list_children(missing).unwrap();
 
-        assert!(children.is_empty());
+        assert_eq!(children, []);
     }
 
     #[test]
@@ -3868,7 +3868,7 @@ mod tests {
 
         let updated = core.set_parents(task.id, Vec::new()).unwrap();
 
-        assert!(updated.parent_ids.is_empty());
+        assert_eq!(updated.parent_ids, []);
         let parent_children = core.list_children(parent.id).unwrap();
         assert!(!parent_children.iter().any(|t| t.id == task.id));
     }
@@ -4142,7 +4142,7 @@ mod tests {
         let stored = core.get_task(task.id).unwrap().unwrap();
         assert_eq!(stored.depends_on, expected);
         let stored_predecessor = core.get_task(predecessor.id).unwrap().unwrap();
-        assert!(stored_predecessor.depends_on.is_empty());
+        assert_eq!(stored_predecessor.depends_on, []);
     }
 
     #[test]
@@ -4212,7 +4212,7 @@ mod tests {
 
         assert!(matches!(result, Err(CoreError::SelfDependency(id)) if id == task.id));
         let stored = core.get_task(task.id).unwrap().unwrap();
-        assert!(stored.depends_on.is_empty());
+        assert_eq!(stored.depends_on, []);
         assert_eq!(stored.updated_at, task.updated_at);
     }
 
@@ -4237,7 +4237,7 @@ mod tests {
 
         assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
         let stored = core.get_task(task.id).unwrap().unwrap();
-        assert!(stored.depends_on.is_empty());
+        assert_eq!(stored.depends_on, []);
         assert_eq!(stored.updated_at, task.updated_at);
     }
 
@@ -4253,7 +4253,7 @@ mod tests {
 
         assert!(matches!(result, Err(CoreError::NotFound(id)) if id == predecessor.id));
         let stored = core.get_task(task.id).unwrap().unwrap();
-        assert!(stored.depends_on.is_empty());
+        assert_eq!(stored.depends_on, []);
     }
 
     #[test]
@@ -4438,10 +4438,10 @@ mod tests {
         assert!(matches!(upward, Err(CoreError::DependsOnRelative { .. })));
         assert!(matches!(downward, Err(CoreError::DependsOnRelative { .. })));
         let task_after = core.get_task(task.id).unwrap().unwrap();
-        assert!(task_after.depends_on.is_empty());
+        assert_eq!(task_after.depends_on, []);
         assert_eq!(task_after.updated_at, task_before.updated_at);
         let parent_after = core.get_task(parent.id).unwrap().unwrap();
-        assert!(parent_after.depends_on.is_empty());
+        assert_eq!(parent_after.depends_on, []);
         assert_eq!(parent_after.updated_at, parent_before.updated_at);
     }
 
@@ -4461,7 +4461,7 @@ mod tests {
             Err(CoreError::CircularDependency { cycle }) if cycle == vec![a.id, b.id, a.id]
         ));
         let a_after = core.get_task(a.id).unwrap().unwrap();
-        assert!(a_after.depends_on.is_empty());
+        assert_eq!(a_after.depends_on, []);
         assert_eq!(a_after.updated_at, a_before.updated_at);
     }
 
@@ -4483,7 +4483,7 @@ mod tests {
             Err(CoreError::CircularDependency { cycle }) if cycle == vec![a.id, c.id, b.id, a.id]
         ));
         let stored = core.get_task(a.id).unwrap().unwrap();
-        assert!(stored.depends_on.is_empty());
+        assert_eq!(stored.depends_on, []);
     }
 
     #[test]
@@ -4597,7 +4597,7 @@ mod tests {
             Err(CoreError::CircularDependency { cycle }) if cycle == vec![a.id, c.id, b.id, a.id]
         ));
         let stored = core.get_task(a.id).unwrap().unwrap();
-        assert!(stored.depends_on.is_empty());
+        assert_eq!(stored.depends_on, []);
     }
 
     #[test]
@@ -4612,10 +4612,10 @@ mod tests {
         let updated = core.remove_dependency(task.id, predecessor.id).unwrap();
 
         assert_eq!(updated.id, task.id);
-        assert!(updated.depends_on.is_empty());
+        assert_eq!(updated.depends_on, []);
         assert!(updated.updated_at >= with_edge.updated_at);
         let stored = core.get_task(task.id).unwrap().unwrap();
-        assert!(stored.depends_on.is_empty());
+        assert_eq!(stored.depends_on, []);
         assert_eq!(stored.updated_at, updated.updated_at);
     }
 
@@ -4718,9 +4718,9 @@ mod tests {
 
         let updated = core.remove_dependency(task.id, predecessor.id).unwrap();
 
-        assert!(updated.depends_on.is_empty());
+        assert_eq!(updated.depends_on, []);
         let stored = core.get_task(task.id).unwrap().unwrap();
-        assert!(stored.depends_on.is_empty());
+        assert_eq!(stored.depends_on, []);
     }
 
     #[test]
