@@ -4,9 +4,10 @@
 //!
 //! `parent_id` and `depends_on` are not columns: reads fill them from the
 //! `parent_edges` and `dependency_edges` tables, and `put_task` writes
-//! neither, so the edge tables are their only source. `progress` and
-//! `out_of_sync` are not columns either: `Core` computes both on read, so a
-//! row always reads back `0.0` and `false` and `put_task` writes neither.
+//! neither, so the edge tables are their only source. `progress`,
+//! `out_of_sync` and `blocked_by` are not columns either: `Core` computes
+//! them on read, so a row always reads back `0.0`, `false` and an empty list
+//! and `put_task` writes none of them.
 
 use bala_core::{StoreError, Task, TaskId, TreeFilter};
 use rusqlite::{OptionalExtension, Row, ToSql, Transaction, params};
@@ -59,6 +60,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
             // Not a stored column either: `Core` computes it from the
             // task's dependencies on every read.
             out_of_sync: false,
+            blocked_by: Vec::new(),
             created_at: timestamp_from_text(&created_at)?,
             updated_at: timestamp_from_text(&updated_at)?,
             completed_at: completed_at.map(|s| timestamp_from_text(&s)).transpose()?,

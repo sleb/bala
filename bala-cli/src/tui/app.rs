@@ -20,6 +20,71 @@ use crate::render::{self, TaskRow};
 use crate::tui::keymap::{Action, key_to_action};
 use crate::tui::mode::{DetailField, EditableField, Mode, Pane, PendingAction};
 
+/// One task blocking the selected row, as shown in the Detail pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocker {
+    /// The blocking task's title.
+    pub title: String,
+    /// The blocking task's current status.
+    pub status: TaskStatus,
+}
+
+/// Which tasks the list shows with respect to dependency blocking.
+///
+/// Blockedness comes from `Task::blocked_by` (a task with a live incomplete
+/// predecessor), so it is the same whichever view is active; the view only
+/// chooses which tasks are listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockedView {
+    /// Every task.
+    #[default]
+    All,
+    /// Only tasks waiting on an incomplete predecessor.
+    Blocked,
+    /// Only incomplete tasks that are not blocked.
+    Ready,
+}
+
+impl BlockedView {
+    /// The view after this one in the cycle `All -> Blocked -> Ready -> All`.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Blocked,
+            Self::Blocked => Self::Ready,
+            Self::Ready => Self::All,
+        }
+    }
+
+    /// Lowercase name shown in the status line.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Blocked => "blocked",
+            Self::Ready => "ready",
+        }
+    }
+
+    /// The view named by `label` (the inverse of [`BlockedView::label`]),
+    /// or `None` when `label` names no view.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        [Self::All, Self::Blocked, Self::Ready]
+            .into_iter()
+            .find(|view| view.label() == label)
+    }
+
+    /// Whether `task` is listed under this view.
+    fn includes(self, task: &Task) -> bool {
+        match self {
+            Self::All => true,
+            Self::Blocked => !task.blocked_by.is_empty(),
+            Self::Ready => task.status == TaskStatus::Incomplete && task.blocked_by.is_empty(),
+        }
+    }
+}
+
 /// Selection state over an in-memory list of task rows, plus the current
 /// interaction mode and any inline error to display.
 ///
@@ -58,6 +123,14 @@ pub struct App {
     /// them. Populated once at startup by `tui::mod::run` (via
     /// [`App::with_type_filter_state`]) from `Core::list_task_types()`.
     available_type_keys: Vec<String>,
+    /// The tasks blocking the selected row, in dependency order. Loaded
+    /// with `Core::get_task` per id by `reload_blockers`, so blockers the
+    /// type filter hides from `rows` are still listed.
+    blockers: Vec<Blocker>,
+    /// The active blocked/ready view, cycled by `Action::CycleBlockedView`
+    /// (`b`). Applied together with the type filter whenever `rows` are
+    /// derived from `tasks`.
+    blocked_view: BlockedView,
 }
 
 impl App {
@@ -86,6 +159,8 @@ impl App {
             pending_d: false,
             type_filter: None,
             available_type_keys: Vec::new(),
+            blockers: Vec::new(),
+            blocked_view: BlockedView::default(),
         }
     }
 
@@ -167,6 +242,17 @@ impl App {
         self
     }
 
+    /// Sets the active blocked/ready view and re-derives `rows` from it,
+    /// letting `tui::mod::run` restore a persisted view at startup. Call
+    /// after [`App::with_tasks`], since the rows are rebuilt from the cached
+    /// tasks.
+    #[must_use]
+    pub fn with_blocked_view(mut self, blocked_view: BlockedView) -> Self {
+        self.blocked_view = blocked_view;
+        self.rebuild_rows();
+        self
+    }
+
     /// Moves the selection down by one row, clamping at the last row.
     /// No-op when there are no rows.
     pub fn move_down(&mut self) {
@@ -223,6 +309,12 @@ impl App {
         &self.collapsed
     }
 
+    /// Returns the active blocked/ready view.
+    #[must_use]
+    pub fn blocked_view(&self) -> BlockedView {
+        self.blocked_view
+    }
+
     /// Returns the active type filter, for `tui::mod::run` to persist into
     /// `ViewState.filter_type_key` on quit.
     #[must_use]
@@ -240,6 +332,13 @@ impl App {
     #[must_use]
     pub fn detail_field(&self) -> DetailField {
         self.detail_field
+    }
+
+    /// Returns the tasks blocking the selected row (empty when it is not
+    /// blocked or nothing is selected).
+    #[must_use]
+    pub fn blockers(&self) -> &[Blocker] {
+        &self.blockers
     }
 
     /// Returns the description of the task with `id`, or `None` when it has
@@ -267,6 +366,32 @@ impl App {
         }
     }
 
+    /// Projects the cached `tasks` into rows, keeping only the tasks the
+    /// active [`BlockedView`] lists. A task whose parent is filtered out
+    /// renders at top level. Blockedness is read from each task's own
+    /// `blocked_by`, so it does not depend on which tasks are listed.
+    fn build_rows(&self) -> Vec<TaskRow> {
+        let visible: Vec<Task>;
+        let tasks = if self.blocked_view == BlockedView::All {
+            &self.tasks
+        } else {
+            visible = self
+                .tasks
+                .iter()
+                .filter(|task| self.blocked_view.includes(task))
+                .cloned()
+                .collect();
+            &visible
+        };
+        render::task_rows(
+            tasks,
+            &self.sibling_order,
+            &self.type_labels,
+            &self.user_names,
+            &self.collapsed,
+        )
+    }
+
     /// Re-derives `rows` from `tasks`/`type_labels`/`user_names`/`collapsed`,
     /// reselecting the row that was focused before the rebuild so a
     /// collapse/expand never loses the user's place. `CollapseFocused`/
@@ -279,13 +404,7 @@ impl App {
     /// (differently-shaped) `rows`.
     fn rebuild_rows(&mut self) {
         let selected_id = self.selected_row().map(|row| row.id);
-        self.rows = render::task_rows(
-            &self.tasks,
-            &self.sibling_order,
-            &self.type_labels,
-            &self.user_names,
-            &self.collapsed,
-        );
+        self.rows = self.build_rows();
         if let Some(id) = selected_id {
             self.select_id_or_nearest_visible_ancestor(id);
         }
@@ -366,12 +485,58 @@ pub fn handle_key<S: Store>(app: &mut App, core: &mut Core<S>, key: KeyEvent) ->
 /// `Mode::Confirm` for `PendingAction::Delete`/`DeleteWithChildren` with
 /// `mode` (see `confirm_delete`); in any other mode it does nothing. `Noop`
 /// does nothing.
-#[allow(clippy::too_many_lines)] // one big dispatch table by design; see doc comment above
+///
+/// After every action except `InsertChar`/`Backspace` the selected row's
+/// blockers are reloaded (see `reload_blockers`), so every selection change
+/// and tree refresh is covered without each call site repeating it. The two
+/// keystroke actions only edit the buffer, so they skip the store reads.
 pub fn apply_action<S: Store>(
     app: &mut App,
     core: &mut Core<S>,
     action: Action,
 ) -> ControlFlow<()> {
+    let edits_buffer_only = matches!(action, Action::InsertChar(_) | Action::Backspace);
+    let flow = dispatch_action(app, core, action);
+    if !edits_buffer_only {
+        reload_blockers(app, core);
+    }
+    flow
+}
+
+/// Reloads `app.blockers` for the selected row: one `Core::get_task` per id
+/// in the row's `blocked_by`, so blockers hidden from `rows` by the type
+/// filter are still listed. A blocker that no longer exists is skipped; a
+/// backend failure sets `app.error` (unless an error is already shown) and
+/// leaves the list empty.
+pub fn reload_blockers<S: Store>(app: &mut App, core: &Core<S>) {
+    app.blockers.clear();
+    let Some(id) = app.selected_row().map(|row| row.id) else {
+        return;
+    };
+    let Some(task) = app.tasks.iter().find(|task| task.id == id) else {
+        return;
+    };
+    let blocked_by = task.blocked_by.clone();
+    for blocker_id in blocked_by {
+        match core.get_task(blocker_id) {
+            Ok(Some(blocker)) => app.blockers.push(Blocker {
+                title: blocker.title,
+                status: blocker.status,
+            }),
+            Ok(None) => {}
+            Err(err) => {
+                if app.error.is_none() {
+                    app.error = Some(err.to_string());
+                }
+                app.blockers.clear();
+                return;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one big dispatch table by design; see `apply_action`
+fn dispatch_action<S: Store>(app: &mut App, core: &mut Core<S>, action: Action) -> ControlFlow<()> {
     // Every action other than `DKeyPressed` itself resets `pending_d`, so a
     // `d`, some unrelated action, `d` sequence doesn't count as two
     // consecutive presses. `was_pending_d` captures the value as it stood
@@ -504,6 +669,12 @@ pub fn apply_action<S: Store>(
         Action::CycleTypeFilter => {
             cycle_type_filter(app);
             refresh_rows_from_tree(app, core, app.selected_row().map(|row| row.id));
+            ControlFlow::Continue(())
+        }
+        Action::CycleBlockedView => {
+            app.blocked_view = app.blocked_view.next();
+            let selected = app.selected_row().map(|row| row.id);
+            refresh_rows_from_tree(app, core, selected);
             ControlFlow::Continue(())
         }
         Action::MoveTaskDown => {
@@ -690,7 +861,9 @@ fn cycle_type_filter(app: &mut App) {
 /// `PendingAction::CompleteCascade(id)` and a prompt naming the task and the
 /// incomplete-child count; on any other error sets `app.error`. For a
 /// `Complete` task, calls `Core::reopen_task(id)` and refreshes that task's
-/// rows on success (mirroring the same error-handling shape).
+/// rows on success (mirroring the same error-handling shape). Either way a
+/// successful call also re-reads the tree from `Core`, since changing a
+/// task's status changes which *other* tasks are blocked.
 fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
     let Some(row) = app.selected_row() else {
         return;
@@ -703,6 +876,7 @@ fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
             Ok(touched) => {
                 refresh_row_statuses(app, &touched);
                 app.error = None;
+                refresh_rows_from_tree(app, core, Some(id));
             }
             Err(CoreError::IncompleteChildren { incomplete, .. }) => {
                 let count = incomplete.len();
@@ -721,6 +895,7 @@ fn handle_toggle_complete<S: Store>(app: &mut App, core: &mut Core<S>) {
             Ok(task) => {
                 refresh_row_statuses(app, std::slice::from_ref(&task));
                 app.error = None;
+                refresh_rows_from_tree(app, core, Some(id));
             }
             Err(err) => {
                 app.error = Some(err.to_string());
@@ -973,8 +1148,9 @@ fn confirm_yes<S: Store>(app: &mut App, core: &mut Core<S>) {
         PendingAction::CompleteCascade(id) => match core.complete_task(id, true) {
             Ok(touched) => {
                 refresh_row_statuses(app, &touched);
-                app.mode = Mode::Normal;
                 app.error = None;
+                refresh_rows_from_tree(app, core, Some(id));
+                app.mode = Mode::Normal;
             }
             Err(err) => {
                 app.mode = Mode::Normal;
@@ -1218,13 +1394,7 @@ fn refresh_rows_from_tree<S: Store>(app: &mut App, core: &mut Core<S>, select_id
             }
             app.tasks = tasks;
             app.sibling_order = sibling_order;
-            app.rows = render::task_rows(
-                &app.tasks,
-                &app.sibling_order,
-                &app.type_labels,
-                &app.user_names,
-                &app.collapsed,
-            );
+            app.rows = app.build_rows();
             app.selected = select_id
                 .and_then(|id| app.rows.iter().position(|row| row.id == id))
                 .or(if app.rows.is_empty() { None } else { Some(0) });
@@ -1414,6 +1584,7 @@ mod tests {
             collapsed: false,
             direct_summary: None,
             parent_id: None,
+            blocked: false,
         }
     }
 
@@ -2122,6 +2293,106 @@ mod tests {
     }
 
     #[test]
+    fn toggle_complete_should_keep_the_error_when_the_tree_refresh_fails() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let order = core.sibling_order().expect("sibling_order should succeed");
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        app.select_by_id(Some(a.id));
+        // The completion commits; the tree re-read then fails.
+        remaining.set(Some(1));
+
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        assert!(app.error().is_some());
+    }
+
+    #[test]
+    fn reload_blockers_should_not_replace_an_error_already_shown() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        let pred = core.create_task(minimal_new_task("Pred")).expect("create");
+        let blocked = core
+            .create_task(minimal_new_task("Blocked"))
+            .expect("create");
+        core.add_dependency(blocked.id, pred.id, bala_core::DependencyType::default())
+            .expect("add dependency");
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let order = core.sibling_order().expect("sibling_order should succeed");
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        app.select_by_id(Some(blocked.id));
+        app.error = Some("original".to_string());
+        remaining.set(Some(0));
+
+        super::reload_blockers(&mut app, &core);
+
+        assert_eq!(app.error(), Some("original"));
+    }
+
+    #[test]
+    fn apply_action_insert_char_should_not_reload_blockers() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        let pred = core.create_task(minimal_new_task("Pred")).expect("create");
+        let blocked = core
+            .create_task(minimal_new_task("Blocked"))
+            .expect("create");
+        core.add_dependency(blocked.id, pred.id, bala_core::DependencyType::default())
+            .expect("add dependency");
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let order = core.sibling_order().expect("sibling_order should succeed");
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        app.select_by_id(Some(blocked.id));
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewTitle);
+        remaining.set(Some(0));
+
+        let _ = apply_action(&mut app, &mut core, Action::InsertChar('x'));
+
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
     fn apply_action_confirm_no_should_return_to_normal_without_calling_delete_task() {
         let mut core = core();
         let task = core
@@ -2714,6 +2985,7 @@ mod tests {
             collapsed: false,
             direct_summary: None,
             parent_id: None,
+            blocked: false,
         }
     }
 
@@ -4009,5 +4281,200 @@ mod tests {
 
         assert_eq!(app.rows(), []);
         assert_eq!(app.selected_index(), None);
+    }
+
+    #[test]
+    fn selecting_a_blocked_task_should_load_its_blockers() {
+        let mut core = core();
+        let first = core.create_task(minimal_new_task("First blocker")).unwrap();
+        let second = core
+            .create_task(minimal_new_task("Second blocker"))
+            .unwrap();
+        let blocked = core.create_task(minimal_new_task("Blocked")).unwrap();
+        for pred in [&first, &second] {
+            core.add_dependency(blocked.id, pred.id, bala_core::DependencyType::default())
+                .unwrap();
+        }
+        let mut app = app_from_core(&mut core);
+        assert_eq!(app.blockers(), []);
+
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+
+        assert_eq!(
+            app.blockers(),
+            [
+                super::Blocker {
+                    title: "First blocker".to_string(),
+                    status: TaskStatus::Incomplete
+                },
+                super::Blocker {
+                    title: "Second blocker".to_string(),
+                    status: TaskStatus::Incomplete
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn refresh_should_drop_a_blocker_once_it_is_completed() {
+        let mut core = core();
+        let first = core.create_task(minimal_new_task("First blocker")).unwrap();
+        let second = core
+            .create_task(minimal_new_task("Second blocker"))
+            .unwrap();
+        let blocked = core.create_task(minimal_new_task("Blocked")).unwrap();
+        for pred in [&first, &second] {
+            core.add_dependency(blocked.id, pred.id, bala_core::DependencyType::default())
+                .unwrap();
+        }
+        let mut app = app_from_core(&mut core);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        assert_eq!(app.blockers().len(), 2);
+
+        // Complete the first blocker, then come back to the blocked row.
+        let _ = apply_action(&mut app, &mut core, Action::MoveUp);
+        let _ = apply_action(&mut app, &mut core, Action::MoveUp);
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+
+        assert_eq!(app.selected_row().map(|r| r.id), Some(blocked.id));
+        let titles: Vec<&str> = app.blockers().iter().map(|b| b.title.as_str()).collect();
+        assert_eq!(titles, ["Second blocker"]);
+    }
+
+    /// Seeds `Blocker` (incomplete, blocks `Blocked`), `Blocked`, `Free`
+    /// (neither) and `Done` (complete), all untyped.
+    fn blocked_view_fixture() -> (Core<InMemoryStore>, App) {
+        let mut core = core();
+        let pred = core.create_task(minimal_new_task("Blocker")).unwrap();
+        let waiting = core.create_task(minimal_new_task("Blocked")).unwrap();
+        core.create_task(minimal_new_task("Free")).unwrap();
+        let done = core.create_task(minimal_new_task("Done")).unwrap();
+        core.add_dependency(waiting.id, pred.id, bala_core::DependencyType::default())
+            .unwrap();
+        core.complete_task(done.id, false).unwrap();
+        let app = app_from_core(&mut core);
+        (core, app)
+    }
+
+    #[test]
+    fn cycle_blocked_view_should_step_all_blocked_ready_all() {
+        let (mut core, mut app) = blocked_view_fixture();
+        assert_eq!(app.blocked_view(), super::BlockedView::All);
+
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        assert_eq!(app.blocked_view(), super::BlockedView::Blocked);
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        assert_eq!(app.blocked_view(), super::BlockedView::Ready);
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        assert_eq!(app.blocked_view(), super::BlockedView::All);
+    }
+
+    #[test]
+    fn blocked_view_should_show_only_tasks_with_blocked_by() {
+        let (mut core, mut app) = blocked_view_fixture();
+
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+
+        assert_eq!(titles(&app), ["Blocked"]);
+        assert!(app.rows()[0].blocked);
+        assert_eq!(app.blockers().len(), 1);
+    }
+
+    #[test]
+    fn ready_view_should_show_only_incomplete_unblocked_tasks() {
+        let (mut core, mut app) = blocked_view_fixture();
+
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+
+        assert_eq!(titles(&app), ["Blocker", "Free"]);
+        assert_eq!(
+            app.selected_row().map(|r| r.title.as_str()),
+            Some("Blocker")
+        );
+    }
+
+    #[test]
+    fn blocked_view_should_compose_with_the_type_filter() {
+        let mut core = core();
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .unwrap();
+        let blocker = core.create_task(minimal_new_task("Blocker")).unwrap();
+        let blocked_goal = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Blocked goal")
+            })
+            .unwrap();
+        let blocked_plain = core.create_task(minimal_new_task("Blocked plain")).unwrap();
+        for id in [blocked_goal.id, blocked_plain.id] {
+            core.add_dependency(id, blocker.id, bala_core::DependencyType::default())
+                .unwrap();
+        }
+        let mut app = app_from_core(&mut core)
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+
+        assert_eq!(titles(&app), ["Blocked goal"]);
+    }
+
+    #[test]
+    fn blocked_view_should_render_a_child_of_a_filtered_out_parent_at_top_level() {
+        let mut core = core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child = child_of(&mut core, "Child", parent.id);
+        let blocker = core.create_task(minimal_new_task("Blocker")).unwrap();
+        core.add_dependency(child.id, blocker.id, bala_core::DependencyType::default())
+            .unwrap();
+        let mut app = app_from_core(&mut core);
+
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+
+        assert_eq!(titles(&app), ["Child"]);
+        assert_eq!(app.rows()[0].depth, 0);
+    }
+
+    #[test]
+    fn blocked_view_should_keep_selection_valid_when_the_selected_row_is_filtered_out() {
+        let (mut core, mut app) = blocked_view_fixture();
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        assert_eq!(app.selected_row().map(|r| r.title.as_str()), Some("Done"));
+
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+
+        assert_eq!(
+            app.selected_row().map(|r| r.title.as_str()),
+            Some("Blocked")
+        );
+    }
+
+    #[test]
+    fn blocked_view_should_persist_across_a_tree_refresh() {
+        let (mut core, mut app) = blocked_view_fixture();
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+
+        // Completing the only blocker unblocks "Blocked"; the next refresh
+        // keeps the Blocked view and now lists nothing.
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        super::refresh_rows_from_tree(&mut app, &mut core, None);
+        assert_eq!(titles(&app), ["Blocked"]);
+        let blocker = app.tasks.iter().find(|t| t.title == "Blocker").unwrap().id;
+        core.complete_task(blocker, false).unwrap();
+        super::refresh_rows_from_tree(&mut app, &mut core, None);
+
+        assert_eq!(app.rows(), []);
+        assert_eq!(app.blocked_view(), super::BlockedView::Blocked);
     }
 }

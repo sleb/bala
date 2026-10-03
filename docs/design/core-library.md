@@ -114,6 +114,10 @@ pub struct Task {
     pub out_of_sync: bool,          // true while its dates break one of
                                      // its dependencies; computed on read
                                      // (§Algorithm 3), never stored
+    pub blocked_by: Vec<TaskId>,    // live, incomplete predecessors, in
+                                     // depends_on order; any dependency
+                                     // type blocks; computed on read,
+                                     // never stored
     pub progress: f32,              // 0.0..=1.0, library-computed, read-only
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -378,8 +382,8 @@ dependencies in `depends_on`, so no edge is fetched separately. The
 tasks are handed to the pass in `get_tree`'s order, so the result is the
 same on every call: `out_of_sync` is in that order, and `moved` has
 predecessors before successors, unrelated tasks in that order. Every
-`Task` in the result has `progress` and `out_of_sync` filled like any
-other task `Core` returns, `out_of_sync` against the dates of the state
+`Task` in the result has `progress`, `out_of_sync` and `blocked_by` filled
+like any other task `Core` returns, `out_of_sync` against the dates of the state
 it describes: current for `before`, scheduled for `after` and for the
 `out_of_sync` list.
 
@@ -511,7 +515,10 @@ dependency is reported, not corrected:
   sync**, whoever's dates changed: the task's own, or a predecessor's.
   The flag sits on the successor, whether its dates are fixed or not. A
   task with several predecessor edges (possibly of different types) is
-  out of sync if *any* one of them is violated.
+  out of sync if *any* one of them is violated. A completed task is never
+  out of sync, whatever its dates: the scheduler never moves it, so
+  flagging it would be noise. It still anchors its successors, which are
+  checked against its dates as usual.
 - **The flag is computed on read, never stored.** `Core` fills
   `out_of_sync` on every `Task` it returns (`get_task`, `get_tree`,
   `list_children`, and each task a mutation returns) by checking
@@ -519,6 +526,17 @@ dependency is reported, not corrected:
   transaction as the read. Moving dates back into line, or removing the
   broken dependency, therefore clears it with nothing further to write.
   `Store::put_task` ignores the field.
+- **`blocked_by` lists the predecessors a task is waiting on.** It holds
+  the live, incomplete predecessors in `depends_on` order, whatever the
+  dependency type and whatever the dates. A completed or soft-deleted
+  predecessor does not block, and a completed or soft-deleted task is
+  blocked by nothing. Like `out_of_sync` it is computed on read and never stored.
+  `Core` fills it wherever it fills `out_of_sync`, including on each task a
+  mutation returns, and `get_tree` counts a predecessor its filter hides.
+  A mutation returns only the tasks whose own rows it changed, so a
+  successor that gains or loses a blocker because a predecessor was
+  completed, reopened or deleted is not returned unless it was touched for
+  another reason; a caller that shows it re-reads it.
 - **Some edges constrain nothing.** An edge whose anchor date or
   constrained date is unset is satisfied whatever the other is, and so is
   an edge whose predecessor is soft-deleted (the edge itself is kept, and
@@ -600,8 +618,9 @@ fn plan(tasks) -> Schedule {
   `after` differs only in the two dates and in `out_of_sync`. A moved
   task stays floating and its `updated_at` is untouched. `out_of_sync`
   lists, in list order, each live task that still breaks a dependency at
-  the planned dates: tasks with fixed dates and completed tasks, which
-  the pass may not move.
+  the planned dates: tasks with fixed dates, which the pass may not move.
+  A completed task is never listed, though it keeps its dates and anchors
+  its successors.
 - **Idempotence.** Every task that can move ends with `start ≥ S` and
   `due ≥ F`, and with no date left for its duration to fill, so running
   `plan` on its own result moves nothing.

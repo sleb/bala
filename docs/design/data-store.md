@@ -149,6 +149,7 @@ CREATE TABLE tasks (
 );
 -- progress is library-computed on read (Core LLD §Algorithm 4) — no column.
 -- out_of_sync likewise (Core LLD §Algorithm 3) — no column.
+-- blocked_by likewise (Core LLD §Algorithm 3) — no column.
 
 CREATE INDEX idx_tasks_type_live     ON tasks(type_key)     WHERE deleted_at IS NULL;
 CREATE INDEX idx_tasks_status_live   ON tasks(status)       WHERE deleted_at IS NULL;

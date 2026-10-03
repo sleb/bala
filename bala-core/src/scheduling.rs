@@ -4,7 +4,7 @@
 //!
 //! [`anchor_date`] and [`constraint_ok`] are the two per-type functions:
 //! which of the predecessor's dates a dependency type reads, and whether a
-//! successor's dates respect it. [`is_out_of_sync`] applies them to every
+//! successor's dates respect it. [`dependency_state`] applies them to every
 //! dependency of one task, and only reports a broken one. [`plan`] works
 //! out the dates that would mend them, over a list of tasks it is handed:
 //! it reads no store and writes nothing. `Core::preview_schedule` returns
@@ -76,20 +76,44 @@ pub fn constraint_ok(dep_type: DependencyType, predecessor: &Task, successor: &T
     }
 }
 
-/// Whether `task`'s dates break at least one of its dependencies, read from
-/// `task.depends_on`. Each predecessor is fetched with
+/// What `task`'s dependencies make of it: whether its dates break at least
+/// one of them (out of sync) and which predecessors it is waiting on
+/// (`blocked_by`, see [`blockers_of`]). Each predecessor is fetched once with
 /// [`StoreTx::get_task`] inside the caller's transaction, so a soft-deleted
-/// one does not resolve and constrains nothing. A soft-deleted `task` is
-/// never out of sync.
+/// one does not resolve: it constrains and blocks nothing. A soft-deleted or
+/// completed `task` is neither out of sync nor blocked; a completed task
+/// still anchors its successors.
 ///
 /// # Errors
 ///
 /// Returns `Err` if the backend fails while fetching a predecessor.
-pub fn is_out_of_sync(tx: &mut dyn StoreTx, task: &Task) -> Result<bool, StoreError> {
-    breaks_a_dependency(task, |id| Ok(tx.get_task(id)?.map(Cow::Owned)))
+pub fn dependency_state(
+    tx: &mut dyn StoreTx,
+    task: &Task,
+) -> Result<(bool, Vec<TaskId>), StoreError> {
+    let mut predecessors: HashMap<TaskId, Option<Task>> = HashMap::new();
+    for dependency in &task.depends_on {
+        let id = dependency.predecessor_id;
+        if let std::collections::hash_map::Entry::Vacant(slot) = predecessors.entry(id) {
+            slot.insert(tx.get_task(id)?);
+        }
+    }
+    let resolve = |id: TaskId| {
+        Ok::<_, Infallible>(
+            predecessors
+                .get(&id)
+                .and_then(Option::as_ref)
+                .map(Cow::Borrowed),
+        )
+    };
+    let (Ok(out_of_sync), Ok(blocked_by)) = (
+        breaks_a_dependency(task, resolve),
+        blockers_of(task, resolve),
+    );
+    Ok((out_of_sync, blocked_by))
 }
 
-/// [`is_out_of_sync`] over any source of live tasks: `live_task` resolves a
+/// The out-of-sync half of [`dependency_state`] over any source of live tasks: `live_task` resolves a
 /// predecessor id to its task, or to `None` if it is soft-deleted or
 /// missing. A caller that already holds some of the predecessors hands
 /// them over borrowed instead of having them fetched again. Stops at the
@@ -102,7 +126,7 @@ pub fn breaks_a_dependency<'a, E>(
     task: &Task,
     mut live_task: impl FnMut(TaskId) -> Result<Option<Cow<'a, Task>>, E>,
 ) -> Result<bool, E> {
-    if task.deleted_at.is_some() {
+    if task.deleted_at.is_some() || task.status == TaskStatus::Complete {
         return Ok(false);
     }
     for dependency in &task.depends_on {
@@ -113,6 +137,32 @@ pub fn breaks_a_dependency<'a, E>(
         }
     }
     Ok(false)
+}
+
+/// The live, incomplete predecessors of `task`, in the order of
+/// `task.depends_on`, over any source of live tasks, resolved like
+/// [`breaks_a_dependency`] resolves them. Every dependency type blocks the
+/// same way, whatever the dates.
+///
+/// # Errors
+///
+/// Returns whatever `live_task` fails with.
+pub fn blockers_of<'a, E>(
+    task: &Task,
+    mut live_task: impl FnMut(TaskId) -> Result<Option<Cow<'a, Task>>, E>,
+) -> Result<Vec<TaskId>, E> {
+    let mut blockers = Vec::new();
+    if task.deleted_at.is_some() || task.status == TaskStatus::Complete {
+        return Ok(blockers);
+    }
+    for dependency in &task.depends_on {
+        if let Some(predecessor) = live_task(dependency.predecessor_id)?
+            && predecessor.status == TaskStatus::Incomplete
+        {
+            blockers.push(dependency.predecessor_id);
+        }
+    }
+    Ok(blockers)
 }
 
 /// Computes a schedule for `tasks` (LLD §Algorithm 3): the dates each
@@ -481,6 +531,7 @@ mod tests {
             assignee_id: None,
             depends_on: Vec::new(),
             out_of_sync: false,
+            blocked_by: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -1137,14 +1188,13 @@ mod tests {
         let mut done = finish_to_start(task(Some(3), Some(9)), &predecessor);
         done.status = TaskStatus::Complete;
         done.completed_at = Some(Utc::now());
-        let done_id = done.id;
         let next = finish_to_start(task(Some(4), Some(6)), &done);
         let next_id = next.id;
 
         let schedule = plan(vec![predecessor, done, next]);
 
         assert_eq!(moves(&schedule), [(next_id, Some(9), Some(11))]);
-        assert_eq!(ids(&schedule.out_of_sync), [done_id]);
+        assert_eq!(schedule.out_of_sync, []);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Integration tests for the `bala` binary, driven end-to-end via
-//! `assert_cmd`. Each test points the CLI at its own temp-file SQLite
+//! `assert_cmd`. Each test points the CLI at its own temp-file `SQLite`
 //! database via the `--db-path` flag, so tests never touch the real
 //! default OS data dir and never interfere with each other.
 
@@ -1960,6 +1960,25 @@ fn schedule_should_list_tasks_left_out_of_sync() {
     assert!(
         stdout.starts_with(&preview),
         "expected the out-of-sync list before the prompt, got: {stdout}"
+    );
+}
+
+#[test]
+fn schedule_should_not_list_a_completed_task_whose_dates_break_a_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let (_a, b) = late_predecessor_fixture(&db_path, false);
+    bala_cmd(&db_path)
+        .args(["task", "complete", &b])
+        .assert()
+        .success();
+
+    let stdout = schedule_stdout(&db_path, &[], "");
+
+    assert_eq!(stdout, "Nothing to move.\n");
+    assert_eq!(
+        ls_line(&db_path, &b),
+        format!("[x] {b} B (type: task) 2026-10-05..2026-10-08 (fixed)")
     );
 }
 

@@ -37,6 +37,9 @@ pub struct TaskRow {
     /// is the task's own parent unless that parent is absent from the input
     /// (e.g. hidden by a type filter), in which case the row is a root.
     pub parent_id: Option<TaskId>,
+    /// Whether the task is waiting on at least one incomplete predecessor,
+    /// as reported by Core in the task's `blocked_by`.
+    pub blocked: bool,
 }
 
 /// Projects every task in `tasks` into a display-ready `TaskRow`, nested
@@ -217,6 +220,7 @@ fn visit(
             collapsed: is_collapsed,
             direct_summary,
             parent_id: ancestors_on_path.last().copied(),
+            blocked: !task.blocked_by.is_empty(),
         });
 
         if is_collapsed {
@@ -345,6 +349,7 @@ mod tests {
             assignee_id: None,
             depends_on: Vec::new(),
             out_of_sync: false,
+            blocked_by: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -592,6 +597,33 @@ mod tests {
             let count = rows.iter().filter(|row| row.id == task.id).count();
             assert_eq!(count, 1, "{} should have exactly one row", task.title);
         }
+    }
+
+    #[test]
+    fn task_rows_should_mark_a_task_with_blocked_by_as_blocked() {
+        let predecessor = task(TaskId::new(), "Predecessor", None);
+        let mut successor = task(TaskId::new(), "Successor", None);
+        successor.blocked_by = vec![predecessor.id];
+        let tasks = [predecessor, successor];
+
+        let rows = rows_of(&tasks, &order_of(&tasks));
+
+        assert!(rows[1].blocked);
+    }
+
+    #[test]
+    fn task_rows_should_not_mark_an_unblocked_task() {
+        let predecessor = task(TaskId::new(), "Predecessor", None);
+        let mut successor = task(TaskId::new(), "Successor", None);
+        successor.depends_on = vec![bala_core::Dependency {
+            predecessor_id: predecessor.id,
+            dep_type: bala_core::DependencyType::default(),
+        }];
+        let tasks = [predecessor, successor];
+
+        let rows = rows_of(&tasks, &order_of(&tasks));
+
+        assert!(rows.iter().all(|row| !row.blocked));
     }
 
     #[test]

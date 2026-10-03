@@ -65,6 +65,7 @@ mod tests {
             assignee_id: None,
             depends_on: Vec::new(),
             out_of_sync: false,
+            blocked_by: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,

@@ -76,7 +76,7 @@ flowchart TB
         Mode["tui::mode\n(Mode state machine, §Modes)"]
         Keymap["tui::keymap\n(key -> Action per mode)"]
         Screens["tui::screens\n(tree/detail/gantt/help widgets)"]
-        Render["render\n(pure layout: tree rows, gantt columns/bars,\nblocked derivation, text export)"]
+        Render["render\n(pure layout: tree rows, gantt columns/bars,\nblocked flag from Core's blocked_by, text export)"]
         Config["config\n(view.toml load/save, directories paths)"]
     end
     Main --> Cli
@@ -109,17 +109,17 @@ pub struct ViewState {
     pub gantt_anchor: NaiveDate,         // left edge of the last viewport (pan position)
     pub filter: TreeFilter,              // Core LLD's TreeFilter, reused verbatim —
                                           // #40 AC4 / #62 AC4 filter/group state
-    pub blocked_only: bool,              // #62 AC4, not expressible via TreeFilter
+    pub blocked_view: BlockedView,       // #62 AC4: All | Blocked | Ready, not expressible via TreeFilter
 }
 
 pub enum GanttScale { Day, Week, Month }
 ```
 
-**Implemented so far:** `selected`, `collapsed`, and the type filter. The
-type filter is stored as `filter_type_key` in the `[tree]` table rather
-than the `[filter]` table sketched below. `gantt_scale`, `gantt_anchor`,
-and `blocked_only` are added with the Gantt view and the blocked-task
-filter. Saving currently happens on the normal quit path only: the
+**Implemented so far:** `selected`, `collapsed`, the type filter, and the
+blocked view. The type filter is stored as `filter_type_key` and the blocked
+view as `blocked_view` (`"blocked"` or `"ready"`, absent for `All`) in the
+`[tree]` table rather than the `[filter]` table sketched below.
+`gantt_scale` and `gantt_anchor` are added with the Gantt view. Saving currently happens on the normal quit path only: the
 `Ctrl-C`/`SIGTERM` cleanup guard described below is the intended design
 but isn't built yet. Until it is, the temp-then-rename write is what
 keeps a crash or kill from corrupting the file.
@@ -130,6 +130,7 @@ Serialized as TOML at `<config_dir>/bala/view.toml`:
 [tree]
 collapsed = ["b3f1...", "9ac2..."]   # TaskId as hyphenated UUID string
 selected = "b3f1..."
+blocked_view = "blocked"             # omitted when All
 
 [gantt]
 scale = "week"
@@ -137,7 +138,6 @@ anchor_date = "2026-09-01"
 
 [filter]
 type_key = "goal"
-blocked_only = false
 
 [data]
 db_path = "/Users/scott/.local/share/bala/bala.db"  # resolved default, override-able
@@ -204,6 +204,7 @@ Gantt):
 | `+`/`-`              | zoom gantt scale in/out — Day↔Week↔Month ([#64](https://github.com/sleb/bala/issues/64) AC1)                                                                                          |
 | `T`                  | jump-to-today: recenters `gantt_anchor` ([#64](https://github.com/sleb/bala/issues/64) AC3)                                                                                           |
 | `f`                  | open filter menu → `Filter` (type/status/blocked-only)                                                                                            |
+| `b`                  | cycle the blocked/ready view: all → blocked (non-empty `Task::blocked_by`) → ready (incomplete, not blocked) → all; applies together with the type filter, and a row whose parent the view hides renders at the top level |
 | `?`                  | help overlay → `Help`                                                                                                                             |
 | `q`                  | save config, quit                                                                                                                                 |
 
@@ -317,31 +318,22 @@ an explicit scope reduction from the HLD story, not an oversight — full
 arrow routing is a reasonable future addition to this same module, not a
 redesign.
 
-### 2. Blocked-task derivation ([#62](https://github.com/sleb/bala/issues/62))
+### 2. Blocked tasks ([#62](https://github.com/sleb/bala/issues/62))
 
-Core LLD's `Task` has no `blocked` field — `progress`/`status` are the
-only library-computed read fields (HLD's rule: nothing else is
-library-computed). Blocked is purely a function of already-fetched data,
-so it's computed client-side, once per render, from the task map
-`get_tree` already returned:
+Core derives blockedness and supplies it: every `Task` that `get_tree`,
+`get_task` and the mutation methods return carries `blocked_by`, the ids
+of the task's live predecessors that are still `Incomplete` (empty for a
+completed task). The client never recomputes this from `depends_on`; a
+row is blocked iff `!task.blocked_by.is_empty()`. `render` copies that into
+`TaskRow::blocked`, and the list pane draws a red `⊘` after the checkbox
+of each blocked row.
 
-```rust
-fn is_blocked(task: &Task, by_id: &HashMap<TaskId, &Task>) -> bool {
-    task.depends_on.iter().any(|dep| {
-        by_id.get(&dep.predecessor_id)
-            .is_some_and(|p| p.status != TaskStatus::Complete)
-    })
-}
-```
-
-O(edges) over the fetched tree, recomputed on every render rather than
-cached on `ViewState` — cheap at the 200+ task scale HLD targets, and
-avoids a second piece of state that could drift from the fetched data
-the way a cached value could after an edit. `blocked_only` (§View State)
-filters rows post-hoc using this same function, applied after Core's
+Because completing or reopening a task changes which *other* tasks are
+blocked, the TUI re-reads the tree from Core after a status toggle rather
+than patching only the touched rows. `blocked_view` (§View State) filters
+rows post-hoc on the same `blocked_by` field, applied after Core's
 `TreeFilter` (type/status/assignee) since blocked-ness isn't one of that
-filter's fields (Core LLD deliberately keeps it out — it's derived, not
-stored).
+filter's fields.
 
 ### 3. Reschedule mode: live preview via `preview_cascade` ([#65](https://github.com/sleb/bala/issues/65) AC2–5)
 
@@ -462,7 +454,7 @@ rather than falling back to string parsing, per HLD's original
 - `render` is pure functions over `Vec<Task>`/`ViewState` → data
   structures — unit-tested directly with no terminal, no `Core`, no I/O:
   scale mapping (`date_to_column`/`column_to_date_range` round-trip),
-  collapsed-summary bar bounds, `is_blocked` (§Algorithm 2), unscheduled
+  collapsed-summary bar bounds, the blocked flag (§Algorithm 2), unscheduled
   bucketing.
 - `ratatui::backend::TestBackend` renders a screen to an in-memory cell
   buffer for snapshot-style assertions (tree indentation, gantt bar
@@ -526,20 +518,16 @@ rather than falling back to string parsing, per HLD's original
   Core LLD uses for `scheduling::plan`/`preview_schedule` — the concrete payoff
   is the parity test in §Testing Strategy, which would fail immediately
   if the two ever drew a different picture of the same schedule.
-- `blocked_only` and the derived `is_blocked` check (§Algorithm 2)
-  living entirely client-side means every caller that wants "blocked"
-  semantics (this CLI today, the future Web Client) recomputes it the
-  same way from the same fetched data rather than trusting a
-  library-computed field that doesn't exist — consistent with HLD's
-  rule that only `progress` is library-computed, but worth remembering
-  if a second client-side consumer of "blocked" ever wants it cached
-  instead of recomputed per render.
+- Blocked-ness is derived by Core (`Task::blocked_by`, §Algorithm 2), so
+  every client (this CLI, the future Web Client) sees the same answer and
+  none recomputes it from `depends_on`. `blocked_view` remains a
+  client-side post-filter over that field.
 
 ## Action Items
 
 1. [ ] Scaffold `bala-cli` binary crate depending on `bala-core` + `bala-store`; wire `main.rs` dispatch (subcommand vs. TUI)
 2. [ ] Implement `config` module (TOML load/save, atomic write, `directories`-based paths for both `view.toml` and the default `db_path`)
-3. [ ] Implement `render` module (§Algorithms 1–2): scale mapping, bar/row layout, collapsed-summary bars, `is_blocked`
+3. [ ] Implement `render` module (§Algorithms 1–2): scale mapping, bar/row layout, collapsed-summary bars, blocked flag from `Task::blocked_by`
 4. [ ] Implement `tui::mode`/`tui::keymap` state machine (§Modes & Keybindings) against Core LLD's in-memory fake `Store`
 5. [ ] Implement `tui::screens`: tree/list, task detail, Gantt, help overlay (ratatui widgets over `render`'s output)
 6. [ ] Implement `Reschedule` mode's live preview loop (§Algorithm 3; its `preview_cascade` calls are superseded by `preview_schedule`, and the mode is to be redesigned around it)

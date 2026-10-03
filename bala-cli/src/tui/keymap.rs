@@ -86,6 +86,9 @@ pub enum Action {
     CollapseAll,
     /// `Normal` mode, `List` pane, `f`: cycle the active type filter.
     CycleTypeFilter,
+    /// `Normal` mode, `List` pane, `b`: cycle the blocked/ready view
+    /// (all, blocked, ready).
+    CycleBlockedView,
     /// `Normal` mode, `List` pane, `J`: move the focused task down among its
     /// siblings.
     MoveTaskDown,
@@ -242,6 +245,12 @@ pub static NORMAL_LIST_BINDINGS: &[Binding] = &[
         action: Action::CycleTypeFilter,
         label: "f",
         description: "Cycle the active type filter",
+    },
+    Binding {
+        keys: &[KeyCode::Char('b')],
+        action: Action::CycleBlockedView,
+        label: "b",
+        description: "Cycle the view: all, blocked, ready",
     },
 ];
 
@@ -616,6 +625,29 @@ mod tests {
         );
 
         assert_eq!(action, Action::CycleTypeFilter);
+    }
+
+    #[test]
+    fn key_to_action_should_map_b_in_normal_list_to_cycle_blocked_view() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::CycleBlockedView);
+    }
+
+    #[test]
+    fn help_entries_should_list_the_blocked_view_key_in_normal_list() {
+        let entries = help_entries(&Mode::Normal, Pane::List, DetailField::Title);
+
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "b" && e.description.contains("blocked"))
+        );
     }
 
     #[test]

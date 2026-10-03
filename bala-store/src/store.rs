@@ -31,7 +31,7 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Opens (creating if absent) the SQLite file at `path`, applying any
+    /// Opens (creating if absent) the `SQLite` file at `path`, applying any
     /// pending migrations and seeding the default `"task"` `TaskType`.
     /// `path` is caller-supplied — this crate has no opinion on config-dir
     /// conventions.
@@ -114,7 +114,7 @@ fn migration_err(err: &refinery::Error) -> StoreError {
 
 /// Fails if `PRAGMA foreign_key_check` reports any violation.
 ///
-/// Migrations run with foreign keys off, and SQLite doesn't re-validate
+/// Migrations run with foreign keys off, and `SQLite` doesn't re-validate
 /// existing rows when they are turned back on, so a dangling reference
 /// (from a migration or from a file written with foreign keys off) would
 /// otherwise go unnoticed until some later write trips over it. The error
@@ -294,6 +294,7 @@ mod tests {
             assignee_id: None,
             depends_on: Vec::new(),
             out_of_sync: false,
+            blocked_by: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
