@@ -1,8 +1,7 @@
 //! The persistence trait boundary (LLD §Storage Boundary).
 
 use crate::model::{
-    Dependency, DependencyType, Parents, Placement, Task, TaskId, TaskType, TreeFilter, User,
-    UserId,
+    Dependency, DependencyType, Placement, Task, TaskId, TaskType, TreeFilter, User, UserId,
 };
 
 /// Errors from the storage boundary.
@@ -85,36 +84,34 @@ pub trait StoreTx {
     /// Returns `Err` if the backend fails.
     fn list_tasks(&mut self, filter: &TreeFilter) -> Result<Vec<Task>, StoreError>;
 
-    /// Lists the ids of `id`'s parents.
+    /// Looks up the id of `id`'s parent.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the backend fails. Returns an empty `Vec`, not
-    /// `Err`, when `id` has no parents.
-    fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
+    /// Returns `Err` if the backend fails. Returns `Ok(None)`, not `Err`,
+    /// when `id` is at the top level or names no task with an edge.
+    fn get_parent_edge(&mut self, id: TaskId) -> Result<Option<TaskId>, StoreError>;
 
-    /// Replaces the whole set of `child`'s parent edges with `parents` in
-    /// one step. Edges already in the new set are kept, edges not in it are
-    /// removed, and missing ones are added. `Parents::TopLevel` gives the
-    /// child a single NULL-parent edge (and removes any real ones); an `Under`
-    /// set removes the NULL edge. Kept edges keep their position; new ones go
-    /// at the end of their parent's children. `placement` says where the child lands among the
-    /// siblings of newly added parents.
+    /// Puts `child` under `parent` (`None` = the top level), replacing the
+    /// one parent edge it had. If `child` is already under `parent`,
+    /// nothing changes and it keeps its position. Otherwise its old edge is
+    /// removed — its former siblings keep their order — and it joins
+    /// `parent`'s children where `placement` says. A `child` with no edge
+    /// yet (a task being created) is simply placed.
     ///
     /// # Errors
     ///
     /// Returns `Err` if the backend fails.
-    fn replace_parent_edges(
+    fn set_parent_edge(
         &mut self,
         child: TaskId,
-        parents: &Parents,
+        parent: Option<TaskId>,
         placement: Placement,
     ) -> Result<(), StoreError>;
 
     /// Swaps the positions of `a` and `b` among `parent`'s children
-    /// (`None` = the top level). Only the `parent` list changes: either
-    /// task's edges under other parents keep their positions. Does nothing
-    /// if either task is not a child of `parent`.
+    /// (`None` = the top level). Does nothing if either task is not a
+    /// child of `parent`.
     ///
     /// # Errors
     ///
@@ -127,7 +124,7 @@ pub trait StoreTx {
     ) -> Result<(), StoreError>;
 
     /// Lists the ids of `parent`'s children in position order — the reverse
-    /// of [`list_parent_edges`](StoreTx::list_parent_edges). `None` lists the
+    /// of [`get_parent_edge`](StoreTx::get_parent_edge). `None` lists the
     /// top-level tasks. Soft-deleted tasks keep their edges and are included.
     ///
     /// # Errors

@@ -25,7 +25,7 @@ fn minimal_new_task(title: &str) -> NewTask {
     NewTask {
         title: title.to_owned(),
         description: None,
-        parent_ids: Vec::new(),
+        parent_id: None,
         type_key: None,
         start_date: None,
         due_date: None,
@@ -69,22 +69,30 @@ fn create_task_should_default_to_top_level_when_no_parent_given() {
 
     let task = core.create_task(minimal_new_task("Top level")).unwrap();
 
-    assert_eq!(task.parent_ids, []);
+    assert_eq!(task.parent_id, None);
 }
 
 #[test]
-fn create_task_should_attach_to_given_parent_when_parent_ids_provided() {
+fn create_task_should_attach_to_given_parent() {
     let mut core = new_core();
     let parent = core.create_task(minimal_new_task("Parent")).unwrap();
 
     let child = core
         .create_task(NewTask {
-            parent_ids: vec![parent.id],
+            parent_id: Some(parent.id),
             ..minimal_new_task("Child")
         })
         .unwrap();
 
-    assert_eq!(child.parent_ids, vec![parent.id]);
+    assert_eq!(child.parent_id, Some(parent.id));
+    // A fresh read rebuilds `parent_id` from the stored edge.
+    let reread = core.get_task(child.id).unwrap().unwrap();
+    assert_eq!(reread.parent_id, Some(parent.id));
+    let children = core.list_children(parent.id).unwrap();
+    assert_eq!(
+        children.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![child.id]
+    );
 }
 
 #[test]
@@ -93,7 +101,7 @@ fn create_task_should_reject_when_given_parent_does_not_exist() {
     let missing_parent = TaskId::new();
 
     let result = core.create_task(NewTask {
-        parent_ids: vec![missing_parent],
+        parent_id: Some(missing_parent),
         ..minimal_new_task("Orphan")
     });
 
@@ -157,53 +165,6 @@ fn create_task_should_reject_due_date_before_start_date() {
         result,
         Err(CoreError::InvalidDateRange { start: s, due: d }) if s == start && d == due
     ));
-}
-
-#[test]
-fn create_task_should_deduplicate_repeated_parent_ids_preserving_first_occurrence_order() {
-    let mut core = new_core();
-    let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
-    let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
-
-    let child = core
-        .create_task(NewTask {
-            parent_ids: vec![parent_a.id, parent_b.id, parent_a.id],
-            ..minimal_new_task("Child")
-        })
-        .unwrap();
-
-    assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
-    // A fresh read rebuilds `parent_ids` from the stored edges.
-    let reread = core.get_task(child.id).unwrap().unwrap();
-    assert_eq!(reread.parent_ids, vec![parent_a.id, parent_b.id]);
-}
-
-#[test]
-fn create_task_should_record_an_edge_for_each_given_parent() {
-    // Attaching a new task under several parents in one call succeeds
-    // and records one edge per parent, in the given order.
-    let mut core = new_core();
-    let parent_a = core.create_task(minimal_new_task("Parent A")).unwrap();
-    let parent_b = core.create_task(minimal_new_task("Parent B")).unwrap();
-
-    let child = core
-        .create_task(NewTask {
-            parent_ids: vec![parent_a.id, parent_b.id],
-            ..minimal_new_task("Multi-parent child")
-        })
-        .unwrap();
-
-    assert_eq!(child.parent_ids, vec![parent_a.id, parent_b.id]);
-    // A fresh read rebuilds `parent_ids` from the stored edges.
-    let reread = core.get_task(child.id).unwrap().unwrap();
-    assert_eq!(reread.parent_ids, vec![parent_a.id, parent_b.id]);
-    for parent in [&parent_a, &parent_b] {
-        let children = core.list_children(parent.id).unwrap();
-        assert_eq!(
-            children.iter().map(|t| t.id).collect::<Vec<_>>(),
-            vec![child.id]
-        );
-    }
 }
 
 #[test]

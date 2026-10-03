@@ -16,8 +16,7 @@ pub use error::CoreError;
 pub use facade::Core;
 pub use in_memory_store::InMemoryStore;
 pub use model::{
-    DeleteMode, DeleteOutcome, Dependency, DependencyType, Direction, Field, NewTask, Parents,
-    Placement, SiblingOrder, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User,
-    UserId,
+    DeleteMode, DeleteOutcome, Dependency, DependencyType, Direction, Field, NewTask, Placement,
+    SiblingOrder, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User, UserId,
 };
 pub use store::{Store, StoreError, StoreTx};

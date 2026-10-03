@@ -5,15 +5,15 @@ use std::rc::Rc;
 
 use crate::in_memory_store::InMemoryStore;
 use crate::model::{
-    Dependency, DependencyType, Parents, Placement, Task, TaskId, TaskType, TreeFilter, User,
-    UserId,
+    Dependency, DependencyType, Placement, Task, TaskId, TaskType, TreeFilter, User, UserId,
 };
 use crate::store::{Store, StoreError, StoreTx};
 
 /// Asserts the parent-edge invariant over every task in `store`, live or
-/// soft-deleted: each task has exactly one NULL-parent edge (it appears once
-/// in `list_child_edges(None)` and has no real parent) or one or more real
-/// parent edges (and is absent from the roots).
+/// soft-deleted: each task has exactly one parent edge. Either it is the
+/// NULL-parent edge (the task appears once in `list_child_edges(None)` and
+/// has no real parent), or it is a real one (the task is absent from the
+/// roots and appears once among its parent's children).
 pub(crate) fn assert_edges_valid(store: &impl Store) {
     store
         .transaction(|tx: &mut dyn StoreTx| {
@@ -21,16 +21,23 @@ pub(crate) fn assert_edges_valid(store: &impl Store) {
                 include_deleted: true,
                 ..TreeFilter::default()
             };
-            let mut root_counts = std::collections::HashMap::new();
-            for root in tx.list_child_edges(None)? {
-                *root_counts.entry(root).or_insert(0usize) += 1;
+            // Per child: how many NULL-parent edges and how many real ones.
+            let mut edge_counts = std::collections::HashMap::new();
+            for (parent, child) in tx.list_all_child_edges()? {
+                let (null_edges, real_edges) = edge_counts.entry(child).or_insert((0usize, 0usize));
+                match parent {
+                    None => *null_edges += 1,
+                    Some(_) => *real_edges += 1,
+                }
             }
             for task in tx.list_tasks(&filter)? {
-                let null_edges = root_counts.get(&task.id).copied().unwrap_or(0);
-                let real_edges = tx.list_parent_edges(task.id)?.len();
+                let parent = tx.get_parent_edge(task.id)?;
+                let (null_edges, real_edges) = edge_counts.get(&task.id).copied().unwrap_or((0, 0));
                 assert!(
-                    (null_edges == 1 && real_edges == 0) || (null_edges == 0 && real_edges >= 1),
-                    "task {:?} has {null_edges} NULL edge(s) and {real_edges} real edge(s)",
+                    (parent.is_none() && null_edges == 1 && real_edges == 0)
+                        || (parent.is_some() && null_edges == 0 && real_edges == 1),
+                    "task {:?} has parent {parent:?}, {null_edges} NULL edge(s) and \
+                     {real_edges} real edge(s)",
                     task.id
                 );
             }
@@ -133,18 +140,18 @@ impl StoreTx for CountingTx<'_> {
         self.tick("list_tasks").list_tasks(filter)
     }
 
-    fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
-        self.tick("list_parent_edges").list_parent_edges(id)
+    fn get_parent_edge(&mut self, id: TaskId) -> Result<Option<TaskId>, StoreError> {
+        self.tick("get_parent_edge").get_parent_edge(id)
     }
 
-    fn replace_parent_edges(
+    fn set_parent_edge(
         &mut self,
         child: TaskId,
-        parents: &Parents,
+        parent: Option<TaskId>,
         placement: Placement,
     ) -> Result<(), StoreError> {
-        self.tick("replace_parent_edges")
-            .replace_parent_edges(child, parents, placement)
+        self.tick("set_parent_edge")
+            .set_parent_edge(child, parent, placement)
     }
 
     fn swap_child_positions(

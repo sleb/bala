@@ -30,9 +30,9 @@ Launches an interactive full-screen terminal UI showing your tasks,
 rather than dispatching to one of the subcommands below.
 
 The task list shows every task's title, type, status, and assignee,
-indented under its parent(s): a subtask is nested two spaces deeper than
-its parent (a task with more than one parent currently appears once under
-each of them). A task with subtasks shows a `▾` (expanded) or `▸`
+indented under its parent: a subtask is nested two spaces deeper than its
+parent. A task has at most one parent, so every task appears as exactly one
+row. A task with subtasks shows a `▾` (expanded) or `▸`
 (collapsed) glyph before its checkbox; a collapsed task's row also shows a
 `(complete/total)` summary counting its direct children only. Collapse/
 expand state persists across sessions in `view.toml` (see
@@ -47,11 +47,11 @@ instead of a blank screen.
 | `l` / `→` (in the list) | Expand the focused task, revealing its subtasks again. No-op if it isn't collapsed. |
 | `E` (in the list) | Expand every task. |
 | `C` (in the list) | Collapse every task that has subtasks. |
-| `J` / `K` (in the list) | Move the focused task down / up among its siblings, under the parent it is shown beneath (a task shown under several parents moves only there). Selection stays on the moved task. No-op at the end of the list. With a type filter active the swap uses the full sibling order, so a press can look like a no-op when the neighbor is hidden. |
-| `L` / `H` (in the list) | Indent / outdent the focused task. `L` nests it as the last child of its previous sibling (which is expanded so the task stays visible); `H` moves it to its parent's level, right after that parent. Only the path it is shown under changes. Selection stays on the moved task. No-op with no previous sibling / at the top level; a cycle shows an inline error. Distinct from lowercase `h`/`l` (collapse/expand). |
+| `J` / `K` (in the list) | Move the focused task down / up among its siblings. Selection stays on the moved task. No-op at the end of the list. With a type filter active the swap uses the full sibling order, so a press can look like a no-op when the neighbor is hidden. |
+| `L` / `H` (in the list) | Indent / outdent the focused task. `L` nests it as the last child of its previous sibling (which is expanded so the task stays visible); `H` moves it to its parent's level, right after that parent. Its subtree moves with it. Selection stays on the moved task. No-op with no previous sibling / at the top level, and on a row whose parent the type filter hides (it is shown at the top level, but is not really there). Distinct from lowercase `h`/`l` (collapse/expand). |
 | `O` | Create a new top-level task: opens a text-entry line for its title. `Enter` submits, `Esc` cancels. |
 | `o` (in the list) | Create a new subtask under the selected task: opens a text-entry line for its title, nested under the focused task. `Enter` submits, `Esc` cancels. If the parent has an assignee or dates, you're then asked whether to inherit them onto the new subtask (`y`/`n`). |
-| `m` (in the list) | Reparent the selected task: opens a text-entry line prefilled with its current parent ids (comma-separated). `Enter` submits, `Esc` cancels. |
+| `m` (in the list) | Reparent the selected task: opens a text-entry line prefilled with its current parent id (empty when it is top-level). `Enter` submits, `Esc` cancels. |
 | `t` (in the list) | Set the selected task's type: opens a text-entry line prefilled with its current type key. `Enter` submits, `Esc` cancels. |
 | `f` (in the list) | Cycle the active type filter: no filter → the first configured type → the next → ... → back to no filter. Persists across sessions in `view.toml` (see [config.md](config.md)). |
 | `Enter` (in the list) | Open the Detail pane for the selected task. |
@@ -59,7 +59,7 @@ instead of a blank screen.
 | `k` / `↑` (in the Detail pane) | Move the field cursor up (Description → Title). |
 | `i` (in the Detail pane) | Edit the field under the cursor: opens a text-entry line prefilled with its current value. `Enter` submits, `Esc` cancels. |
 | `Esc` (in the Detail pane) | Leave the Detail pane, back to the list. |
-| `dd` (in the list) | Delete the selected task: press `d` twice in a row to prompt for confirmation. For a task with no subtasks, `y` confirms and `n`/`Esc` cancels. For a task with subtasks, the prompt names how many it has: `s` deletes the task and its subtasks, `p` deletes only the task and promotes its subtasks to its parents (or to top level), and `n`/`Esc` cancels. |
+| `dd` (in the list) | Delete the selected task: press `d` twice in a row to prompt for confirmation. For a task with no subtasks, `y` confirms and `n`/`Esc` cancels. For a task with subtasks, the prompt names how many it has: `s` deletes the task and its whole subtree, `p` deletes only the task and promotes its subtasks to its parent (or to top level if it had none), and `n`/`Esc` cancels. |
 | `x` / `Space` (in the list or Detail pane) | Toggle the selected task's complete/incomplete state. Completing a task with incomplete subtasks prompts for confirmation: `y` completes the whole cascade, `n`/`Esc` cancels. |
 | `?` | Open the help overlay, listing every key bound in the current mode. Not available in Insert mode, where `?` types a literal question mark — use `F1` there instead. |
 | `F1` (in a text-entry line) | Open the help overlay. |
@@ -85,17 +85,18 @@ copies those fields onto the new subtask, `n` leaves it unassigned and
 undated. When the parent has none of those fields set, the new subtask is
 created directly with no prompt.
 
-Pressing `m` on a selected task opens a `Parents (comma-separated ids): `
-input line at the bottom of the screen, prefilled with the task's current
-parent ids as a comma-separated list (empty when it's already top-level).
-Edit the list and press `Enter` to submit, or `Esc` to cancel without
-changing anything. Submitting with an empty buffer promotes the task to
-top-level (no parents). An id that isn't a valid task id, or a reparent that
-would make the task its own ancestor (a circular hierarchy), shows an inline
-error under the input line and keeps you in the entry line to fix it — fix
-the list and press `Enter` again, or `Esc` to give up. `m` does not offer to
-inherit the new parent's assignee or dates; that's `o`'s behavior for newly
-created subtasks only.
+Pressing `m` on a selected task opens a `Parent id: ` input line at the
+bottom of the screen, prefilled with the task's current parent id (empty
+when it's already top-level). Edit the id and press `Enter` to submit, or
+`Esc` to cancel without changing anything. Submitting one id moves the task
+under that parent; submitting an empty line promotes the task to top-level
+(no parent). A task has at most one parent, so entering more than one id
+(separated by commas or spaces) is an error. That, an id that isn't a valid
+task id, or a reparent that would make the task its own ancestor (a circular
+hierarchy), shows an inline error under the input line and keeps you in the
+entry line to fix it — fix the id and press `Enter` again, or `Esc` to give
+up. `m` does not offer to inherit the new parent's assignee or dates; that's
+`o`'s behavior for newly created subtasks only.
 
 Pressing `t` on a selected task opens a `Type: ` input line at the bottom of
 the screen, prefilled with the task's current type key. Edit it and press
@@ -121,11 +122,10 @@ press `y` to delete it or `n`/`Esc` to cancel without deleting anything. For
 a task with subtasks, the prompt says how many direct subtasks it has
 (counting any hidden by the type filter or a collapsed row) and asks how to
 treat them, matching `bala task delete`'s `--cascade` and
-`--promote-children`: press `s` to delete the task along with its subtree (a
-subtask that also has another parent keeps that parent and is not deleted),
-`p` to delete only the task and move its direct subtasks up to the task's
-own parents (or to top level if it had none), or `n`/`Esc` to cancel. `y`
-does nothing at this prompt. Pressing `d` once and then any other key
+`--promote-children`: press `s` to delete the task along with its whole
+subtree (every subtask at any depth), `p` to delete only the task and move
+its direct subtasks up to the task's own parent (or to top level if it had
+none), or `n`/`Esc` to cancel. `y` does nothing at this prompt. Pressing `d` once and then any other key
 (rather than a second `d`) does not count toward the sequence — the next `d`
 starts fresh.
 
@@ -180,17 +180,21 @@ bala task add --title "Write docs" \
 | --- | --- | --- |
 | `--title` | yes | The task's title. |
 | `--description` | no | A longer description of the task. |
-| `--parent` | no (repeatable) | Id of a parent task. May be given multiple times to attach the new task under several parents; repeating the same id attaches the task under that parent only once. |
+| `--parent` | no | Id of the task to nest the new task under. A task has at most one parent: giving `--parent` more than once is a usage error and creates nothing. |
 | `--start` | no | Start date, `YYYY-MM-DD`. |
 | `--due` | no | Due date, `YYYY-MM-DD`. |
 | `--assignee` | no | Id of the user to assign the task to. |
-| `--inherit` | no | Copy assignee/start/due from the first `--parent` for any of those fields not explicitly given. Only meaningful alongside `--parent`; passing it without `--parent` is a usage error. |
+| `--inherit` | no | Copy assignee/start/due from the `--parent` task for any of those fields not explicitly given. Only meaningful alongside `--parent`; passing it without `--parent` is a usage error. |
 | `--type` | no | Task type key. Defaults to the seeded `task` type when omitted. Fails with a nonzero exit if the key doesn't name a configured task type. |
 
 `--inherit` fills in `--assignee`/`--start`/`--due` from the new task's
-first `--parent` wherever the corresponding flag wasn't given explicitly —
-an explicit flag always wins. With multiple `--parent` values, only the
-first one is consulted.
+`--parent` wherever the corresponding flag wasn't given explicitly — an
+explicit flag always wins.
+
+Work that more than one goal needs still has a single parent: nest it under
+one goal and make the others depend on it with [`bala dep add`](#bala-dep-add).
+A finish-to-finish dependency (`--type ff`) says "this goal is not done until
+that task is done".
 
 Prints the new task's id (a UUID) on success.
 
@@ -209,8 +213,8 @@ bala task ls --type task
 
 Output is one task per line: `[<marker>] <id> <title> (type: <type-key>)`,
 plus ` (assigned: <name>)` when the task has an assignee. `<marker>` is `x`
-for a completed task and a space otherwise. A task with at least one parent
-is indented one level; this is a minimal visual cue, not a full recursive
+for a completed task and a space otherwise. Every task is printed on exactly
+one line. A task with a parent is indented one level; this is a minimal visual cue, not a full recursive
 tree layout (that's planned for the TUI).
 
 ### `bala task edit`
@@ -246,23 +250,25 @@ per line in the same format as `task ls`.
 
 ### `bala task mv`
 
-Reparents a task under a new set of parents, replacing its current parents
-entirely.
+Moves a task under a new parent, replacing its current one, or promotes it
+to top-level.
 
 ```sh
-bala task mv <task-id> --parents <parent-id>[,<parent-id>...]
+bala task mv <task-id> --parent <parent-id>   # move under that parent
+bala task mv <task-id>                        # promote to top-level
 ```
 
 | Flag | Required | Description |
 | --- | --- | --- |
-| `--parents` | no (comma-separated) | New parent ids, comma-separated. Omit to promote the task to top-level (no parents). A repeated id attaches the task under that parent only once. |
+| `--parent` | no | Id of the new parent. Omit to promote the task to top-level (no parent). A task has at most one parent: giving `--parent` more than once is a usage error and moves nothing. |
 
-Prints the reparented task, in the same format as `task ls`.
+Prints the moved task, in the same format as `task ls`.
 
-If the task id or any given parent id doesn't exist, or if the move would
+If the task id or the given parent id doesn't exist, or if the move would
 make the task its own ancestor (for example naming the task itself, or one
-of its own descendants, as a new parent), the command fails with a nonzero
-exit and an error message describing the problem.
+of its own descendants, as the new parent), the command fails with a nonzero
+exit and an error message describing the problem, and the task stays where
+it was.
 
 ### `bala task delete`
 
@@ -275,8 +281,8 @@ bala task delete <task-id> [--yes] [--cascade | --promote-children]
 | Flag | Description |
 | --- | --- |
 | `--yes` | Skip the interactive confirmation prompt. |
-| `--cascade` | Delete the task's whole subtree along with it. Conflicts with `--promote-children`. |
-| `--promote-children` | Reattach the task's children to its own parents instead of deleting them. |
+| `--cascade` | Delete the task's whole subtree along with it: every subtask at any depth is deleted too. Conflicts with `--promote-children`. |
+| `--promote-children` | Delete only the task and move its children to its own parent, or to top level if it had none. |
 
 If the task has subtasks and neither `--cascade` nor `--promote-children` is
 given, the command fails and lists the subtasks so you can choose a mode.
@@ -290,15 +296,16 @@ are printed to stderr before the confirmation prompt (and also with `--yes`):
   <task-id> <title>
 ```
 
-With `--cascade` (or a task with no subtasks) this covers the task and every
-subtask the delete removes; a subtask still under another parent survives, so
-it isn't covered, and it is named itself if it depends on a subtask that is
-removed. With `--promote-children` it covers the task alone. Nothing is
-printed when no task depends on them. The delete itself is unaffected: the
+With `--cascade` (or a task with no subtasks) this covers the task and its
+whole subtree: every task outside the subtree that depends on the task or on
+any of its subtasks is named once, and a task inside the subtree is never
+named, since it is deleted too. With `--promote-children` it covers the task
+alone. Nothing is printed when no task depends on them. The delete itself is unaffected: the
 dependency edges stay, and `bala task restore` brings them back.
 
 Prints the id of each deleted task, one per line, on success.
-Subtasks that survive (another parent, or `--promote-children`) are not listed.
+With `--promote-children` the promoted subtasks are not deleted, so they are
+not listed.
 
 ### `bala task restore`
 

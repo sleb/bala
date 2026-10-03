@@ -38,25 +38,24 @@ CREATE INDEX idx_tasks_type_live     ON tasks(type_key)     WHERE deleted_at IS 
 CREATE INDEX idx_tasks_status_live   ON tasks(status)       WHERE deleted_at IS NULL;
 CREATE INDEX idx_tasks_assignee_live ON tasks(assignee_id)  WHERE deleted_at IS NULL;
 
--- Every task has at least one parent edge, and every edge a sibling position.
+-- Every task has exactly one parent edge, and every edge a sibling position.
 --
---  * A top-level task has exactly one edge, with `parent_id IS NULL`.
+--  * The edge names the task's one parent; `parent_id IS NULL` means the
+--    task is at the top level.
 --  * `position` (0-based, per parent; NULL parent = the root list) orders
 --    siblings.
---  * "Exactly one NULL edge XOR one-or-more real edges" is enforced in code
---    (`Parents` + `replace_parent_edges`), not by triggers; the schema only
---    guarantees at most one NULL edge per child and no duplicate real edge.
+--  * "At most one edge per task" is enforced by the unique index on
+--    `child_id`, so a task cannot have two parents, nor be both top level
+--    and under a parent. "At least one" is not a constraint: it holds
+--    because `set_parent_edge` writes a new task's edge in the transaction
+--    that creates it and only ever replaces that edge afterwards.
 CREATE TABLE parent_edges (
     parent_id BLOB REFERENCES tasks(id),           -- NULL = top level
     child_id  BLOB NOT NULL REFERENCES tasks(id),
     position  INTEGER NOT NULL
 );
 
-CREATE UNIQUE INDEX idx_parent_edges_real_pair ON parent_edges(parent_id, child_id)
-    WHERE parent_id IS NOT NULL;                                        -- no duplicate real edge
-CREATE UNIQUE INDEX idx_parent_edges_one_null ON parent_edges(child_id)
-    WHERE parent_id IS NULL;                                            -- at most one NULL edge
-CREATE INDEX idx_parent_edges_child ON parent_edges(child_id);            -- parents of X
+CREATE UNIQUE INDEX idx_parent_edges_child ON parent_edges(child_id);     -- one parent per task; parent of X
                                                                           -- (hierarchy upward walk, Core LLD §Algorithm 1)
 CREATE INDEX idx_parent_edges_parent_pos ON parent_edges(parent_id, position); -- ordered children of X
                                                                           -- (rollup, subtree delete)

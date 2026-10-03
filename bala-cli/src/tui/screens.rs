@@ -143,7 +143,7 @@ fn draw_insert_input(frame: &mut Frame, app: &App, area: Rect) {
         EditableField::Title(_) => "Title",
         EditableField::Description(_) => "Description",
         EditableField::NewSubtaskTitle(_) => "New subtask",
-        EditableField::Parents(_) => "Parents (comma-separated ids)",
+        EditableField::Parent(_) => "Parent id",
         EditableField::TypeKey(_) => "Type",
     };
     let [buffer_area, error_area] =
@@ -269,7 +269,6 @@ mod tests {
             collapsed: false,
             direct_summary: None,
             parent_id: None,
-            grandparent_id: None,
         }
     }
 
@@ -464,6 +463,33 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
         assert!(app.error().is_some());
         assert!(text.contains(app.error().unwrap()));
+    }
+
+    #[test]
+    fn draw_insert_should_label_the_reparent_line_with_a_parent_id_prompt() {
+        let mut core = core();
+        let task = core
+            .create_task(bala_core::NewTask {
+                title: "Write docs".to_string(),
+                description: None,
+                parent_id: None,
+                type_key: None,
+                start_date: None,
+                due_date: None,
+                assignee_id: None,
+            })
+            .expect("create_task should succeed");
+        let mut task_row = row("Write docs", TaskStatus::Incomplete);
+        task_row.id = task.id;
+        let mut app = App::new(vec![task_row]);
+        let _ = apply_action(&mut app, &mut core, Action::StartReparent);
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Parent id: _"), "got: {text}");
     }
 
     #[test]

@@ -1,26 +1,25 @@
 //! `parent_edges` and `dependency_edges` queries (LLD-2 §Schema).
 
-use bala_core::{Dependency, DependencyType, Parents, Placement, StoreError, TaskId};
+use bala_core::{Dependency, DependencyType, Placement, StoreError, TaskId};
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use crate::convert::{blob_to_task_id, dep_type_from_text, dep_type_to_text, id_to_blob};
 use crate::task::sqlite_err;
 
-pub(crate) fn list_parent_edges(tx: &Transaction, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
+/// The parent of `id`, or `None` when it is at the top level (its edge has
+/// a NULL parent) or has no edge at all.
+pub(crate) fn get_parent_edge(tx: &Transaction, id: TaskId) -> Result<Option<TaskId>, StoreError> {
     let id_blob = id_to_blob(id);
-    let mut stmt = tx
-        .prepare("SELECT parent_id FROM parent_edges WHERE child_id = ?1 AND parent_id IS NOT NULL")
-        .map_err(sqlite_err)?;
-    let rows = stmt
-        .query_map(params![id_blob.as_slice()], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(sqlite_err)?;
-
-    let mut parent_ids = Vec::new();
-    for row in rows {
-        let blob = row.map_err(sqlite_err)?;
-        parent_ids.push(blob_to_task_id(&blob)?);
-    }
-    Ok(parent_ids)
+    tx.query_row(
+        "SELECT parent_id FROM parent_edges WHERE child_id = ?1 AND parent_id IS NOT NULL",
+        params![id_blob.as_slice()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .map_err(sqlite_err)?
+    .as_deref()
+    .map(blob_to_task_id)
+    .transpose()
 }
 
 /// Next free `position` under `parent` (`None` = the root list): max + 1, or
@@ -94,74 +93,44 @@ pub(crate) fn list_all_child_edges(
     Ok(edges)
 }
 
-/// Replaces `child`'s whole parent set: edges outside `parents` are deleted,
-/// edges already present are left untouched (keeping their position), and
-/// missing ones are inserted per `placement` (default: the end) among their
-/// parent's siblings.
-/// `Parents::TopLevel` is one NULL-parent edge; a `TopLevel` child that
-/// already has it is left alone, and any real edge is removed. The caller's
+/// Puts `child` under `parent` (`None` = the NULL-parent, top-level edge).
+/// A child already under `parent` is left alone, keeping its position.
+/// Otherwise its old edge is deleted — leaving a gap in its former
+/// siblings' positions, which only their order depends on — and the new one
+/// is inserted per `placement` among `parent`'s children. The caller's
 /// transaction makes this atomic.
-pub(crate) fn replace_parent_edges(
+pub(crate) fn set_parent_edge(
     tx: &Transaction,
     child: TaskId,
-    parents: &Parents,
+    parent: Option<TaskId>,
     placement: Placement,
 ) -> Result<(), StoreError> {
     let child_blob = id_to_blob(child);
+    let parent_blob = parent.map(id_to_blob);
+    let parent_slice = parent_blob.as_ref().map(<[u8; 16]>::as_slice);
 
-    // Desired parents: `None` = the NULL edge.
-    let wanted: Vec<Option<TaskId>> = match parents {
-        Parents::TopLevel => vec![None],
-        Parents::Under(ids) => ids.iter().copied().map(Some).collect(),
-    };
-
-    let mut existing: Vec<Option<TaskId>> = Vec::new();
-    {
-        let mut stmt = tx
-            .prepare("SELECT parent_id FROM parent_edges WHERE child_id = ?1")
-            .map_err(sqlite_err)?;
-        let rows = stmt
-            .query_map(params![child_blob.as_slice()], |row| {
-                row.get::<_, Option<Vec<u8>>>(0)
-            })
-            .map_err(sqlite_err)?;
-        for row in rows {
-            existing.push(
-                row.map_err(sqlite_err)?
-                    .as_deref()
-                    .map(blob_to_task_id)
-                    .transpose()?,
-            );
-        }
-    }
-
-    for old in existing.iter().filter(|e| !wanted.contains(e)) {
-        let old_blob = old.map(id_to_blob);
-        tx.execute(
-            "DELETE FROM parent_edges WHERE child_id = ?1 AND parent_id IS ?2",
-            params![
-                child_blob.as_slice(),
-                old_blob.as_ref().map(<[u8; 16]>::as_slice)
-            ],
+    let already_there: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM parent_edges WHERE child_id = ?1 AND parent_id IS ?2)",
+            params![child_blob.as_slice(), parent_slice],
+            |row| row.get(0),
         )
         .map_err(sqlite_err)?;
+    if already_there {
+        return Ok(());
     }
 
-    let mut added: Vec<Option<TaskId>> = Vec::new();
-    for new in wanted.iter().filter(|w| !existing.contains(w)) {
-        if added.contains(new) {
-            continue; // duplicate id in `parents`
-        }
-        added.push(*new);
-        let new_blob = new.map(id_to_blob);
-        let parent_slice = new_blob.as_ref().map(<[u8; 16]>::as_slice);
-        let position = insertion_position(tx, parent_slice, child, placement)?;
-        tx.execute(
-            "INSERT INTO parent_edges (parent_id, child_id, position) VALUES (?1, ?2, ?3)",
-            params![parent_slice, child_blob.as_slice(), position],
-        )
-        .map_err(sqlite_err)?;
-    }
+    tx.execute(
+        "DELETE FROM parent_edges WHERE child_id = ?1",
+        params![child_blob.as_slice()],
+    )
+    .map_err(sqlite_err)?;
+    let position = insertion_position(tx, parent_slice, child, placement)?;
+    tx.execute(
+        "INSERT INTO parent_edges (parent_id, child_id, position) VALUES (?1, ?2, ?3)",
+        params![parent_slice, child_blob.as_slice(), position],
+    )
+    .map_err(sqlite_err)?;
     Ok(())
 }
 

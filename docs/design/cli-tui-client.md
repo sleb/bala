@@ -188,14 +188,14 @@ Gantt):
 | `h`/`l`, `←`/`→`     | collapse/expand focused task ([#38](https://github.com/sleb/bala/issues/38) AC1)                                                                                                      |
 | `gg` / `G`           | jump to first/last visible task                                                                                                                   |
 | `E` / `C`            | expand all / collapse all ([#38](https://github.com/sleb/bala/issues/38) AC3)                                                                                                         |
-| `J` / `K`            | move focused task down/up among siblings via `Core::move_sibling` under the row's rendered parent (`TaskRow.parent_id`); selection follows the task ([#45](https://github.com/sleb/bala/issues/45)). Swaps use the full sibling order, so with a type filter a press may look like a no-op when the neighbor is hidden (known caveat) |
-| `L` / `H`            | indent / outdent the focused task via `Core::indent_task` / `Core::outdent_task` using the row's rendered path (`parent_id`, `grandparent_id`); indent expands the new parent (previous live sibling, from `SiblingOrder`) and selection follows the task to its new row; no-op is silent, errors (e.g. `CircularHierarchy`) show inline ([#45](https://github.com/sleb/bala/issues/45)) |
+| `J` / `K`            | move focused task down/up among siblings via `Core::move_sibling(id, direction)`, which reads the task's parent itself; selection follows the task ([#45](https://github.com/sleb/bala/issues/45)). Swaps use the full sibling order, so with a type filter a press may look like a no-op when the neighbor is hidden (known caveat) |
+| `L` / `H`            | indent / outdent the focused task via `Core::indent_task(id)` / `Core::outdent_task(id)`, which read the task's parent (and its parent's parent) themselves; indent expands the new parent (previous live sibling, from `SiblingOrder`) and selection follows the task to its new row; no-op is silent, errors show inline ([#45](https://github.com/sleb/bala/issues/45)). On a row whose parent the type filter hides (rendered parent ≠ the task's own parent) neither key calls Core: a silent no-op |
 | `o` / `O`            | new subtask under focused task / new top-level task → `Insert{title}` ([#6](https://github.com/sleb/bala/issues/6), [#37](https://github.com/sleb/bala/issues/37))                                                          |
 | `Enter`              | open Detail pane on focused task                                                                                                                  |
 | `i` (in Detail pane) | edit a field → `Insert` ([#11](https://github.com/sleb/bala/issues/11))                                                                                                               |
 | `dd`                 | delete focused task → `Confirm` ([#12](https://github.com/sleb/bala/issues/12)): `PendingAction::Delete` (`y`/`n`) if `Core::list_children` is empty, else `PendingAction::DeleteWithChildren` naming the child count (`s` = `DeleteMode::Subtree`, `p` = `DeleteMode::PromoteChildren`, `n`/`Esc` cancels); a `list_children` error shows inline and stays in `Normal` |
 | `x` / `Space`        | toggle complete → `Confirm` only if blocked by incomplete children ([#13](https://github.com/sleb/bala/issues/13))                                                                    |
-| `m`                  | reparent (`set_parents`) → `Insert{parent list}` ([#37](https://github.com/sleb/bala/issues/37) AC4)                                                                                  |
+| `m`                  | reparent (`set_parent`, an optional parent id) → `Insert{parent}`, a `Parent id: ` line prefilled with the current parent id (empty when top level); one id reparents, an empty line promotes to top level, more than one id is an inline error that stays in the entry line ([#37](https://github.com/sleb/bala/issues/37) AC4) |
 | `p` / `P`            | add / remove dependency → `Insert{predecessor}` ([#60](https://github.com/sleb/bala/issues/60))                                                                                       |
 | `t`                  | set task type → `Insert{type}` ([#40](https://github.com/sleb/bala/issues/40))                                                                                                        |
 | `g` (Gantt toggle)   | switch right pane Detail ↔ Gantt ([#63](https://github.com/sleb/bala/issues/63))                                                                                                      |
@@ -227,8 +227,9 @@ the prompt opened, they are promoted rather than silently deleted.
 `PendingAction::DeleteWithChildren` (`dd` on a task that has live children,
 counted via `Core::list_children` so children hidden by the type filter
 still count) instead accepts `s` (`delete_task` with
-`DeleteMode::Subtree`), `p` (`delete_task` with `DeleteMode::PromoteChildren`,
-reparenting the children to the deleted task's parents or to top level), or
+`DeleteMode::Subtree`, deleting the task and every descendant), `p`
+(`delete_task` with `DeleteMode::PromoteChildren`, reparenting the children
+to the deleted task's parent, or to top level if it had none), or
 `n`/`Esc`; `y` is unbound there, mirroring the CLI's refusal to delete a
 parent without `--cascade` or `--promote-children`. After either delete the
 list is re-rendered from a fresh `get_tree`.
@@ -238,17 +239,16 @@ list is re-rendered from a fresh `get_tree`.
 ### Tree/List View (left pane, always visible in Normal/Reschedule)
 
 Flattens the visible subset of `get_tree`'s result — a task is visible
-if every ancestor on at least one of its paths to a root is expanded
+if every ancestor on its path to a root is expanded
 ([#38](https://github.com/sleb/bala/issues/38)) — into ordered rows, each showing: expand/collapse glyph,
 indentation by depth, type label/color tag ([#40](https://github.com/sleb/bala/issues/40) AC3), title,
 progress fraction ([#39](https://github.com/sleb/bala/issues/39) AC1, `"3/7"` style per [#38](https://github.com/sleb/bala/issues/38) AC4's
 collapsed-summary requirement — shown on every row, not just collapsed
 ones, since it's cheap once computed), a completion glyph, and a blocked
-indicator ([#62](https://github.com/sleb/bala/issues/62) AC1, §Algorithm 2). A task shared by two parents
-(HLD's DAG hierarchy) appears once per parent it's expanded under — the
-tree view is a rendering of paths through the DAG, not a claim that the
-task itself is duplicated; selecting either instance operates on the
-same underlying `TaskId`.
+indicator ([#62](https://github.com/sleb/bala/issues/62) AC1, §Algorithm 2). The hierarchy is
+a tree (a task has at most one parent), so every task appears as exactly
+one row, nested under its parent, and `bala task ls` prints it on exactly
+one line.
 
 ### Task Detail View (right pane)
 
@@ -387,11 +387,11 @@ option) — not attempted here.
 
 ```
 bala                                    # launch TUI (default, no subcommand)
-bala task add --title <t> [--parent <id>]... [--type <key>] [--start <date>] [--due <date>] [--assignee <id>]
+bala task add --title <t> [--parent <id>] [--type <key>] [--start <date>] [--due <date>] [--assignee <id>]
 bala task edit <id> [--title <t>] [--description <d>] [--start <date>] [--due <date>] [--assignee <id>] [--clear-description] ...
 bala task rm <id> [--promote-children]           # DeleteMode; default Subtree, confirmed via -y or an inline y/n prompt
 bala task complete <id> [--cascade]
-bala task mv <id> --parents <id>[,<id>...]       # set_parents
+bala task mv <id> [--parent <id>]                # set_parent; no --parent promotes to top level
 bala task ls [--type <key>] [--status <s>] [--assignee <id>] [--blocked-only] [--flat]
 bala dep add <id> --on <predecessor-id> [--type fs|ss|ff|sf]   # default fs
 bala dep rm <id> --on <predecessor-id>
@@ -399,6 +399,11 @@ bala type ls
 bala type set <key> --label <l> [--color <c>] [--sort-order <n>]
 bala export gantt [--out <path>] [--scale day|week|month] [--from <date>] [--filter ...]
 ```
+
+`task add` and `task mv` take a single `--parent`: a task has at most one
+parent, so repeating the flag is a clap usage error (exit 2) that writes
+nothing, and there is no `--parents` flag. `task mv` with no `--parent`
+promotes the task to top level. Both hand `Core` zero or one parent id.
 
 Every subcommand maps to exactly one `Core` method call (mirroring HLD
 §Interfaces' Web API constraint: "near-mechanical translation," applied
@@ -421,7 +426,7 @@ rendering rule, shared by the TUI status bar and CLI subcommand stderr:
 | `CoreError` variant                       | TUI                                                                                   | CLI                                         |
 | ----------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------- |
 | `EmptyTitle`, `InvalidDateRange`          | inline message under the `Insert` field, blocks submit                                | stderr, nonzero exit, no partial write      |
-| `CircularHierarchy`                       | inline in `Insert{parent list}` (reparent)                                            | stderr, nonzero exit                        |
+| `CircularHierarchy`                       | inline in `Insert{parent}` (reparent)                                                 | stderr, nonzero exit                        |
 | `SelfDependency`, `DependsOnRelative`, `CircularDependency` | inline in `Insert{predecessor}`                                     | stderr, nonzero exit                        |
 | `IncompleteChildren`                      | routes to `Confirm` offering cascade (§Modes)                                         | stderr suggesting `--cascade`, nonzero exit |
 | `NotFound`, `UnknownTaskType`             | status-bar message (defensive — shouldn't normally be reachable from a rendered list) | stderr, nonzero exit                        |

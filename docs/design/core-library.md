@@ -99,9 +99,8 @@ pub struct Task {
     pub id: TaskId,
     pub title: String,
     pub description: Option<String>,
-    pub parent_ids: Vec<TaskId>,    // a task may sit under multiple parents
-                                     // (e.g. shared by two goals/projects);
-                                     // empty = top-level
+    pub parent_id: Option<TaskId>,  // a task sits under at most one parent;
+                                     // None = top-level
     pub type_key: String,           // FK into TaskType.key; "task" default
     pub status: TaskStatus,
     pub start_date: Option<NaiveDate>,
@@ -184,9 +183,9 @@ pub struct TaskPatch {
     pub due_date: Field<NaiveDate>,   // Clear -> None
     pub assignee_id: Field<UserId>,   // Clear -> unassign
     pub type_key: Field<String>,
-    // parent_ids and depends_on are intentionally NOT here — reparenting
+    // parent_id and depends_on are intentionally NOT here — reparenting
     // and dependency edits go through their own dedicated methods
-    // (set_parents, add/remove_dependency) because each carries its
+    // (set_parent, add/remove_dependency) because each carries its
     // own invariant check that a generic patch would obscure.
 }
 
@@ -220,9 +219,6 @@ pub enum CoreError {
 
     #[error("moving {task:?} under {attempted_parent:?} would make it its own ancestor")]
     CircularHierarchy { task: TaskId, attempted_parent: TaskId },
-
-    #[error("{task:?} is not a child of {parent}")] // parent: id, or "the top level" for None
-    NotUnderParent { task: TaskId, parent: Option<TaskId> },
 
     #[error("a task cannot depend on itself: {0:?}")]
     SelfDependency(TaskId),
@@ -264,10 +260,10 @@ impl<S: Store> Core<S> {
     pub fn update_task(&mut self, id: TaskId, patch: TaskPatch) -> Result<Vec<Task>, CoreError>;
     pub fn delete_task(&mut self, id: TaskId, mode: DeleteMode) -> Result<DeleteOutcome, CoreError>;
     pub fn restore_task(&mut self, id: TaskId) -> Result<Task, CoreError>;
-    pub fn set_parents(&mut self, id: TaskId, new_parents: Vec<TaskId>) -> Result<Task, CoreError>;
-    pub fn move_sibling(&mut self, parent: Option<TaskId>, id: TaskId, direction: Direction) -> Result<bool, CoreError>;
-    pub fn indent_task(&mut self, parent: Option<TaskId>, id: TaskId) -> Result<bool, CoreError>;
-    pub fn outdent_task(&mut self, parent: Option<TaskId>, grandparent: Option<TaskId>, id: TaskId) -> Result<bool, CoreError>;
+    pub fn set_parent(&mut self, id: TaskId, parent: Option<TaskId>) -> Result<Task, CoreError>;
+    pub fn move_sibling(&mut self, id: TaskId, direction: Direction) -> Result<bool, CoreError>;
+    pub fn indent_task(&mut self, id: TaskId) -> Result<bool, CoreError>;
+    pub fn outdent_task(&mut self, id: TaskId) -> Result<bool, CoreError>;
     pub fn add_dependency(&mut self, id: TaskId, predecessor: TaskId, dep_type: DependencyType) -> Result<Task, CoreError>;
     pub fn remove_dependency(&mut self, id: TaskId, predecessor: TaskId) -> Result<Task, CoreError>;
     pub fn complete_task(&mut self, id: TaskId, cascade: bool) -> Result<Vec<Task>, CoreError>;
@@ -279,8 +275,7 @@ impl<S: Store> Core<S> {
     /// Sibling order of every live task, keyed by parent (`None` = top level);
     /// one transaction. `list_children` and `get_tree` follow it: children in
     /// stored position order (creation order by default), `get_tree` results
-    /// in depth-first sibling order (a task under several parents takes its
-    /// first position; unreached tasks sort last).
+    /// in depth-first sibling order (unreached tasks sort last).
     pub fn sibling_order(&self) -> Result<SiblingOrder, CoreError>;
     pub fn list_task_types(&self) -> Result<Vec<TaskType>, CoreError>;
     pub fn upsert_task_type(&mut self, t: TaskType) -> Result<TaskType, CoreError>;
@@ -299,103 +294,97 @@ contract encodes the "rm vs. rm -r" decision from §Context — deliberately
 as an explicit parameter rather than two method names, since the CLI/Web
 API each map it onto one confirmation prompt either way.
 
-With multiple parents, `DeleteMode::Subtree` only ever removes
-*parent-edges*, not tasks: deleting task A with `Subtree` drops the A→X
-edge for every child X, and X itself is only soft-deleted (tombstoned)
-once that leaves it with an empty `parent_ids` — i.e. A was its only
-parent. A child still reachable through another live parent (e.g. it's
-also under Goal B) keeps existing (not tombstoned), just with one less
-parent edge, so deleting a goal can never silently delete a task that
-another goal still needs. `PromoteChildren` follows the same rule in
-reverse: A's parent edge on each child is replaced with an edge to A's
-own parents (or dropped, making the child top-level, if A had none) —
-for a child with other parents besides A, that's one more edge added
-alongside the ones it already keeps.
+Every task has at most one parent, so the tasks beneath A form a subtree
+that belongs to A alone. `DeleteMode::Subtree` soft-deletes (tombstones)
+A and every descendant of A, at any depth, with no survivors: nothing
+beneath A is reachable any other way, so nothing is kept. The walk is an
+iterative work-stack (no recursion, since hierarchy depth is unbounded)
+that reaches each descendant once; a descendant already tombstoned by an
+earlier call is left as it was, keeping its original `deleted_at`, and is
+not reported again. `DeleteMode::PromoteChildren` tombstones only A: each
+of A's children is moved to A's own parent (or to the top level, if A
+had none), landing after that parent's existing children in the order
+they had under A, and keeps its own children. Either mode runs in one
+store transaction.
 
 `delete_task` reports what it changed as a `DeleteOutcome` rather than
 one mixed list, so no caller has to partition on `deleted_at` itself:
 `deleted` holds every task the call tombstoned, `updated` every task that
-survived but whose own fields changed — a `Subtree` child that lost the
-A→X edge but is still under another parent, or a `PromoteChildren` child
-reparented onto A's parents. Both lists hold only tasks whose own stored
-row changed, each at most once and at its final value, and no id is in
-both: a child that first survives one dropped edge and is later left
-parentless by the same walk (e.g. A→X, A→D, D→X) is reported only in
-`deleted`. A parent whose rolled-up `progress` changed only because its
-children changed (e.g. B, once the shared X loses A) is in neither list;
-a caller showing it re-fetches it.
+survived but whose own fields changed — the children a `PromoteChildren`
+delete reparented. A `Subtree` delete leaves no survivor whose own row
+changes, so its `updated` is always empty. Both lists hold only tasks
+whose own stored row changed, each at most once and at its final value,
+and no id is in both. A parent whose rolled-up `progress` changed only
+because its children changed (e.g. A's parent, once A is gone) is in
+neither list; a caller showing it re-fetches it.
 
-`move_sibling(parent, id, Direction::{Up,Down})` reorders `id` by one
-place within `parent`'s children (`None` = top level) in a single
-transaction. It swaps with the nearest *live* sibling in that direction
+`move_sibling(id, Direction::{Up,Down})` reorders `id` by one place among
+its parent's children (the top level for a task with no parent) in a
+single transaction. The parent is read from the task, never supplied by
+the caller. It swaps with the nearest *live* sibling in that direction
 (tombstoned siblings are skipped) via `StoreTx::swap_child_positions`, so
-only `parent`'s list changes: `id`'s position under any other parent, its
-parents, depth and `updated_at` are untouched. It returns `true` if the task
+only the order of the parent's children changes: `id`'s parent, depth and
+`updated_at` are untouched. It returns `true` if the task
 moved and `false` at the end of the list (a true no-op: no write, no error).
-It fails with `NotFound` for a missing/deleted `id` and `NotUnderParent {
-task, parent }` when `id` is not a child of `parent`.
+It fails with `NotFound` for a missing/deleted `id`.
 
-`indent_task(parent, id)` / `outdent_task(parent, grandparent, id)` take
-the *rendered path* (the parent the row is shown under, plus that parent's
-parent for outdent), so in a multi-parent DAG they change only that one
-path. Each runs in one transaction, composes the new parent set (current
-minus `parent`, plus the target) and writes it through
-`hierarchy::replace_parents`, so the cycle guard is shared with
-`set_parents` (`CircularHierarchy`); other parents keep their edges and
-positions. Both return `true` on a change and `false` on a no-op (no write,
-no `updated_at` bump); a change bumps `updated_at` and refreshes
-`parent_ids`.
+`indent_task(id)` / `outdent_task(id)` likewise read the task's place in
+the tree from the store (its parent, plus that parent's parent for
+outdent) inside their transaction. Each runs in one transaction and
+writes the new parent through `hierarchy::set_parent`, so the cycle guard
+is shared with `set_parent` (`CircularHierarchy`, which neither move can
+trigger in a valid tree). Both return `true` on a change and `false` on a
+no-op (no write, no `updated_at` bump); a change bumps `updated_at` and
+refreshes `parent_id`. Both fail with `NotFound` for a missing/deleted
+`id`.
 
-- Indent: the target is the nearest *live* previous sibling under `parent`
-  (tombstoned ones skipped); `id` becomes its last child. No previous
-  sibling: no-op. Only `id`'s own edges change, so its subtree follows.
-- Outdent: `id` joins `grandparent`'s children immediately after `parent`
-  (`Placement::After(parent)`). `parent == None` (already top level) is a
-  no-op. `NotUnderParent` if `id` is not under `parent`, or `parent` not
-  under `grandparent`. With `grandparent == None` the task becomes top level
-  only if `parent` was its sole parent; if other real parents remain it
-  just drops `parent`, since a task is never both top level and nested.
+- Indent: the target is the nearest *live* previous sibling under `id`'s
+  parent (tombstoned ones skipped); `id` becomes its last child. No
+  previous sibling: no-op. Only `id`'s own edge changes, so its subtree
+  follows.
+- Outdent: `id` joins its parent's parent's children immediately after
+  its old parent (`Placement::After(old_parent)`); when the old parent is
+  top level, so is `id` afterwards. A task with no parent (already top
+  level) is a no-op.
 
-`set_parents` replaces the old single-parent `reparent_task(id,
-Option<TaskId>)`. It takes the *whole* new parent list and applies it
-atomically: the hierarchy invariant (§1) is checked for every added
-parent before any edge is written, and if any one of them would create a
-cycle, the whole call is rejected with `CircularHierarchy` naming that
-specific parent — no partial reparenting. This is a bulk replace, not an
-incremental add/remove, because the per-edge cycle check doesn't depend
-on which other parents are being added in the same call (adding parent P
-to task `id` only risks a cycle if `id` is already an ancestor of P,
-independent of P's siblings in the call), so bulk-and-atomic gets the
-same error precision as one-edge-at-a-time without the extra round
-trips.
+`set_parent(id, parent)` moves `id` under `parent`; `None` promotes it to
+the top level. The whole read-check-write is one transaction: `id` and
+`parent` must both name live tasks (`NotFound` otherwise, `id` checked
+first), and the hierarchy invariant (§1) is checked before the edge is
+written, so a rejected call (`CircularHierarchy`) changes nothing. The
+task lands after the new parent's existing children and its subtree moves
+with it. Setting the parent a task already has is a true no-op: no write,
+`updated_at` is unchanged and the task keeps its position among its
+siblings.
 
 ## Algorithms
 
 ### 1. Hierarchy invariant — no circular nesting ([#37](https://github.com/sleb/bala/issues/37) AC5)
 
-Multiple parents make the hierarchy a DAG, not a tree, so "ancestor
-chain" becomes "ancestor set reachable via `parent_ids`." `set_parents(id,
-new_parents)` checks each candidate `parent` in `new_parents`
-independently: DFS/BFS upward from `parent` following `parent_ids`
-edges, with a `visited` set (a shared ancestor reachable through two
-different paths — e.g. two of `id`'s new parents both rolling up to the
-same goal — is only walked once). If `id` is reachable in that walk,
-reject the whole call with `CircularHierarchy { task: id, attempted_parent:
-parent }` — no edges are written until every candidate parent has passed
-the check. O(edges) per call, same complexity class as the old O(depth)
-single-chain walk since `visited` bounds the work to each ancestor node
-once regardless of how many paths reach it. `create_task` skips the
-check and writes the new task's edges directly: a freshly minted id has no
-descendants, so it cannot be an ancestor of any entry in
-`NewTask.parent_ids`, and each parent's existence is validated in the
-same transaction that writes the task and its edges.
-Running the walk anyway would cost one `list_parent_edges` per ancestor,
-making every create under a deep chain O(depth) for a check that can never
-fail. Every write that adds a parent to an *existing* task still goes
-through `hierarchy::replace_parents` and its check.
+The hierarchy is a tree: a task has at most one parent, so its ancestors
+are one chain. `set_parent(id, parent)` follows that chain upward from
+`parent` — `parent` itself, then `get_parent_edge` of each task reached —
+until it runs out at the top level. If `id` turns up, the move would make
+`id` its own ancestor: reject with `CircularHierarchy { task: id,
+attempted_parent: parent }`, before anything is written. The walk is a
+plain loop: it needs no visited set (one chain has no second path to a
+task) and no recursion (depth is unbounded, so recursing could overflow
+the stack). O(depth) per call.
 
-Both `create_task` and `set_parents` remove repeated parent ids before
-any check or write, keeping each id's first occurrence.
+`hierarchy::set_parent` is the writer for an *existing* task's parent
+edge whenever the task is put under a parent, and every such write goes
+through it and its check. It skips the walk when the move cannot create a
+cycle: to the top level, or to the parent the task already has. The one
+write that bypasses it is a `Subtree` delete, which moves each
+descendant's edge straight to the top level as it tombstones it — a move
+that cannot create a cycle either.
+
+`create_task` skips the check and writes the new task's edge directly: a
+freshly minted id has no descendants, so it cannot be an ancestor of
+`NewTask.parent_id`, and the parent's existence is validated in the same
+transaction that writes the task and its edge. Running the walk anyway
+would cost one `get_parent_edge` per ancestor, making every create under
+a deep chain O(depth) for a check that can never fail.
 
 ### 2. Dependency invariants ([#60](https://github.com/sleb/bala/issues/60) AC2–3)
 
@@ -404,14 +393,12 @@ any check or write, keeping each id's first occurrence.
 2. Reject with `DependsOnRelative` if `predecessor` is an ancestor or a
    descendant of `id` in the hierarchy graph — this is the one place a
    dependency check must cross into the hierarchy graph, per HLD §4.
-   With multiple parents this is DAG reachability (§1's memoized walk)
-   rather than a single chain, and both directions are checked by
-   walking *upward* through every parent of every task: from `id`
-   looking for `predecessor` (an ancestor), then from `predecessor`
-   looking for `id` (a descendant). A descendant of `id` is exactly a
-   task from which `id` is reachable upward, so there is no need to scan
-   `id`'s whole subtree; each walk visits only the ancestors of where it
-   starts.
+   Both directions are checked by walking *upward* along one parent
+   chain (§1's loop): from `id` looking for `predecessor` (an ancestor),
+   then from `predecessor` looking for `id` (a descendant). A descendant
+   of `id` is exactly a task from which `id` is reachable upward, so
+   there is no need to scan `id`'s whole subtree; each walk visits only
+   the ancestors of where it starts.
 3. Cycle check on the dependency graph itself: before adding the edge
    `predecessor → id`, walk from `predecessor` following existing
    `depends_on` edges (i.e., walk what `predecessor` already
@@ -556,19 +543,13 @@ lookup of its direct children's `status`, independent of traversal order
 or of any other task's rollup. `get_tree` computes this once per result
 task, each a `list_child_edges` + `get_task`-per-child lookup — O(n + e)
 for the whole tree per call (n result tasks, e parent-child edges walked
-across all of them), not O(n) per task. With multiple parents a task can
-have more than one incoming edge, so e can be as large as O(n²) in the
-worst case — this is still one lookup per edge, not a repeated per-task
-cost, but it is not O(n) outright.
+across all of them), not O(n) per task. Every task has at most one
+parent edge, so e is at most n and the whole tree is O(n).
 
-With multiple parents, "children" is the reverse lookup — every task
-whose `parent_ids` contains this task's id — and a task shared by two
-parents contributes its `status` **independently to each parent's own
-average**; there's no splitting, normalization, or memoization concern
-across parents, since this is a per-parent lookup of `list_child_edges`
-and each direct child's `status`, not a graph traversal (a Complete
-shared child counts as a full `1.0` toward both Goal A's and Goal B's
-rollup, computed separately for each).
+"Children" is the reverse lookup — every task whose `parent_id` is this
+task's id, read through `list_child_edges`. Each task is a child of at
+most one parent, so its `status` counts toward exactly one rollup, its
+parent's; there is nothing to split, normalize, or memoize.
 
 ### 5. `complete_task` ([#13](https://github.com/sleb/bala/issues/13) AC2, resolved per §Context)
 
@@ -603,11 +584,11 @@ when the TUI's completion toggle needed a way back.
 Not a network contract (HLD §4) — a Rust trait so `bala-core` is
 testable against an in-memory fake today and the Data Store LLD's
 embedded engine is just another implementation. Per HLD, hierarchy
-(`parent_ids`) and dependency edges are related-but-independent graphs
+(`parent_id`) and dependency edges are related-but-independent graphs
 stored distinctly, so the trait doesn't fold edges into the task row.
-Multiple parents mean hierarchy is now an edge set rather than a single
-FK column, so it gets the same edge-table shape dependencies already
-have:
+A task has one parent edge, which carries its position among its
+siblings (a top-level task's edge has no parent), so the hierarchy is
+read and written through edge methods of its own:
 
 ```rust
 pub trait Store {
@@ -626,20 +607,23 @@ pub trait StoreTx {
     fn put_task(&mut self, task: &Task) -> Result<(), StoreError>;
     fn list_tasks(&mut self, filter: &TreeFilter) -> Result<Vec<Task>, StoreError>;
 
-    fn list_parent_edges(&mut self, id: TaskId) -> Result<Vec<TaskId>, StoreError>;
+    /// `id`'s parent; `None` = top level (or no such task).
+    fn get_parent_edge(&mut self, id: TaskId) -> Result<Option<TaskId>, StoreError>;
     /// `None` = the top-level tasks (children of the NULL parent), in position order.
     fn list_child_edges(&mut self, parent: Option<TaskId>) -> Result<Vec<TaskId>, StoreError>;
     /// Every (parent, child) edge grouped by parent, position order within each
     /// (`None` = top level), tombstones included. One call, so whole-hierarchy
     /// reads (`Core::sibling_order`) avoid a `list_child_edges` per parent.
     fn list_all_child_edges(&mut self) -> Result<Vec<(Option<TaskId>, TaskId)>, StoreError>;
-    /// `Placement::End` appends; `Placement::After(sibling)` inserts right after
-    /// `sibling` in each newly added parent's children, falling back to `End` for
-    /// a parent that does not contain `sibling` (or if `sibling == child`).
-    /// Retained parents keep their position.
-    fn replace_parent_edges(&mut self, child: TaskId, parents: &Parents, placement: Placement) -> Result<(), StoreError>;
-    /// Swaps the positions of `a` and `b` among `parent`'s children only (other
-    /// parents' positions untouched); no-op if either is not a child of `parent`.
+    /// Puts `child` under `parent` (`None` = top level), replacing the one edge
+    /// it had. Already under `parent`: nothing changes, position kept. Otherwise
+    /// the old edge is removed and `child` joins `parent`'s children per
+    /// `placement`: `Placement::End` appends; `Placement::After(sibling)` inserts
+    /// right after `sibling`, falling back to `End` if `parent`'s children do not
+    /// contain `sibling` (or if `sibling == child`).
+    fn set_parent_edge(&mut self, child: TaskId, parent: Option<TaskId>, placement: Placement) -> Result<(), StoreError>;
+    /// Swaps the positions of `a` and `b` among `parent`'s children; no-op if
+    /// either is not a child of `parent`.
     fn swap_child_positions(&mut self, parent: Option<TaskId>, a: TaskId, b: TaskId) -> Result<(), StoreError>;
 
     fn list_dependency_edges(&mut self, id: TaskId) -> Result<Vec<Dependency>, StoreError>;
@@ -653,12 +637,12 @@ pub trait StoreTx {
 ```
 
 `list_child_edges`/`list_successor_edges` are the reverse of
-`list_parent_edges`/`list_dependency_edges` — resolving Data Store LLD's
+`get_parent_edge`/`list_dependency_edges` — resolving Data Store LLD's
 §Open Questions item 1 as named trait methods rather than something
 `Core` reconstructs in memory from a bulk `list_tasks`. §Algorithm 3's
 cascade (`graph.successor_edges_of(current)`) calls `list_successor_edges`
 per task walked, and §Algorithm 4's rollup ("children" = reverse lookup
-of `parent_ids`) calls `list_child_edges` per task in its post-order
+of `parent_id`) calls `list_child_edges` per task in its post-order
 traversal — both were already relying on this direction existing, just
 without a named method to call.
 
@@ -681,8 +665,8 @@ flagged at the HLD level, not solved by adding locking here.
 - Name tests for behavior, not method name, per rust-best-practices:
   e.g. `add_dependency_should_reject_cycle_through_transitive_predecessor`,
   `complete_task_should_block_when_children_incomplete_and_cascade_false`,
-  `set_parents_should_reject_whole_call_when_one_candidate_creates_cycle`,
-  `delete_subtree_should_keep_child_reachable_through_other_parent`.
+  `set_parent_should_reject_missing_parent`,
+  `delete_task_subtree_should_tombstone_every_descendant`.
 - Cascade tests per `DependencyType`: one predecessor/successor pair for
   each of FS/SS/FF/SF confirming the right field pair (start↔start,
   due↔start, due↔due, start↔due) is checked and shifted; plus a mixed
@@ -692,12 +676,15 @@ flagged at the HLD level, not solved by adding locking here.
   of dependency types), assert the post-cascade graph satisfies each
   edge's own type-specific constraint and that `preview_cascade` and
   `update_task` agree on the touched set before the latter commits.
-- Multi-parent rollup: a task shared by two parents contributes its own
-  `status` to each parent's average independently, computed per-parent
-  from that parent's own `list_child_edges`; since this is a flat
-  per-parent lookup rather than a graph traversal, there's no
-  memoization concern to test — each parent's `get_tree` result should
-  simply reflect only its own direct children.
+- Delete over a tree: a `Subtree` delete of a branching, several-level
+  subtree tombstones every descendant, leaves the tasks around it
+  untouched and reports an empty `updated`; a `PromoteChildren` delete
+  moves the children to the deleted task's parent (or to the top level
+  if it had none), keeping their order. A chain thousands of levels deep
+  is deleted and cascade-completed without overflowing the stack.
+- Rollup: each parent's `progress` reflects only its own direct
+  children's `status`; since this is a flat per-parent lookup rather
+  than a graph traversal, there's no memoization concern to test.
 
 ## Deferred to Other LLDs
 
@@ -727,11 +714,13 @@ flagged at the HLD level, not solved by adding locking here.
   same `cascade()` function by construction — there's no way for preview
   to drift from what actually commits, which is the whole point of
   [#61](https://github.com/sleb/bala/issues/61) AC3.
-- Multiple parents turn the hierarchy into a DAG, which is now load-bearing
-  on §1's invariant check, §2's ancestor/descendant walk, §4's rollup,
-  and delete cascade semantics (§Method Contract) — a future move back to
-  strict single-parent would be a simplification, not free, since callers
-  (including the Web API) would already be built against `Vec<TaskId>`.
+- The hierarchy is a tree (HLD §Product Assumptions): `parent_id` is an
+  `Option<TaskId>` across the model, the facade and the store trait, so
+  §1's invariant check and §2's ancestor/descendant walk are loops up one
+  chain rather than graph searches. Work two goals share is a dependency
+  between them, not a second parent, so a task counts toward the rolled-up
+  progress of its one parent only. Allowing a second parent later would
+  be a breaking change to every caller, including the future Web API.
 - Typed dependencies are similarly load-bearing on §3's cascade algorithm:
   starting with FS-only usage in practice doesn't defer any of this
   complexity, since the constraint/anchor abstraction had to exist from
