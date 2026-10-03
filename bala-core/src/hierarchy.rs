@@ -275,7 +275,7 @@ mod replace_parents_tests {
             .unwrap();
 
         let edges = store.transaction(|tx| tx.list_parent_edges(b)).unwrap();
-        assert!(edges.is_empty());
+        assert_eq!(edges, []);
     }
 
     #[test]
@@ -299,6 +299,6 @@ mod replace_parents_tests {
 
         assert!(matches!(result, Err(CoreError::CircularHierarchy { .. })));
         let edges = store.transaction(|tx| tx.list_parent_edges(a)).unwrap();
-        assert!(edges.is_empty());
+        assert_eq!(edges, []);
     }
 }

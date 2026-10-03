@@ -4,12 +4,12 @@
 //! IDs are stored as `BLOB(16)` raw UUID bytes (LLD-2 §Decision); dates and
 //! timestamps as ISO-8601 `TEXT` (LLD-2 §Schema).
 
-use bala_core::{StoreError, TaskId, TaskStatus, UserId};
+use bala_core::{DependencyType, StoreError, TaskId, TaskStatus, UserId};
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
-/// Maps any lower-level failure (bad blob length, unparseable date/status
-/// text) into the one variant `bala_core::StoreError` currently has.
+/// Maps any lower-level failure (bad blob length, unparseable
+/// date/status/dependency-type text) into the one variant `bala_core::StoreError` currently has.
 ///
 /// `bala-core`'s `StoreError` has only `Backend(String)` — see this crate's module docs for why `bala-store` maps into it
 /// via `.to_string()` rather than growing its own separate error type.
@@ -59,6 +59,27 @@ pub(crate) fn status_from_text(text: &str) -> Result<TaskStatus, StoreError> {
         "incomplete" => Ok(TaskStatus::Incomplete),
         "complete" => Ok(TaskStatus::Complete),
         other => Err(corrupt("task status", other)),
+    }
+}
+
+/// The `dependency_edges.dep_type` text for `dep_type`; the values match the
+/// column's `CHECK` constraint (`migrations/V1__init.sql`).
+pub(crate) fn dep_type_to_text(dep_type: DependencyType) -> &'static str {
+    match dep_type {
+        DependencyType::FinishToStart => "finish_to_start",
+        DependencyType::StartToStart => "start_to_start",
+        DependencyType::FinishToFinish => "finish_to_finish",
+        DependencyType::StartToFinish => "start_to_finish",
+    }
+}
+
+pub(crate) fn dep_type_from_text(text: &str) -> Result<DependencyType, StoreError> {
+    match text {
+        "finish_to_start" => Ok(DependencyType::FinishToStart),
+        "start_to_start" => Ok(DependencyType::StartToStart),
+        "finish_to_finish" => Ok(DependencyType::FinishToFinish),
+        "start_to_finish" => Ok(DependencyType::StartToFinish),
+        other => Err(corrupt("dependency type", other)),
     }
 }
 

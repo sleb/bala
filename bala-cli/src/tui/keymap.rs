@@ -1104,7 +1104,7 @@ mod tests {
 
         let entries = help_entries(&mode, Pane::List, DetailField::Title);
 
-        assert!(entries.is_empty());
+        assert_eq!(entries, []);
     }
 
     /// A `Mode::Confirm` for `dd` on a task that has children.

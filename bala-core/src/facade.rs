@@ -1,8 +1,8 @@
 //! The `Core` facade (LLD §Decision, §Method Contract): the single entry
 //! point every caller (CLI today, Web API later) drives.
 //!
-//! Task dependencies and date-cascade rescheduling are not implemented
-//! yet.
+//! Task dependencies can be added and removed; date-cascade rescheduling
+//! along them is not implemented yet.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,10 +11,12 @@ use chrono::Utc;
 use crate::error::CoreError;
 use crate::hierarchy::replace_parents;
 use crate::model::{
-    DeleteMode, DeleteOutcome, Direction, Field, NewTask, Parents, Placement, SiblingOrder, Task,
-    TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User, UserId,
+    DeleteMode, DeleteOutcome, Dependency, DependencyType, Direction, Field, NewTask, Parents,
+    Placement, SiblingOrder, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User,
+    UserId,
 };
 use crate::rollup;
+use crate::scheduling::check_new_dependency;
 use crate::store::{Store, StoreError, StoreTx};
 
 /// The stable key of the default task type every `Core` seeds on
@@ -145,6 +147,7 @@ impl<S: Store> Core<S> {
             start_date: new.start_date,
             due_date: new.due_date,
             assignee_id: new.assignee_id,
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -895,6 +898,137 @@ impl<S: Store> Core<S> {
         })??;
         Ok(changed)
     }
+
+    /// Makes `id` depend on `predecessor` with the given `dep_type`, per
+    /// LLD §Algorithm 2 and §Method Contract, and returns `id`'s task with
+    /// the new edge in `depends_on`.
+    ///
+    /// A task may have any number of predecessors; each new one is appended
+    /// after the existing ones. If `id` already depends on `predecessor`,
+    /// that edge's type is replaced in place rather than a second edge being
+    /// added, so this is also how a caller changes an edge's type.
+    ///
+    /// Everything runs inside one [`Store::transaction`], and every
+    /// rejection returns before anything is written. If `id` already
+    /// depends on `predecessor` with this same `dep_type`, nothing is
+    /// written and the task is returned as stored, `updated_at` unchanged;
+    /// otherwise the edge is added (or its type replaced) and `id`'s
+    /// `updated_at` is bumped. `predecessor`'s row is never written.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::SelfDependency`] if `id == predecessor`.
+    /// - [`CoreError::NotFound`] if `id` or `predecessor` names no live task
+    ///   (a soft-deleted one counts as missing); it carries whichever id is
+    ///   missing, `id` first.
+    /// - [`CoreError::DependsOnRelative`] if `predecessor` is an ancestor or
+    ///   a descendant of `id` in the hierarchy, through any of a task's
+    ///   parents.
+    /// - [`CoreError::CircularDependency`] if `predecessor` already depends
+    ///   on `id`, directly or transitively, through edges of any type and
+    ///   through soft-deleted tasks; `cycle` is `[id, predecessor, …, id]`,
+    ///   each entry depending on the next.
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn add_dependency(
+        &mut self,
+        id: TaskId,
+        predecessor: TaskId,
+        dep_type: DependencyType,
+    ) -> Result<Task, CoreError> {
+        if id == predecessor {
+            return Err(CoreError::SelfDependency(id));
+        }
+
+        let task = self.store.transaction(|tx| {
+            let mut task = match live_task(tx, id) {
+                Ok(task) => task,
+                Err(e) => return Ok(Err(e)),
+            };
+            if let Err(e) = live_task(tx, predecessor) {
+                return Ok(Err(e));
+            }
+            if let Err(e) = check_new_dependency(tx, id, predecessor) {
+                return Ok(Err(e));
+            }
+            let unchanged = Dependency {
+                predecessor_id: predecessor,
+                dep_type,
+            };
+            if task.depends_on.contains(&unchanged) {
+                task.progress = compute_progress(tx, id, task.status)?;
+                return Ok(Ok(task));
+            }
+
+            tx.add_dependency_edge(predecessor, id, dep_type)?;
+
+            // Read after the edge is written, so `depends_on` — filled by
+            // the store from the edges on every read — already includes it.
+            let Some(mut task) = tx.get_task(id)? else {
+                return Ok(Err(CoreError::NotFound(id)));
+            };
+            task.progress = compute_progress(tx, id, task.status)?;
+            task.updated_at = Utc::now();
+            tx.put_task(&task)?;
+
+            Ok(Ok(task))
+        })??;
+
+        Ok(task)
+    }
+
+    /// Drops `id`'s dependency on `predecessor`, per LLD §Algorithm 2 and
+    /// §Method Contract, and returns `id`'s task without that edge in
+    /// `depends_on`.
+    ///
+    /// `predecessor` may be soft-deleted, so a dependency on a deleted task
+    /// can still be removed. Removing an edge cannot create a cycle or a
+    /// hierarchy conflict, so no invariant check runs.
+    ///
+    /// Everything runs inside one [`Store::transaction`]. If `id` does not
+    /// depend on `predecessor`, nothing is written and the task is returned
+    /// as stored, `updated_at` unchanged; otherwise the edge is removed and
+    /// `id`'s `updated_at` is bumped. `predecessor`'s row is never written.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::NotFound`] if `id` names no live task (a soft-deleted
+    ///   one counts as missing).
+    /// - [`CoreError::Store`] if the backend fails.
+    pub fn remove_dependency(
+        &mut self,
+        id: TaskId,
+        predecessor: TaskId,
+    ) -> Result<Task, CoreError> {
+        let task = self.store.transaction(|tx| {
+            let mut task = match live_task(tx, id) {
+                Ok(task) => task,
+                Err(e) => return Ok(Err(e)),
+            };
+            if !task
+                .depends_on
+                .iter()
+                .any(|dep| dep.predecessor_id == predecessor)
+            {
+                task.progress = compute_progress(tx, id, task.status)?;
+                return Ok(Ok(task));
+            }
+
+            tx.remove_dependency_edge(predecessor, id)?;
+
+            // Read after the edge is removed, so `depends_on` — filled by
+            // the store from the edges on every read — no longer names it.
+            let Some(mut task) = tx.get_task(id)? else {
+                return Ok(Err(CoreError::NotFound(id)));
+            };
+            task.progress = compute_progress(tx, id, task.status)?;
+            task.updated_at = Utc::now();
+            tx.put_task(&task)?;
+
+            Ok(Ok(task))
+        })??;
+
+        Ok(task)
+    }
 }
 
 /// Fetches the live task `id`, or `NotFound`.
@@ -1278,7 +1412,7 @@ mod tests {
 
         let task = core.create_task(minimal_new_task("Top level")).unwrap();
 
-        assert!(task.parent_ids.is_empty());
+        assert_eq!(task.parent_ids, []);
     }
 
     #[test]
@@ -2308,7 +2442,7 @@ mod tests {
         assert_eq!(outcome.deleted.len(), 1);
         assert_eq!(outcome.deleted[0].id, task.id);
         assert!(outcome.deleted[0].deleted_at.is_some());
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
 
         // A second delete on the same (now soft-deleted) task is treated
         // as not-found, not re-tombstoned.
@@ -2470,7 +2604,7 @@ mod tests {
             deleted_ids,
             HashSet::from([root.id, mid.id, leaf.id, deepest.id])
         );
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
 
         let tree = core
             .get_tree(TreeFilter {
@@ -2508,7 +2642,7 @@ mod tests {
 
         assert_eq!(outcome.deleted.len(), 5001);
         assert!(outcome.deleted.iter().all(|t| t.deleted_at.is_some()));
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
     }
 
     #[test]
@@ -2552,7 +2686,7 @@ mod tests {
 
         let tree = core.get_tree(TreeFilter::default()).unwrap();
         let child_after = tree.iter().find(|t| t.id == child.id).unwrap();
-        assert!(child_after.parent_ids.is_empty());
+        assert_eq!(child_after.parent_ids, []);
     }
 
     #[test]
@@ -2665,6 +2799,46 @@ mod tests {
         assert!(restored.deleted_at.is_none());
         let tree = core.get_tree(TreeFilter::default()).unwrap();
         assert!(tree.iter().any(|t| t.id == task.id));
+    }
+
+    #[test]
+    fn delete_task_should_keep_dependency_edges() {
+        let mut core = new_core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        core.add_dependency(b.id, a.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        core.delete_task(a.id, DeleteMode::Subtree).unwrap();
+
+        let stored = core.get_task(b.id).unwrap().unwrap();
+        assert_eq!(
+            stored.depends_on,
+            vec![Dependency {
+                predecessor_id: a.id,
+                dep_type: DependencyType::FinishToStart,
+            }]
+        );
+    }
+
+    #[test]
+    fn restore_task_should_bring_back_its_dependencies() {
+        let mut core = new_core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        core.add_dependency(b.id, a.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.delete_task(b.id, DeleteMode::Subtree).unwrap();
+
+        let restored = core.restore_task(b.id).unwrap();
+
+        let expected = vec![Dependency {
+            predecessor_id: a.id,
+            dep_type: DependencyType::FinishToStart,
+        }];
+        assert_eq!(restored.depends_on, expected);
+        let stored = core.get_task(b.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, expected);
     }
 
     #[test]
@@ -2814,7 +2988,7 @@ mod tests {
         let deleted_ids: HashSet<_> = outcome.deleted.iter().map(|t| t.id).collect();
         assert_eq!(outcome.deleted.len(), 3);
         assert_eq!(deleted_ids, HashSet::from([a.id, d.id, c.id]));
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
         assert!(outcome.updated.iter().all(|t| !deleted_ids.contains(&t.id)));
     }
 
@@ -2871,7 +3045,7 @@ mod tests {
 
         let deleted_ids: Vec<_> = outcome.deleted.iter().map(|t| t.id).collect();
         assert_eq!(deleted_ids, vec![parent.id]);
-        assert!(outcome.updated.is_empty());
+        assert_eq!(outcome.updated, []);
         let tree = core
             .get_tree(TreeFilter {
                 include_deleted: true,
@@ -3119,7 +3293,7 @@ mod tests {
 
         let second = core.complete_task(task.id, false).unwrap();
 
-        assert!(second.is_empty());
+        assert_eq!(second, []);
         let stored = core
             .get_tree(TreeFilter::default())
             .unwrap()
@@ -3238,7 +3412,7 @@ mod tests {
 
         assert_eq!(order.children_of(None), [r1.id, r2.id]);
         assert_eq!(order.children_of(Some(r1.id)), [child.id]);
-        assert!(order.children_of(Some(r2.id)).is_empty());
+        assert_eq!(order.children_of(Some(r2.id)), []);
     }
 
     #[test]
@@ -3509,7 +3683,7 @@ mod tests {
         assert!(changed);
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(g)), [p, x, after]);
-        assert!(order.children_of(Some(p)).is_empty());
+        assert_eq!(order.children_of(Some(p)), []);
         assert_eq!(core.get_task(x).unwrap().unwrap().parent_ids, [g]);
     }
 
@@ -3525,7 +3699,7 @@ mod tests {
         assert!(changed);
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(None), [p, x, next]);
-        assert!(core.get_task(x).unwrap().unwrap().parent_ids.is_empty());
+        assert_eq!(core.get_task(x).unwrap().unwrap().parent_ids, []);
     }
 
     #[test]
@@ -3558,7 +3732,7 @@ mod tests {
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(g)), [p, x]);
         assert_eq!(order.children_of(Some(q)), [x]);
-        assert!(order.children_of(Some(p)).is_empty());
+        assert_eq!(order.children_of(Some(p)), []);
     }
 
     #[test]
@@ -3573,7 +3747,7 @@ mod tests {
 
         let order = core.sibling_order().unwrap();
         assert_eq!(order.children_of(Some(q)), [x]);
-        assert!(order.children_of(Some(p)).is_empty());
+        assert_eq!(order.children_of(Some(p)), []);
         assert!(!order.children_of(None).contains(&x));
     }
 
@@ -3604,7 +3778,7 @@ mod tests {
 
         let children = core.list_children(task.id).unwrap();
 
-        assert!(children.is_empty());
+        assert_eq!(children, []);
     }
 
     #[test]
@@ -3635,7 +3809,7 @@ mod tests {
 
         let children = core.list_children(missing).unwrap();
 
-        assert!(children.is_empty());
+        assert_eq!(children, []);
     }
 
     #[test]
@@ -3694,7 +3868,7 @@ mod tests {
 
         let updated = core.set_parents(task.id, Vec::new()).unwrap();
 
-        assert!(updated.parent_ids.is_empty());
+        assert_eq!(updated.parent_ids, []);
         let parent_children = core.list_children(parent.id).unwrap();
         assert!(!parent_children.iter().any(|t| t.id == task.id));
     }
@@ -3947,5 +4121,627 @@ mod tests {
 
         let sibling_progress_after = core.get_task(sibling.id).unwrap().unwrap().progress;
         assert!((sibling_progress_after - sibling_progress_before).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn add_dependency_should_record_predecessor_on_the_task() {
+        let mut core = new_core();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let updated = core
+            .add_dependency(task.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        let expected = vec![Dependency {
+            predecessor_id: predecessor.id,
+            dep_type: DependencyType::FinishToStart,
+        }];
+        assert_eq!(updated.id, task.id);
+        assert_eq!(updated.depends_on, expected);
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, expected);
+        let stored_predecessor = core.get_task(predecessor.id).unwrap().unwrap();
+        assert_eq!(stored_predecessor.depends_on, []);
+    }
+
+    #[test]
+    fn add_dependency_should_accept_several_predecessors_for_one_task() {
+        let mut core = new_core();
+        let first = core.create_task(minimal_new_task("First")).unwrap();
+        let second = core.create_task(minimal_new_task("Second")).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        core.add_dependency(task.id, first.id, DependencyType::FinishToStart)
+            .unwrap();
+        let updated = core
+            .add_dependency(task.id, second.id, DependencyType::StartToStart)
+            .unwrap();
+
+        assert_eq!(
+            updated.depends_on,
+            vec![
+                Dependency {
+                    predecessor_id: first.id,
+                    dep_type: DependencyType::FinishToStart,
+                },
+                Dependency {
+                    predecessor_id: second.id,
+                    dep_type: DependencyType::StartToStart,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn add_dependency_should_replace_type_on_existing_pair() {
+        let mut core = new_core();
+        let first = core.create_task(minimal_new_task("First")).unwrap();
+        let second = core.create_task(minimal_new_task("Second")).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        core.add_dependency(task.id, first.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.add_dependency(task.id, second.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        let updated = core
+            .add_dependency(task.id, first.id, DependencyType::FinishToFinish)
+            .unwrap();
+
+        assert_eq!(
+            updated.depends_on,
+            vec![
+                Dependency {
+                    predecessor_id: first.id,
+                    dep_type: DependencyType::FinishToFinish,
+                },
+                Dependency {
+                    predecessor_id: second.id,
+                    dep_type: DependencyType::FinishToStart,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn add_dependency_should_reject_self_dependency() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let result = core.add_dependency(task.id, task.id, DependencyType::FinishToStart);
+
+        assert!(matches!(result, Err(CoreError::SelfDependency(id)) if id == task.id));
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, []);
+        assert_eq!(stored.updated_at, task.updated_at);
+    }
+
+    #[test]
+    fn add_dependency_should_reject_when_task_not_found() {
+        let mut core = new_core();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let missing = TaskId::new();
+
+        let result = core.add_dependency(missing, predecessor.id, DependencyType::FinishToStart);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
+    #[test]
+    fn add_dependency_should_reject_when_predecessor_not_found() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let missing = TaskId::new();
+
+        let result = core.add_dependency(task.id, missing, DependencyType::FinishToStart);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, []);
+        assert_eq!(stored.updated_at, task.updated_at);
+    }
+
+    #[test]
+    fn add_dependency_should_reject_soft_deleted_predecessor() {
+        let mut core = new_core();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        core.delete_task(predecessor.id, DeleteMode::Subtree)
+            .unwrap();
+
+        let result = core.add_dependency(task.id, predecessor.id, DependencyType::FinishToStart);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == predecessor.id));
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, []);
+    }
+
+    #[test]
+    fn add_dependency_should_bump_updated_at() {
+        let mut core = new_core();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let updated = core
+            .add_dependency(task.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        assert_eq!(updated.created_at, task.created_at);
+        assert!(updated.updated_at >= task.updated_at);
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.updated_at, updated.updated_at);
+    }
+
+    #[test]
+    fn add_dependency_should_change_nothing_when_pair_already_linked_with_that_type() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let done_child = core
+            .create_task(NewTask {
+                parent_ids: vec![task.id],
+                ..minimal_new_task("Done child")
+            })
+            .unwrap();
+        core.create_task(NewTask {
+            parent_ids: vec![task.id],
+            ..minimal_new_task("Open child")
+        })
+        .unwrap();
+        core.complete_task(done_child.id, false).unwrap();
+        let before = core
+            .add_dependency(task.id, predecessor.id, DependencyType::StartToStart)
+            .unwrap();
+        let start = log.borrow().len();
+
+        let returned = core
+            .add_dependency(task.id, predecessor.id, DependencyType::StartToStart)
+            .unwrap();
+
+        let calls = log.borrow()[start..].to_vec();
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, m)| m != "put_task" && m != "add_dependency_edge"),
+            "calls: {calls:?}"
+        );
+        assert_eq!(returned, before);
+        assert!((returned.progress - 0.5).abs() < f32::EPSILON);
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored, before);
+    }
+
+    #[test]
+    fn add_dependency_should_reject_direct_parent_as_predecessor() {
+        let mut core = new_core();
+        let parent = titled_under(&mut core, "Parent", &[]);
+        let task = titled_under(&mut core, "Task", &[parent.id]);
+
+        let result = core.add_dependency(task.id, parent.id, DependencyType::FinishToStart);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::DependsOnRelative { task: t, other })
+                if t == task.id && other == parent.id
+        ));
+    }
+
+    #[test]
+    fn add_dependency_should_reject_distant_ancestor_as_predecessor() {
+        let mut core = new_core();
+        let great_grandparent = titled_under(&mut core, "Great-grandparent", &[]);
+        let grandparent = titled_under(&mut core, "Grandparent", &[great_grandparent.id]);
+        let parent = titled_under(&mut core, "Parent", &[grandparent.id]);
+        let task = titled_under(&mut core, "Task", &[parent.id]);
+
+        let result =
+            core.add_dependency(task.id, great_grandparent.id, DependencyType::FinishToStart);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::DependsOnRelative { task: t, other })
+                if t == task.id && other == great_grandparent.id
+        ));
+    }
+
+    #[test]
+    fn add_dependency_should_reject_descendant_as_predecessor() {
+        let mut core = new_core();
+        let task = titled_under(&mut core, "Task", &[]);
+        let child = titled_under(&mut core, "Child", &[task.id]);
+        let grandchild = titled_under(&mut core, "Grandchild", &[child.id]);
+
+        let result = core.add_dependency(task.id, grandchild.id, DependencyType::FinishToStart);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::DependsOnRelative { task: t, other })
+                if t == task.id && other == grandchild.id
+        ));
+    }
+
+    #[test]
+    fn add_dependency_should_reject_descendant_reachable_only_through_second_parent() {
+        // `descendant`'s first parent is outside `task`'s subtree; only its
+        // second parent sits under `task`, so a walk up from `descendant`
+        // that followed just the first parent of each task would miss it.
+        let mut core = new_core();
+        let task = titled_under(&mut core, "Task", &[]);
+        let outsider = titled_under(&mut core, "Outsider", &[]);
+        let child = titled_under(&mut core, "Child", &[task.id]);
+        let descendant = titled_under(&mut core, "Descendant", &[outsider.id, child.id]);
+
+        let result = core.add_dependency(task.id, descendant.id, DependencyType::FinishToStart);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::DependsOnRelative { task: t, other })
+                if t == task.id && other == descendant.id
+        ));
+    }
+
+    #[test]
+    fn add_dependency_should_reject_ancestor_reachable_only_through_second_parent() {
+        // `task` has two parents; only the second one sits under
+        // `grandparent`, so a walk that followed just the first parent of
+        // each task would never reach it.
+        let mut core = new_core();
+        let first_parent = titled_under(&mut core, "First parent", &[]);
+        let grandparent = titled_under(&mut core, "Grandparent", &[]);
+        let second_parent = titled_under(&mut core, "Second parent", &[grandparent.id]);
+        let task = titled_under(&mut core, "Task", &[first_parent.id, second_parent.id]);
+
+        let result = core.add_dependency(task.id, grandparent.id, DependencyType::FinishToStart);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::DependsOnRelative { task: t, other })
+                if t == task.id && other == grandparent.id
+        ));
+    }
+
+    #[test]
+    fn add_dependency_should_allow_sibling_as_predecessor() {
+        let mut core = new_core();
+        let parent = titled_under(&mut core, "Parent", &[]);
+        let sibling = titled_under(&mut core, "Sibling", &[parent.id]);
+        let task = titled_under(&mut core, "Task", &[parent.id]);
+
+        let updated = core
+            .add_dependency(task.id, sibling.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        assert_eq!(
+            updated.depends_on,
+            vec![Dependency {
+                predecessor_id: sibling.id,
+                dep_type: DependencyType::FinishToStart,
+            }]
+        );
+    }
+
+    #[test]
+    fn add_dependency_should_write_no_edge_when_rejected() {
+        let mut core = new_core();
+        let parent = titled_under(&mut core, "Parent", &[]);
+        let task = titled_under(&mut core, "Task", &[parent.id]);
+        let parent_before = core.get_task(parent.id).unwrap().unwrap();
+        let task_before = core.get_task(task.id).unwrap().unwrap();
+
+        // Rejected in both directions: `task` on its parent, and `parent`
+        // on its child.
+        let upward = core.add_dependency(task.id, parent.id, DependencyType::FinishToStart);
+        let downward = core.add_dependency(parent.id, task.id, DependencyType::FinishToStart);
+
+        assert!(matches!(upward, Err(CoreError::DependsOnRelative { .. })));
+        assert!(matches!(downward, Err(CoreError::DependsOnRelative { .. })));
+        let task_after = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(task_after.depends_on, []);
+        assert_eq!(task_after.updated_at, task_before.updated_at);
+        let parent_after = core.get_task(parent.id).unwrap().unwrap();
+        assert_eq!(parent_after.depends_on, []);
+        assert_eq!(parent_after.updated_at, parent_before.updated_at);
+    }
+
+    #[test]
+    fn add_dependency_should_reject_direct_cycle() {
+        let mut core = new_core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        core.add_dependency(b.id, a.id, DependencyType::FinishToStart)
+            .unwrap();
+        let a_before = core.get_task(a.id).unwrap().unwrap();
+
+        let result = core.add_dependency(a.id, b.id, DependencyType::FinishToStart);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::CircularDependency { cycle }) if cycle == vec![a.id, b.id, a.id]
+        ));
+        let a_after = core.get_task(a.id).unwrap().unwrap();
+        assert_eq!(a_after.depends_on, []);
+        assert_eq!(a_after.updated_at, a_before.updated_at);
+    }
+
+    #[test]
+    fn add_dependency_should_reject_cycle_through_transitive_predecessor() {
+        let mut core = new_core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let c = core.create_task(minimal_new_task("C")).unwrap();
+        core.add_dependency(b.id, a.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.add_dependency(c.id, b.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        let result = core.add_dependency(a.id, c.id, DependencyType::FinishToStart);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::CircularDependency { cycle }) if cycle == vec![a.id, c.id, b.id, a.id]
+        ));
+        let stored = core.get_task(a.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, []);
+    }
+
+    #[test]
+    fn add_dependency_should_report_the_cycle_path_from_task_back_to_itself() {
+        // `predecessor` depends on a dead-end branch (`decoy`, which depends
+        // on `other`) and on `middle`, which depends on `task`. Only the
+        // `middle` branch leads back to `task`, so the reported path must
+        // skip the decoy branch entirely.
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let other = core.create_task(minimal_new_task("Other")).unwrap();
+        let decoy = core.create_task(minimal_new_task("Decoy")).unwrap();
+        let middle = core.create_task(minimal_new_task("Middle")).unwrap();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        for (successor, pred) in [
+            (decoy.id, other.id),
+            (middle.id, task.id),
+            (predecessor.id, decoy.id),
+            (predecessor.id, middle.id),
+        ] {
+            core.add_dependency(successor, pred, DependencyType::FinishToStart)
+                .unwrap();
+        }
+
+        let result = core.add_dependency(task.id, predecessor.id, DependencyType::FinishToStart);
+
+        let Err(CoreError::CircularDependency { cycle }) = result else {
+            panic!("expected CircularDependency, got {result:?}");
+        };
+        assert_eq!(cycle, vec![task.id, predecessor.id, middle.id, task.id]);
+        // Past the new edge itself, each task in the path depends on the
+        // next through an edge that already exists.
+        for pair in cycle[1..].windows(2) {
+            let stored = core.get_task(pair[0]).unwrap().unwrap();
+            assert!(
+                stored
+                    .depends_on
+                    .iter()
+                    .any(|d| d.predecessor_id == pair[1]),
+                "{:?} does not depend on {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn add_dependency_should_allow_redundant_edge_that_closes_no_cycle() {
+        let mut core = new_core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let c = core.create_task(minimal_new_task("C")).unwrap();
+        core.add_dependency(b.id, a.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.add_dependency(c.id, b.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        let updated = core
+            .add_dependency(c.id, a.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        let predecessors: Vec<TaskId> = updated
+            .depends_on
+            .iter()
+            .map(|d| d.predecessor_id)
+            .collect();
+        assert_eq!(predecessors, vec![b.id, a.id]);
+    }
+
+    #[test]
+    fn add_dependency_should_reject_cycle_regardless_of_dependency_type() {
+        let types = [
+            DependencyType::FinishToStart,
+            DependencyType::StartToStart,
+            DependencyType::FinishToFinish,
+            DependencyType::StartToFinish,
+        ];
+        for existing in types {
+            for closing in types {
+                let mut core = new_core();
+                let a = core.create_task(minimal_new_task("A")).unwrap();
+                let b = core.create_task(minimal_new_task("B")).unwrap();
+                core.add_dependency(b.id, a.id, existing).unwrap();
+
+                let result = core.add_dependency(a.id, b.id, closing);
+
+                assert!(
+                    matches!(result, Err(CoreError::CircularDependency { .. })),
+                    "existing {existing:?}, closing {closing:?}: got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn add_dependency_should_reject_cycle_through_soft_deleted_task() {
+        let mut core = new_core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let c = core.create_task(minimal_new_task("C")).unwrap();
+        core.add_dependency(b.id, a.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.add_dependency(c.id, b.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.delete_task(b.id, DeleteMode::Subtree).unwrap();
+
+        let result = core.add_dependency(a.id, c.id, DependencyType::FinishToStart);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::CircularDependency { cycle }) if cycle == vec![a.id, c.id, b.id, a.id]
+        ));
+        let stored = core.get_task(a.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, []);
+    }
+
+    #[test]
+    fn remove_dependency_should_drop_predecessor_from_depends_on() {
+        let mut core = new_core();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let with_edge = core
+            .add_dependency(task.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        let updated = core.remove_dependency(task.id, predecessor.id).unwrap();
+
+        assert_eq!(updated.id, task.id);
+        assert_eq!(updated.depends_on, []);
+        assert!(updated.updated_at >= with_edge.updated_at);
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, []);
+        assert_eq!(stored.updated_at, updated.updated_at);
+    }
+
+    #[test]
+    fn remove_dependency_should_keep_other_predecessors() {
+        let mut core = new_core();
+        let first = core.create_task(minimal_new_task("First")).unwrap();
+        let second = core.create_task(minimal_new_task("Second")).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        core.add_dependency(task.id, first.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.add_dependency(task.id, second.id, DependencyType::StartToStart)
+            .unwrap();
+
+        let updated = core.remove_dependency(task.id, first.id).unwrap();
+
+        let expected = vec![Dependency {
+            predecessor_id: second.id,
+            dep_type: DependencyType::StartToStart,
+        }];
+        assert_eq!(updated.depends_on, expected);
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, expected);
+    }
+
+    #[test]
+    fn remove_dependency_should_reject_when_task_not_found() {
+        let mut core = new_core();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let missing = TaskId::new();
+
+        let result = core.remove_dependency(missing, predecessor.id);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == missing));
+    }
+
+    #[test]
+    fn remove_dependency_should_reject_soft_deleted_task() {
+        let mut core = new_core();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        core.add_dependency(task.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.delete_task(task.id, DeleteMode::Subtree).unwrap();
+
+        let result = core.remove_dependency(task.id, predecessor.id);
+
+        assert!(matches!(result, Err(CoreError::NotFound(id)) if id == task.id));
+    }
+
+    #[test]
+    fn remove_dependency_should_change_nothing_when_no_such_edge_exists() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let other = core.create_task(minimal_new_task("Other")).unwrap();
+        let unrelated = core.create_task(minimal_new_task("Unrelated")).unwrap();
+        let done_child = core
+            .create_task(NewTask {
+                parent_ids: vec![parent.id],
+                ..minimal_new_task("Done child")
+            })
+            .unwrap();
+        core.create_task(NewTask {
+            parent_ids: vec![parent.id],
+            ..minimal_new_task("Open child")
+        })
+        .unwrap();
+        core.complete_task(done_child.id, false).unwrap();
+        let before = core
+            .add_dependency(parent.id, other.id, DependencyType::FinishToStart)
+            .unwrap();
+        let start = log.borrow().len();
+
+        let returned = core.remove_dependency(parent.id, unrelated.id).unwrap();
+
+        let calls = log.borrow()[start..].to_vec();
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, m)| m != "put_task" && m != "remove_dependency_edge"),
+            "calls: {calls:?}"
+        );
+        assert_eq!(returned, before);
+        assert!((returned.progress - 0.5).abs() < f32::EPSILON);
+        let stored = core.get_task(parent.id).unwrap().unwrap();
+        assert_eq!(stored, before);
+    }
+
+    #[test]
+    fn remove_dependency_should_work_for_a_soft_deleted_predecessor() {
+        let mut core = new_core();
+        let predecessor = core.create_task(minimal_new_task("Predecessor")).unwrap();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        core.add_dependency(task.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.delete_task(predecessor.id, DeleteMode::Subtree)
+            .unwrap();
+
+        let updated = core.remove_dependency(task.id, predecessor.id).unwrap();
+
+        assert_eq!(updated.depends_on, []);
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on, []);
+    }
+
+    #[test]
+    fn remove_dependency_then_add_reverse_edge_should_succeed() {
+        let mut core = new_core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        core.add_dependency(b.id, a.id, DependencyType::FinishToStart)
+            .unwrap();
+        core.remove_dependency(b.id, a.id).unwrap();
+
+        let updated = core
+            .add_dependency(a.id, b.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        assert_eq!(
+            updated.depends_on,
+            vec![Dependency {
+                predecessor_id: b.id,
+                dep_type: DependencyType::FinishToStart,
+            }]
+        );
     }
 }

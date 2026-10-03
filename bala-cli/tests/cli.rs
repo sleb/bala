@@ -482,6 +482,150 @@ fn task_delete_promote_children_should_print_only_the_deleted_task_id() {
     assert_eq!(String::from_utf8(output).unwrap(), format!("{parent_id}\n"));
 }
 
+/// Makes `task_id` depend on `predecessor_id` via `bala dep add`.
+fn add_dependency(db_path: &std::path::Path, task_id: &str, predecessor_id: &str) {
+    bala_cmd(db_path)
+        .args(["dep", "add", task_id, "--on", predecessor_id])
+        .assert()
+        .success();
+}
+
+#[test]
+fn task_delete_should_name_dependent_tasks_before_confirming() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a_id = add_task(&db_path, &["--title", "Task A"]);
+    let b_id = add_task(&db_path, &["--title", "Task B"]);
+    add_dependency(&db_path, &b_id, &a_id);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &a_id])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stderr(contains("1 task(s) depend on what this deletes:"))
+        .stderr(contains(format!("  {b_id} Task B")))
+        .stdout(contains("Aborted"));
+
+    bala_cmd(&db_path)
+        .args(["task", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("Task A"));
+}
+
+#[test]
+fn task_delete_with_yes_should_still_print_the_dependents_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a_id = add_task(&db_path, &["--title", "Task A"]);
+    let b_id = add_task(&db_path, &["--title", "Task B"]);
+    add_dependency(&db_path, &b_id, &a_id);
+
+    let output = bala_cmd(&db_path)
+        .args(["task", "delete", &a_id, "--yes"])
+        .assert()
+        .success()
+        .stderr(contains("1 task(s) depend on what this deletes:"))
+        .stderr(contains(format!("  {b_id} Task B")))
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(String::from_utf8(output).unwrap(), format!("{a_id}\n"));
+}
+
+#[test]
+fn task_delete_cascade_should_warn_about_dependents_of_descendants() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    let child_id = add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+    let dependent_id = add_task(&db_path, &["--title", "Dependent task"]);
+    add_dependency(&db_path, &dependent_id, &child_id);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &parent_id, "--cascade", "--yes"])
+        .assert()
+        .success()
+        .stderr(contains("1 task(s) depend on what this deletes:"))
+        .stderr(contains(format!("  {dependent_id} Dependent task")));
+}
+
+#[test]
+fn task_delete_cascade_should_warn_about_surviving_subtask_depending_on_deleted_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let target_id = add_task(&db_path, &["--title", "Target task"]);
+    let other_parent_id = add_task(&db_path, &["--title", "Other parent"]);
+    let doomed_id = add_task(
+        &db_path,
+        &["--title", "Doomed child", "--parent", &target_id],
+    );
+    let survivor_id = add_task(
+        &db_path,
+        &[
+            "--title",
+            "Survivor child",
+            "--parent",
+            &target_id,
+            "--parent",
+            &other_parent_id,
+        ],
+    );
+    add_dependency(&db_path, &survivor_id, &doomed_id);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &target_id, "--cascade", "--yes"])
+        .assert()
+        .success()
+        .stdout(contains(doomed_id))
+        .stdout(contains(survivor_id.clone()).not())
+        .stderr(contains("1 task(s) depend on what this deletes:"))
+        .stderr(contains(format!("  {survivor_id} Survivor child")));
+}
+
+#[test]
+fn task_delete_promote_children_should_warn_only_about_the_task_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let parent_id = add_task(&db_path, &["--title", "Parent task"]);
+    let child_id = add_task(&db_path, &["--title", "Child task", "--parent", &parent_id]);
+    let on_child_id = add_task(&db_path, &["--title", "Depends on child"]);
+    add_dependency(&db_path, &on_child_id, &child_id);
+    let on_parent_id = add_task(&db_path, &["--title", "Depends on parent"]);
+    add_dependency(&db_path, &on_parent_id, &parent_id);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &parent_id, "--promote-children", "--yes"])
+        .assert()
+        .success()
+        .stderr(contains("1 task(s) depend on what this deletes:"))
+        .stderr(contains(format!("  {on_parent_id} Depends on parent")))
+        .stderr(contains(on_child_id).not());
+}
+
+#[test]
+fn task_delete_without_dependents_should_print_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a_id = add_task(&db_path, &["--title", "Task A"]);
+    let b_id = add_task(&db_path, &["--title", "Task B"]);
+    add_dependency(&db_path, &a_id, &b_id);
+
+    bala_cmd(&db_path)
+        .args(["task", "delete", &a_id, "--yes"])
+        .assert()
+        .success()
+        .stderr(contains("depend on what this deletes").not());
+}
+
 #[test]
 fn task_restore_should_bring_task_back_into_ls() {
     let dir = tempfile::tempdir().unwrap();
@@ -1070,4 +1214,181 @@ fn task_add_with_type_set_by_type_set_should_succeed() {
         .args(["task", "add", "--title", "x", "--type", "goal"])
         .assert()
         .success();
+}
+
+#[test]
+fn dep_add_should_print_the_task_with_its_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a = add_task(&db_path, &["--title", "A"]);
+    let b = add_task(&db_path, &["--title", "B"]);
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &b, "--on", &a])
+        .assert()
+        .success()
+        .stdout(contains("B"))
+        .stdout(contains(format!("  depends on: {a} (fs)")));
+}
+
+#[test]
+fn dep_add_twice_should_list_both_predecessors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a = add_task(&db_path, &["--title", "A"]);
+    let b = add_task(&db_path, &["--title", "B"]);
+    let c = add_task(&db_path, &["--title", "C"]);
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &c, "--on", &a])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &c, "--on", &b])
+        .assert()
+        .success()
+        .stdout(contains(format!("  depends on: {a} (fs)")))
+        .stdout(contains(format!("  depends on: {b} (fs)")));
+}
+
+#[test]
+fn dep_add_should_default_to_finish_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a = add_task(&db_path, &["--title", "A"]);
+    let b = add_task(&db_path, &["--title", "B"]);
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &b, "--on", &a])
+        .assert()
+        .success()
+        .stdout(contains("(fs)"))
+        .stdout(contains("(ss)").not())
+        .stdout(contains("(ff)").not())
+        .stdout(contains("(sf)").not());
+}
+
+#[test]
+fn dep_add_with_type_should_record_that_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a = add_task(&db_path, &["--title", "A"]);
+    let b = add_task(&db_path, &["--title", "B"]);
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &b, "--on", &a, "--type", "ss"])
+        .assert()
+        .success()
+        .stdout(contains(format!("  depends on: {a} (ss)")));
+}
+
+#[test]
+fn dep_add_with_unknown_type_should_fail_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a = add_task(&db_path, &["--title", "A"]);
+    let b = add_task(&db_path, &["--title", "B"]);
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &b, "--on", &a, "--type", "xx"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("invalid value 'xx'"));
+}
+
+#[test]
+fn dep_add_on_itself_should_fail_with_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a = add_task(&db_path, &["--title", "A"]);
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &a, "--on", &a])
+        .assert()
+        .failure()
+        .stderr(contains("cannot depend on itself"));
+}
+
+#[test]
+fn dep_add_on_own_parent_should_fail_with_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let p = add_task(&db_path, &["--title", "P"]);
+    let c = add_task(&db_path, &["--title", "C", "--parent", &p]);
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &c, "--on", &p])
+        .assert()
+        .failure()
+        .stderr(contains("ancestor"));
+}
+
+#[test]
+fn dep_add_closing_a_cycle_should_fail_with_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a = add_task(&db_path, &["--title", "A"]);
+    let b = add_task(&db_path, &["--title", "B"]);
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &b, "--on", &a])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &a, "--on", &b])
+        .assert()
+        .failure()
+        .stderr(contains("cycle"));
+}
+
+#[test]
+fn dep_rm_should_remove_the_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a = add_task(&db_path, &["--title", "A"]);
+    let b = add_task(&db_path, &["--title", "B"]);
+
+    bala_cmd(&db_path)
+        .args(["dep", "add", &b, "--on", &a])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["dep", "rm", &b, "--on", &a])
+        .assert()
+        .success()
+        .stdout(contains("B"))
+        .stdout(contains("depends on:").not());
+}
+
+#[test]
+fn dep_rm_with_unknown_task_id_should_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let a = add_task(&db_path, &["--title", "A"]);
+
+    bala_cmd(&db_path)
+        .args([
+            "dep",
+            "rm",
+            "00000000-0000-0000-0000-000000000000",
+            "--on",
+            &a,
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("not found"));
 }

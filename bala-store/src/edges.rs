@@ -1,13 +1,9 @@
-//! `parent_edges` queries.
-//!
-//! `dependency_edges` exists in the schema (LLD-2 §Schema) but has no
-//! module of its own yet — it sits unused until the dependency-edge
-//! `StoreTx` methods are added alongside task dependencies.
+//! `parent_edges` and `dependency_edges` queries (LLD-2 §Schema).
 
-use bala_core::{Parents, Placement, StoreError, TaskId};
+use bala_core::{Dependency, DependencyType, Parents, Placement, StoreError, TaskId};
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use crate::convert::{blob_to_task_id, id_to_blob};
+use crate::convert::{blob_to_task_id, dep_type_from_text, dep_type_to_text, id_to_blob};
 use crate::task::sqlite_err;
 
 pub(crate) fn list_parent_edges(tx: &Transaction, id: TaskId) -> Result<Vec<TaskId>, StoreError> {
@@ -226,5 +222,102 @@ pub(crate) fn swap_child_positions(
         )
         .map_err(sqlite_err)?;
     }
+    Ok(())
+}
+
+/// Lists the edges whose successor is `id` — what `id` depends on — in
+/// insertion order. `dependency_edges` is a rowid table and an edge's rowid
+/// is assigned when its pair is first inserted, so `ORDER BY rowid` is
+/// insertion order. Tombstoned tasks are included.
+pub(crate) fn list_dependency_edges(
+    tx: &Transaction,
+    id: TaskId,
+) -> Result<Vec<Dependency>, StoreError> {
+    let id_blob = id_to_blob(id);
+    let mut stmt = tx
+        .prepare(
+            "SELECT predecessor_id, dep_type FROM dependency_edges \
+             WHERE successor_id = ?1 ORDER BY rowid",
+        )
+        .map_err(sqlite_err)?;
+    let rows = stmt
+        .query_map(params![id_blob.as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sqlite_err)?;
+
+    let mut dependencies = Vec::new();
+    for row in rows {
+        let (predecessor, dep_type) = row.map_err(sqlite_err)?;
+        dependencies.push(Dependency {
+            predecessor_id: blob_to_task_id(&predecessor)?,
+            dep_type: dep_type_from_text(&dep_type)?,
+        });
+    }
+    Ok(dependencies)
+}
+
+/// Lists the successors of `id` — the tasks that depend on it — in insertion
+/// order (see [`list_dependency_edges`]). Tombstoned tasks are included.
+pub(crate) fn list_successor_edges(
+    tx: &Transaction,
+    id: TaskId,
+) -> Result<Vec<TaskId>, StoreError> {
+    let id_blob = id_to_blob(id);
+    let mut stmt = tx
+        .prepare(
+            "SELECT successor_id FROM dependency_edges WHERE predecessor_id = ?1 ORDER BY rowid",
+        )
+        .map_err(sqlite_err)?;
+    let rows = stmt
+        .query_map(params![id_blob.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_err)?;
+
+    let mut successor_ids = Vec::new();
+    for row in rows {
+        let blob = row.map_err(sqlite_err)?;
+        successor_ids.push(blob_to_task_id(&blob)?);
+    }
+    Ok(successor_ids)
+}
+
+/// Inserts the `predecessor -> successor` edge, or replaces its type if the
+/// pair is already linked. The upsert updates the existing row in place, so
+/// a replaced edge keeps its rowid and with it its place in both lists.
+pub(crate) fn add_dependency_edge(
+    tx: &Transaction,
+    predecessor: TaskId,
+    successor: TaskId,
+    dep_type: DependencyType,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO dependency_edges (predecessor_id, successor_id, dep_type) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(predecessor_id, successor_id) DO UPDATE SET dep_type = excluded.dep_type",
+        params![
+            id_to_blob(predecessor).as_slice(),
+            id_to_blob(successor).as_slice(),
+            dep_type_to_text(dep_type)
+        ],
+    )
+    .map_err(sqlite_err)?;
+    Ok(())
+}
+
+/// Deletes the `predecessor -> successor` edge; no-op if the pair is not
+/// linked.
+pub(crate) fn remove_dependency_edge(
+    tx: &Transaction,
+    predecessor: TaskId,
+    successor: TaskId,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "DELETE FROM dependency_edges WHERE predecessor_id = ?1 AND successor_id = ?2",
+        params![
+            id_to_blob(predecessor).as_slice(),
+            id_to_blob(successor).as_slice()
+        ],
+    )
+    .map_err(sqlite_err)?;
     Ok(())
 }

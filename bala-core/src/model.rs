@@ -97,11 +97,38 @@ pub enum TaskStatus {
     Complete,
 }
 
+/// One dependency of a task: a predecessor and how the two are linked (LLD
+/// §Data Model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Dependency {
+    pub predecessor_id: TaskId,
+    pub dep_type: DependencyType,
+}
+
+/// Which end of the predecessor constrains which end of the successor.
+///
+/// There is one edge per (predecessor, successor) pair: adding a new type
+/// between an already-linked pair replaces the existing edge rather than
+/// adding a second one, so removing a dependency never has to disambiguate
+/// by type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DependencyType {
+    /// The predecessor finishes before the successor starts.
+    #[default]
+    FinishToStart,
+    /// The predecessor starts before the successor starts.
+    StartToStart,
+    /// The predecessor finishes before the successor finishes.
+    FinishToFinish,
+    /// The predecessor starts before the successor finishes.
+    StartToFinish,
+}
+
 /// A task as stored and returned by the core library.
 ///
-/// Deliberately narrower than the full LLD shape: the dependency fields
-/// (`depends_on`, `out_of_sync`) are omitted until dependencies are
-/// implemented.
+/// Deliberately narrower than the full LLD shape (LLD §Data Model):
+/// `out_of_sync` is omitted, since nothing cascades dates along dependencies
+/// yet and so no task can fall out of sync with its predecessors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: TaskId,
@@ -126,6 +153,12 @@ pub struct Task {
     /// `None` means unassigned. `Core::create_task` validates a `Some`
     /// value against `Store::get_user` before persisting.
     pub assignee_id: Option<UserId>,
+    /// The tasks this one depends on, each with its link type, in the order
+    /// the dependencies were added. Filled by the store from its dependency
+    /// edges on every read; `StoreTx::put_task` ignores it, so the edges are
+    /// its only source. May name a soft-deleted predecessor, since a
+    /// soft-deleted task keeps its dependency edges.
+    pub depends_on: Vec<Dependency>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `Some` means the task is soft-deleted; `None` means live.
@@ -353,7 +386,7 @@ mod tests {
         let a = TaskId::new();
         let b = a;
         assert_eq!(a, b);
-        assert!(!format!("{a:?}").is_empty());
+        assert_ne!(format!("{a:?}"), "");
     }
 
     #[test]
@@ -384,6 +417,11 @@ mod tests {
     }
 
     #[test]
+    fn dependency_type_should_default_to_finish_to_start() {
+        assert_eq!(DependencyType::default(), DependencyType::FinishToStart);
+    }
+
+    #[test]
     fn task_is_constructible_with_expected_fields() {
         let now = Utc::now();
         let task = Task {
@@ -397,6 +435,7 @@ mod tests {
             start_date: None,
             due_date: None,
             assignee_id: None,
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -405,7 +444,7 @@ mod tests {
 
         assert_eq!(task.title, "Write tests");
         assert_eq!(task.status, TaskStatus::Incomplete);
-        assert!(task.parent_ids.is_empty());
+        assert_eq!(task.parent_ids, []);
         assert!((task.progress - 0.0).abs() < f32::EPSILON);
     }
 
@@ -423,6 +462,7 @@ mod tests {
             start_date: None,
             due_date: None,
             assignee_id: None,
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,

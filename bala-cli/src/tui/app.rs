@@ -1634,7 +1634,7 @@ mod tests {
         let _ = apply_action(&mut app, &mut core, Action::CancelInsert);
 
         assert_eq!(app.mode(), &Mode::Normal);
-        assert!(app.rows().is_empty());
+        assert_eq!(app.rows(), []);
     }
 
     #[test]
@@ -1672,7 +1672,7 @@ mod tests {
             } if buffer.is_empty()
         ));
         assert!(app.error().is_some());
-        assert!(app.rows().is_empty());
+        assert_eq!(app.rows(), []);
     }
 
     #[test]
@@ -2070,7 +2070,7 @@ mod tests {
 
         assert_eq!(app.mode(), &Mode::Normal);
         assert_eq!(app.pane(), Pane::List);
-        assert!(app.rows().is_empty());
+        assert_eq!(app.rows(), []);
         let tasks = core
             .get_tree(bala_core::TreeFilter::default())
             .expect("get_tree should succeed");
@@ -2320,7 +2320,7 @@ mod tests {
             .iter()
             .find(|task| task.id == k.id)
             .expect("a child the prompt never mentioned should survive");
-        assert!(kid.parent_ids.is_empty());
+        assert_eq!(kid.parent_ids, []);
         assert!(app.rows().iter().any(|row| row.id == k.id));
     }
 
@@ -2437,7 +2437,7 @@ mod tests {
         assert_eq!(app.error(), None);
         let tasks = live_tasks(&core);
         let task = tasks.iter().find(|t| t.id == k.id).expect("child survives");
-        assert!(task.parent_ids.is_empty());
+        assert_eq!(task.parent_ids, []);
         assert_eq!(titles(&app), vec!["K"]);
         let row = &app.rows()[0];
         assert_eq!(row.id, k.id);
@@ -3018,7 +3018,7 @@ mod tests {
         let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
 
         assert_eq!(app.mode(), &Mode::Normal);
-        assert!(app.rows().is_empty());
+        assert_eq!(app.rows(), []);
         assert_eq!(app.error(), None);
     }
 
@@ -3336,7 +3336,7 @@ mod tests {
                 buffer,
             } => {
                 assert_eq!(*id, child.id);
-                assert!(!buffer.is_empty());
+                assert_ne!(buffer, "");
                 buffer.chars().count()
             }
             other => panic!("expected Mode::Insert with Parents field, got {other:?}"),
@@ -3353,7 +3353,7 @@ mod tests {
             .get_task(child.id)
             .expect("get_task should succeed")
             .expect("child should exist");
-        assert!(updated_child.parent_ids.is_empty());
+        assert_eq!(updated_child.parent_ids, []);
         let child_row = app
             .rows()
             .iter()
@@ -4069,7 +4069,7 @@ mod tests {
         app.type_filter = Some("nonexistent".to_string());
         super::refresh_rows_from_tree(&mut app, &mut core, Some(goal_task.id));
 
-        assert!(app.rows().is_empty());
+        assert_eq!(app.rows(), []);
         assert_eq!(app.selected_index(), None);
     }
 }

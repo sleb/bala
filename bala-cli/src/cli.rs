@@ -6,13 +6,15 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use bala_core::{
-    Core, CoreError, DeleteMode, Field, NewTask, StoreError, Task, TaskId, TaskPatch, TaskStatus,
-    TaskType, TreeFilter, UserId,
+    Core, CoreError, DeleteMode, DependencyType, Field, NewTask, StoreError, Task, TaskId,
+    TaskPatch, TaskStatus, TaskType, TreeFilter, UserId,
 };
 use bala_store::SqliteStore;
 use chrono::NaiveDate;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
+
+use crate::render;
 
 /// Top-level CLI arguments.
 #[derive(Debug, Parser)]
@@ -36,6 +38,8 @@ pub enum Commands {
     User(UserArgs),
     /// Task type operations: `ls`, `set`.
     Type(TypeArgs),
+    /// Task dependency operations: `add`, `rm`.
+    Dep(DepArgs),
 }
 
 #[derive(Debug, Args)]
@@ -255,6 +259,79 @@ pub struct TypeSetArgs {
     pub sort_order: Option<i32>,
 }
 
+#[derive(Debug, Args)]
+pub struct DepArgs {
+    #[command(subcommand)]
+    pub command: DepCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DepCommands {
+    /// Make a task depend on a predecessor task (or change the type of an
+    /// existing dependency).
+    Add(DepAddArgs),
+    /// Remove a task's dependency on a predecessor task.
+    Rm(DepRmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DepAddArgs {
+    /// Id of the dependent task.
+    pub id: Uuid,
+
+    /// Id of the predecessor task.
+    #[arg(long, value_name = "PREDECESSOR_ID")]
+    pub on: Uuid,
+
+    /// How the two tasks' schedules are linked.
+    #[arg(long = "type", value_name = "TYPE", value_enum, default_value_t = DepTypeArg::Fs)]
+    pub dep_type: DepTypeArg,
+}
+
+#[derive(Debug, Args)]
+pub struct DepRmArgs {
+    /// Id of the dependent task.
+    pub id: Uuid,
+
+    /// Id of the predecessor task.
+    #[arg(long, value_name = "PREDECESSOR_ID")]
+    pub on: Uuid,
+}
+
+/// The `--type` values `dep add` accepts, one per [`DependencyType`].
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum DepTypeArg {
+    /// Finish-to-start: the predecessor finishes before this task starts.
+    Fs,
+    /// Start-to-start: the predecessor starts before this task starts.
+    Ss,
+    /// Finish-to-finish: the predecessor finishes before this task finishes.
+    Ff,
+    /// Start-to-finish: the predecessor starts before this task finishes.
+    Sf,
+}
+
+impl From<DepTypeArg> for DependencyType {
+    fn from(arg: DepTypeArg) -> Self {
+        match arg {
+            DepTypeArg::Fs => Self::FinishToStart,
+            DepTypeArg::Ss => Self::StartToStart,
+            DepTypeArg::Ff => Self::FinishToFinish,
+            DepTypeArg::Sf => Self::StartToFinish,
+        }
+    }
+}
+
+/// The `--type` abbreviation for `dep_type`, as `dep add`/`dep rm` print it.
+fn dep_type_abbrev(dep_type: DependencyType) -> &'static str {
+    match dep_type {
+        DependencyType::FinishToStart => "fs",
+        DependencyType::StartToStart => "ss",
+        DependencyType::FinishToFinish => "ff",
+        DependencyType::StartToFinish => "sf",
+    }
+}
+
 /// Errors that can surface while dispatching a command, distinct from
 /// `CoreError` only in that it also covers opening the store itself.
 #[derive(Debug, thiserror::Error)]
@@ -382,11 +459,7 @@ fn run_task_ls(db_path: &Path, args: &LsArgs) -> Result<(), CliError> {
         ..TreeFilter::default()
     };
     let tasks = core.get_tree(filter)?;
-    let names: HashMap<UserId, String> = core
-        .list_users()?
-        .into_iter()
-        .map(|user| (user.id, user.name))
-        .collect();
+    let names = user_names(&core)?;
     for task in &tasks {
         println!("{}", format_task_line(task, &names));
     }
@@ -432,11 +505,7 @@ fn run_task_edit(db_path: &Path, args: EditArgs) -> Result<(), CliError> {
         type_key: field_from(args.type_key, false),
     };
     let updated = core.update_task(TaskId::from(args.id), patch)?;
-    let names: HashMap<UserId, String> = core
-        .list_users()?
-        .into_iter()
-        .map(|user| (user.id, user.name))
-        .collect();
+    let names = user_names(&core)?;
     for task in &updated {
         println!("{}", format_task_line(task, &names));
     }
@@ -464,6 +533,8 @@ fn run_task_delete(db_path: &Path, args: &DeleteArgs) -> Result<(), CliError> {
         }
     };
 
+    warn_about_dependents(&core, target_id, mode)?;
+
     if !args.yes && !confirm(&format!("Delete task {:?}? [y/N] ", target.title))? {
         println!("Aborted: nothing was deleted.");
         return Ok(());
@@ -472,6 +543,38 @@ fn run_task_delete(db_path: &Path, args: &DeleteArgs) -> Result<(), CliError> {
     let outcome = core.delete_task(target_id, mode)?;
     for task in &outcome.deleted {
         println!("{}", Uuid::from(task.id));
+    }
+    Ok(())
+}
+
+/// Prints to stderr the live tasks that depend on what deleting `target_id`
+/// under `mode` would delete, and that are not deleted themselves: under
+/// `DeleteMode::Subtree`, the task and every descendant left with no
+/// parent outside the deleted set (a descendant still under another parent
+/// survives); under `DeleteMode::PromoteChildren`, the task alone. Prints
+/// nothing when there are none.
+///
+/// The set is computed client-side from a tree read separate from the
+/// delete, so a concurrent change between the two can make the warning
+/// stale; it is advisory only.
+fn warn_about_dependents(
+    core: &Core<SqliteStore>,
+    target_id: TaskId,
+    mode: DeleteMode,
+) -> Result<(), CliError> {
+    let tasks = core.get_tree(TreeFilter::default())?;
+    let deleted = match mode {
+        DeleteMode::Subtree => render::subtree_delete_ids(target_id, &tasks),
+        DeleteMode::PromoteChildren => vec![target_id],
+    };
+    let dependents = render::dependents_of(&deleted, &tasks);
+    if dependents.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!("{} task(s) depend on what this deletes:", dependents.len());
+    for task in dependents {
+        eprintln!("  {} {}", Uuid::from(task.id), task.title);
     }
     Ok(())
 }
@@ -491,11 +594,7 @@ fn confirm(prompt: &str) -> Result<bool, CliError> {
 fn run_task_restore(db_path: &Path, args: &RestoreArgs) -> Result<(), CliError> {
     let mut core = open_core(db_path)?;
     let task = core.restore_task(TaskId::from(args.id))?;
-    let names: HashMap<UserId, String> = core
-        .list_users()?
-        .into_iter()
-        .map(|user| (user.id, user.name))
-        .collect();
+    let names = user_names(&core)?;
     println!("{}", format_task_line(&task, &names));
     Ok(())
 }
@@ -503,11 +602,7 @@ fn run_task_restore(db_path: &Path, args: &RestoreArgs) -> Result<(), CliError> 
 fn run_task_complete(db_path: &Path, args: &CompleteArgs) -> Result<(), CliError> {
     let mut core = open_core(db_path)?;
     let completed = core.complete_task(TaskId::from(args.id), args.cascade)?;
-    let names: HashMap<UserId, String> = core
-        .list_users()?
-        .into_iter()
-        .map(|user| (user.id, user.name))
-        .collect();
+    let names = user_names(&core)?;
     for task in &completed {
         println!("{}", format_task_line(task, &names));
     }
@@ -517,11 +612,7 @@ fn run_task_complete(db_path: &Path, args: &CompleteArgs) -> Result<(), CliError
 fn run_task_reopen(db_path: &Path, args: &ReopenArgs) -> Result<(), CliError> {
     let mut core = open_core(db_path)?;
     let task = core.reopen_task(TaskId::from(args.id))?;
-    let names: HashMap<UserId, String> = core
-        .list_users()?
-        .into_iter()
-        .map(|user| (user.id, user.name))
-        .collect();
+    let names = user_names(&core)?;
     println!("{}", format_task_line(&task, &names));
     Ok(())
 }
@@ -530,12 +621,65 @@ fn run_task_mv(db_path: &Path, args: &MvArgs) -> Result<(), CliError> {
     let mut core = open_core(db_path)?;
     let new_parents = args.parents.iter().copied().map(TaskId::from).collect();
     let task = core.set_parents(TaskId::from(args.id), new_parents)?;
-    let names: HashMap<UserId, String> = core
+    let names = user_names(&core)?;
+    println!("{}", format_task_line(&task, &names));
+    Ok(())
+}
+
+/// Runs the given dependency command against the store at `db_path`,
+/// printing the dependent task and its remaining predecessors on success.
+///
+/// # Errors
+///
+/// Returns `Err` if the store can't be opened or the underlying `Core`
+/// call fails (an unknown or deleted task, a self-dependency, a dependency
+/// between a task and its ancestor or descendant, or one that would close
+/// a cycle).
+pub fn run_dep_command(db_path: &Path, command: DepCommands) -> Result<(), CliError> {
+    match command {
+        DepCommands::Add(args) => run_dep_add(db_path, &args),
+        DepCommands::Rm(args) => run_dep_rm(db_path, &args),
+    }
+}
+
+fn run_dep_add(db_path: &Path, args: &DepAddArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let task = core.add_dependency(
+        TaskId::from(args.id),
+        TaskId::from(args.on),
+        args.dep_type.into(),
+    )?;
+    print_task_with_dependencies(&core, &task)
+}
+
+fn run_dep_rm(db_path: &Path, args: &DepRmArgs) -> Result<(), CliError> {
+    let mut core = open_core(db_path)?;
+    let task = core.remove_dependency(TaskId::from(args.id), TaskId::from(args.on))?;
+    print_task_with_dependencies(&core, &task)
+}
+
+/// Every user's name keyed by id, for resolving the assignee column of
+/// [`format_task_line`].
+fn user_names(core: &Core<SqliteStore>) -> Result<HashMap<UserId, String>, CliError> {
+    Ok(core
         .list_users()?
         .into_iter()
         .map(|user| (user.id, user.name))
-        .collect();
-    println!("{}", format_task_line(&task, &names));
+        .collect())
+}
+
+/// Prints `task`'s summary line, then one `  depends on: <id> (<type>)`
+/// line per predecessor.
+fn print_task_with_dependencies(core: &Core<SqliteStore>, task: &Task) -> Result<(), CliError> {
+    let names = user_names(core)?;
+    println!("{}", format_task_line(task, &names));
+    for dep in &task.depends_on {
+        println!(
+            "  depends on: {} ({})",
+            Uuid::from(dep.predecessor_id),
+            dep_type_abbrev(dep.dep_type)
+        );
+    }
     Ok(())
 }
 

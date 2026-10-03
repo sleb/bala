@@ -6,11 +6,8 @@ use chrono::NaiveDate;
 use crate::model::{TaskId, UserId};
 use crate::store::StoreError;
 
-/// Errors the `Core` facade can return.
-///
-/// This is a subset of the full taxonomy in `docs/design/core-library.md`
-/// §Error Taxonomy: the dependency variants (`DependsOnRelative`,
-/// `CircularDependency`) are added when task dependencies are implemented.
+/// Errors the `Core` facade can return: the full taxonomy in
+/// `docs/design/core-library.md` §Error Taxonomy.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("task {0:?} not found")]
@@ -47,6 +44,18 @@ pub enum CoreError {
         task: TaskId,
         attempted_parent: TaskId,
     },
+
+    #[error("a task cannot depend on itself: {0:?}")]
+    SelfDependency(TaskId),
+
+    #[error("{task:?} cannot depend on {other:?}: it is an ancestor/descendant of it")]
+    DependsOnRelative { task: TaskId, other: TaskId },
+
+    /// `cycle` runs from the task that would gain the dependency, through
+    /// the new predecessor and what it already depends on, back to the
+    /// task: each entry depends on the next.
+    #[error("adding this dependency would create a cycle: {cycle:?}")]
+    CircularDependency { cycle: Vec<TaskId> },
 
     #[error("{task:?} is not a child of {}", fmt_parent(*parent))]
     NotUnderParent {
@@ -133,6 +142,39 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!("moving {task:?} under {attempted_parent:?} would make it its own ancestor")
+        );
+    }
+
+    #[test]
+    fn self_dependency_display_message() {
+        let task = TaskId::new();
+        let err = CoreError::SelfDependency(task);
+        assert_eq!(
+            err.to_string(),
+            format!("a task cannot depend on itself: {task:?}")
+        );
+    }
+
+    #[test]
+    fn depends_on_relative_display_message() {
+        let task = TaskId::new();
+        let other = TaskId::new();
+        let err = CoreError::DependsOnRelative { task, other };
+        assert_eq!(
+            err.to_string(),
+            format!("{task:?} cannot depend on {other:?}: it is an ancestor/descendant of it")
+        );
+    }
+
+    #[test]
+    fn circular_dependency_display_message() {
+        let cycle = vec![TaskId::new(), TaskId::new(), TaskId::new()];
+        let err = CoreError::CircularDependency {
+            cycle: cycle.clone(),
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("adding this dependency would create a cycle: {cycle:?}")
         );
     }
 
