@@ -95,8 +95,9 @@ flowchart TB
 gantt cells — never a `ratatui::Frame` directly. `tui::screens` adapts
 that data into `ratatui` widgets; `cli`'s `export gantt` subcommand
 formats the same data as plain UTF-8 box-drawing text to a file. Neither
-consumer duplicates layout logic, mirroring how Core LLD's
-`preview_cascade` and `update_task` share one `cascade()` function.
+consumer duplicates layout logic, mirroring how Core LLD computes a
+schedule in one function (`scheduling::plan`) that `preview_schedule`
+returns unwritten.
 
 ## View State & Config
 
@@ -344,6 +345,14 @@ stored).
 
 ### 3. Reschedule mode: live preview via `preview_cascade` ([#65](https://github.com/sleb/bala/issues/65) AC2–5)
 
+> **Superseded.** `Core::preview_cascade(task_id, patch)` does not exist.
+> Core previews a schedule with `Core::preview_schedule()`, which takes
+> no task and no patch: it computes, over every live task, which floating
+> tasks would move and which tasks would still be out of sync (Core LLD
+> §Algorithm 3), and an edit to one task never moves another. The flow
+> below, and every `preview_cascade` call in it, is kept as written until
+> this mode is redesigned around `preview_schedule`.
+
 Every nudge (`h`/`l`/`H`/`L`, or a committed date-entry sub-edit) updates
 a local, uncommitted `TaskPatch` for the focused task and immediately
 calls `Core::preview_cascade(task_id, patch)` (read-only, no store
@@ -387,14 +396,15 @@ option) — not attempted here.
 
 ```
 bala                                    # launch TUI (default, no subcommand)
-bala task add --title <t> [--parent <id>] [--type <key>] [--start <date>] [--due <date>] [--assignee <id>]
-bala task edit <id> [--title <t>] [--description <d>] [--start <date>] [--due <date>] [--assignee <id>] [--clear-description] ...
+bala task add --title <t> [--parent <id>] [--type <key>] [--start <date>] [--due <date>] [--duration <days>] [--assignee <id>]
+bala task edit <id> [--title <t>] [--description <d>] [--start <date>] [--due <date>] [--duration <days>] [--fix | --float] [--assignee <id>] [--clear-description] [--clear-duration] ...
 bala task rm <id> [--promote-children]           # DeleteMode; default Subtree, confirmed via -y or an inline y/n prompt
 bala task complete <id> [--cascade]
 bala task mv <id> [--parent <id>]                # set_parent; no --parent promotes to top level
 bala task ls [--type <key>] [--status <s>] [--assignee <id>] [--blocked-only] [--flat]
 bala dep add <id> --on <predecessor-id> [--type fs|ss|ff|sf]   # default fs
 bala dep rm <id> --on <predecessor-id>
+bala schedule [--yes]                            # preview_schedule, then reschedule once confirmed via --yes or an inline y/n prompt
 bala type ls
 bala type set <key> --label <l> [--color <c>] [--sort-order <n>]
 bala export gantt [--out <path>] [--scale day|week|month] [--from <date>] [--filter ...]
@@ -405,7 +415,16 @@ parent, so repeating the flag is a clap usage error (exit 2) that writes
 nothing, and there is no `--parents` flag. `task mv` with no `--parent`
 promotes the task to top level. Both hand `Core` zero or one parent id.
 
-Every subcommand maps to exactly one `Core` method call (mirroring HLD
+`schedule` makes two `Core` calls, a preview and a commit, as `task rm`
+reads before it deletes: `preview_schedule` supplies the list of moves
+(old and new dates) and of tasks that would stay out of sync, and
+`reschedule` applies it once confirmed. With nothing to move it prints
+"Nothing to move." and never prompts or calls `reschedule`. The two calls
+are not one transaction, so another process can change the database
+between them; the tasks printed after applying are the ones `reschedule`
+itself reports having moved, not the previewed ones.
+
+Every other subcommand maps to exactly one `Core` method call (mirroring HLD
 §Interfaces' Web API constraint: "near-mechanical translation," applied
 here to argv instead of HTTP) — if a subcommand needed logic beyond
 argument parsing and calling `Core`, that logic belongs in `bala-core`,
@@ -453,7 +472,8 @@ rather than falling back to string parsing, per HLD's original
   (backed by Core LLD's in-memory fake `Store`, not `SqliteStore` — fast,
   no filesystem) and assert the resulting `Mode` transitions and which
   `Core` method was called with which arguments — e.g.
-  `reschedule_h_should_call_preview_cascade_not_update_task`,
+  `reschedule_h_should_call_preview_cascade_not_update_task`
+  (superseded with §Algorithm 3: Core's preview is `preview_schedule`),
   `esc_in_reschedule_should_discard_preview_without_calling_core`,
   `dd_on_task_with_children_should_enter_confirm_not_delete_immediately`.
 - CLI subcommands are tested via `assert_cmd` against a temp-file
@@ -503,7 +523,7 @@ rather than falling back to string parsing, per HLD's original
   column-mapping or bar-drawing functions other features depend on.
 - `render` being pure and shared between the interactive Gantt pane and
   the [#67](https://github.com/sleb/bala/issues/67) text export is the same "single source of truth" pattern
-  Core LLD used for `preview_cascade`/`update_task` — the concrete payoff
+  Core LLD uses for `scheduling::plan`/`preview_schedule` — the concrete payoff
   is the parity test in §Testing Strategy, which would fail immediately
   if the two ever drew a different picture of the same schedule.
 - `blocked_only` and the derived `is_blocked` check (§Algorithm 2)
@@ -522,7 +542,7 @@ rather than falling back to string parsing, per HLD's original
 3. [ ] Implement `render` module (§Algorithms 1–2): scale mapping, bar/row layout, collapsed-summary bars, `is_blocked`
 4. [ ] Implement `tui::mode`/`tui::keymap` state machine (§Modes & Keybindings) against Core LLD's in-memory fake `Store`
 5. [ ] Implement `tui::screens`: tree/list, task detail, Gantt, help overlay (ratatui widgets over `render`'s output)
-6. [ ] Implement `Reschedule` mode's live `preview_cascade` loop (§Algorithm 3)
+6. [ ] Implement `Reschedule` mode's live preview loop (§Algorithm 3; its `preview_cascade` calls are superseded by `preview_schedule`, and the mode is to be redesigned around it)
 7. [ ] Implement `cli` subcommand tree (clap) mapping 1:1 onto `Core` methods, including `export gantt` (§Algorithm 4)
 8. [ ] Implement error-to-message mapping (§Error Rendering), shared by TUI status bar and CLI stderr
 9. [ ] Write tests per §Testing Strategy, including the TUI/export render-parity test

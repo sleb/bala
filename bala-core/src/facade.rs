@@ -1,10 +1,15 @@
 //! The `Core` facade (LLD §Decision, §Method Contract): the single entry
 //! point every caller (CLI today, Web API later) drives.
 //!
-//! Task dependencies can be added and removed; date-cascade rescheduling
-//! along them is not implemented yet.
+//! Task dependencies can be added and removed, and a task whose dates
+//! break one is reported as out of sync on every read. Editing a task or
+//! a dependency never moves another task's dates; only
+//! [`Core::reschedule`] does, committing the schedule
+//! [`Core::preview_schedule`] reports.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 
 use chrono::Utc;
 
@@ -12,10 +17,11 @@ use crate::error::CoreError;
 use crate::hierarchy;
 use crate::model::{
     DeleteMode, DeleteOutcome, Dependency, DependencyType, Direction, Field, NewTask, Placement,
-    SiblingOrder, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User, UserId,
+    Schedule, SiblingOrder, Task, TaskId, TaskPatch, TaskStatus, TaskType, TreeFilter, User,
+    UserId,
 };
 use crate::rollup;
-use crate::scheduling::check_new_dependency;
+use crate::scheduling::{self, check_new_dependency, is_out_of_sync};
 use crate::store::{Store, StoreError, StoreTx};
 
 /// The stable key of the default task type every `Core` seeds on
@@ -106,6 +112,9 @@ impl<S: Store> Core<S> {
     /// store transaction, and the validation errors below are checked in
     /// the order listed ([`CoreError::Store`] can surface from any step).
     ///
+    /// The new task's dates are fixed ([`Task::dates_fixed`]) if either
+    /// `new.start_date` or `new.due_date` is given, and floating otherwise.
+    ///
     /// # Errors
     ///
     /// - [`CoreError::EmptyTitle`] if `new.title` is empty or
@@ -135,8 +144,14 @@ impl<S: Store> Core<S> {
             progress: 0.0,
             start_date: new.start_date,
             due_date: new.due_date,
+            duration_days: new.duration_days,
+            // A task created with a date has that date fixed; one created
+            // with none floats.
+            dates_fixed: new.start_date.is_some() || new.due_date.is_some(),
             assignee_id: new.assignee_id,
             depends_on: Vec::new(),
+            // A new task has no dependencies to break.
+            out_of_sync: false,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -194,7 +209,8 @@ impl<S: Store> Core<S> {
         Ok(task)
     }
 
-    /// Looks up a task by id.
+    /// Looks up a task by id, with `progress` and `out_of_sync` computed
+    /// in the same transaction as the read.
     ///
     /// A thin pass-through to [`StoreTx::get_task`]: like every other read
     /// in this module (`update_task`, `delete_task`, `complete_task`), a
@@ -211,6 +227,7 @@ impl<S: Store> Core<S> {
                 return Ok(None);
             };
             task.progress = compute_progress(tx, id, task.status)?;
+            task.out_of_sync = is_out_of_sync(tx, &task)?;
             Ok(Some(task))
         })?)
     }
@@ -238,6 +255,7 @@ impl<S: Store> Core<S> {
                 .collect::<Result<Vec<Task>, StoreError>>()?;
             for child in &mut children {
                 child.progress = compute_progress(tx, child.id, child.status)?;
+                child.out_of_sync = is_out_of_sync(tx, child)?;
             }
             Ok(children)
         })?)
@@ -252,7 +270,13 @@ impl<S: Store> Core<S> {
     /// Hierarchy assembly beyond what `Task::parent_id` already carries is
     /// still out of scope.
     ///
-    /// The base list and every per-task child lookup run inside the same
+    /// Each result's `out_of_sync` is filled too (LLD §Algorithm 3), from
+    /// the task's own dependencies. A live predecessor constrains a listed
+    /// task whether or not `filter` lets the predecessor itself into the
+    /// result.
+    ///
+    /// The base list and every per-task child or predecessor lookup run
+    /// inside the same
     /// `Store::transaction` closure, so the whole read is one atomic
     /// snapshot rather than separate transactions that could observe a
     /// concurrent write differently between the list and a child fetch.
@@ -267,7 +291,16 @@ impl<S: Store> Core<S> {
     pub fn get_tree(&self, filter: TreeFilter) -> Result<Vec<Task>, CoreError> {
         Ok(self.store.transaction(|tx| {
             let mut tasks = tx.list_tasks(&filter)?;
-            sort_by_hierarchy_order(tx, &mut tasks)?;
+            // An unfiltered list is exactly the live tasks, so it supplies
+            // the live set the ordering needs; a filtered one does not, and
+            // the live tasks are listed for it.
+            let order = if filter == TreeFilter::default() {
+                let live: HashSet<TaskId> = tasks.iter().map(|task| task.id).collect();
+                sibling_order_of(tx, &live)?
+            } else {
+                live_sibling_order(tx)?
+            };
+            sort_in_sibling_order(&order, &mut tasks);
             for task in &mut tasks {
                 let children = tx
                     .list_child_edges(Some(task.id))?
@@ -276,7 +309,94 @@ impl<S: Store> Core<S> {
                     .collect::<Result<Vec<Task>, StoreError>>()?;
                 task.progress = rollup::direct_children_progress(&children, task.status);
             }
+
+            // A predecessor is usually among the listed tasks, so it is
+            // read from there. One the filter left out is fetched instead,
+            // once however many listed tasks depend on it: it still
+            // constrains its successors while it is live. A soft-deleted
+            // one does not resolve and is remembered as `None`.
+            let listed: HashMap<TaskId, &Task> = tasks
+                .iter()
+                .filter(|task| task.deleted_at.is_none())
+                .map(|task| (task.id, task))
+                .collect();
+            let mut unlisted: HashMap<TaskId, Option<Task>> = HashMap::new();
+            for task in tasks.iter().filter(|task| task.deleted_at.is_none()) {
+                for dependency in &task.depends_on {
+                    let id = dependency.predecessor_id;
+                    if !listed.contains_key(&id) && !unlisted.contains_key(&id) {
+                        unlisted.insert(id, tx.get_task(id)?);
+                    }
+                }
+            }
+            let out_of_sync: Vec<bool> = tasks
+                .iter()
+                .map(|task| {
+                    let Ok(broken) = scheduling::breaks_a_dependency(task, |id| {
+                        let predecessor = listed
+                            .get(&id)
+                            .copied()
+                            .or_else(|| unlisted.get(&id).and_then(Option::as_ref));
+                        Ok::<_, Infallible>(predecessor.map(Cow::Borrowed))
+                    });
+                    broken
+                })
+                .collect();
+            for (task, out_of_sync) in tasks.iter_mut().zip(out_of_sync) {
+                task.out_of_sync = out_of_sync;
+            }
             Ok(tasks)
+        })?)
+    }
+
+    /// Computes the schedule that would bring every floating task into
+    /// line with its dependencies (LLD §Algorithm 3), without writing it:
+    /// which tasks would move, each as it is now and as scheduled, and
+    /// which would still break a dependency afterwards. See LLD
+    /// §Algorithm 3 for the rules. [`Core::reschedule`] commits the same
+    /// schedule.
+    ///
+    /// Every live task is read with one `StoreTx::list_tasks`, which
+    /// already carries each task's dependencies in `depends_on`, so the
+    /// edges are not fetched a second time. The tasks are scheduled in the
+    /// order [`Core::get_tree`] lists them, which makes the result the
+    /// same on every call: [`Schedule::out_of_sync`] is in that order, and
+    /// [`Schedule::moved`] has predecessors before their successors, with
+    /// tasks that do not depend on each other in that order. Each task
+    /// returned has its `progress` filled in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    pub fn preview_schedule(&self) -> Result<Schedule, CoreError> {
+        Ok(self.store.transaction(|tx| planned_schedule(tx))?)
+    }
+
+    /// Commits the schedule [`Core::preview_schedule`] reports (LLD
+    /// §Algorithm 3) and returns it: every [`Schedule::moved`] task is
+    /// written with its scheduled dates.
+    ///
+    /// The read, the plan and every write run in one `Store::transaction`,
+    /// and the plan is the one `preview_schedule` computes, so on the same
+    /// state both report the same moves in the same order. Only moved
+    /// tasks are written: each has `updated_at` bumped, which
+    /// [`Rescheduled::after`] carries, and keeps floating dates
+    /// ([`Task::dates_fixed`] stays `false`), so a later schedule may move
+    /// it again. When nothing moves, nothing is written; calling this
+    /// again straight away is such a call.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the backend fails.
+    pub fn reschedule(&mut self) -> Result<Schedule, CoreError> {
+        Ok(self.store.transaction(|tx| {
+            let mut schedule = planned_schedule(tx)?;
+            let now = Utc::now();
+            for moved in &mut schedule.moved {
+                moved.after.updated_at = now;
+                tx.put_task(&moved.after)?;
+            }
+            Ok(schedule)
         })?)
     }
 
@@ -307,11 +427,20 @@ impl<S: Store> Core<S> {
     /// `patch.title` and `patch.type_key` are `String`-backed, not
     /// `Option`-backed, on [`Task`], so [`Field::Clear`] on either is a
     /// defensive no-op equivalent to [`Field::Keep`] rather than a real
-    /// path — no caller constructs one.
+    /// path — no caller constructs one. The same holds for
+    /// `patch.dates_fixed`.
     ///
-    /// Editing never reschedules dependents or subtasks — a task's own
-    /// dates and assignment change in isolation, and this always returns a
-    /// single-element `Vec` until that cascade lands.
+    /// Setting `start_date` or `due_date` fixes the task's dates
+    /// ([`Task::dates_fixed`]); `patch.dates_fixed` is applied after that,
+    /// so it wins within the same call. A task left with neither date is
+    /// never fixed.
+    ///
+    /// Editing never moves another task's dates, a dependent's or a
+    /// subtask's: only `id`'s own row is written, and this always returns a
+    /// single-element `Vec` holding it. A date that breaks one of `id`'s
+    /// dependencies is allowed and comes back with
+    /// [`Task::out_of_sync`] set; a date that breaks a dependent's
+    /// dependency on `id` flags that dependent the next time it is read.
     ///
     /// # Errors
     ///
@@ -362,6 +491,12 @@ impl<S: Store> Core<S> {
                 Field::Clear => task.description = None,
             }
 
+            // Setting either date fixes the task's dates, unless
+            // `patch.dates_fixed` says otherwise below.
+            if matches!(patch.start_date, Field::Set(_)) || matches!(patch.due_date, Field::Set(_))
+            {
+                task.dates_fixed = true;
+            }
             match patch.start_date {
                 Field::Keep => {}
                 Field::Set(start_date) => task.start_date = Some(start_date),
@@ -372,10 +507,23 @@ impl<S: Store> Core<S> {
                 Field::Set(due_date) => task.due_date = Some(due_date),
                 Field::Clear => task.due_date = None,
             }
+            if let Field::Set(dates_fixed) = patch.dates_fixed {
+                task.dates_fixed = dates_fixed;
+            }
+            // A task with no dates has nothing to fix.
+            if task.start_date.is_none() && task.due_date.is_none() {
+                task.dates_fixed = false;
+            }
             if let (Some(start), Some(due)) = (task.start_date, task.due_date)
                 && due < start
             {
                 return Ok(Err(CoreError::InvalidDateRange { start, due }));
+            }
+
+            match patch.duration_days {
+                Field::Keep => {}
+                Field::Set(duration_days) => task.duration_days = Some(duration_days),
+                Field::Clear => task.duration_days = None,
             }
 
             match patch.assignee_id {
@@ -396,6 +544,7 @@ impl<S: Store> Core<S> {
             // rollup on every write rather than trusted from the fetched
             // `task`.
             task.progress = compute_progress(tx, id, task.status)?;
+            task.out_of_sync = is_out_of_sync(tx, &task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -429,6 +578,13 @@ impl<S: Store> Core<S> {
     /// each at most once, at its final value, and no id is in both. A
     /// parent whose rolled-up `progress` changed only because its children
     /// changed is not included; a caller that shows it re-fetches it.
+    ///
+    /// A tombstoned task is never out of sync, so every task in `deleted`
+    /// has [`Task::out_of_sync`] `false`. Each task in `updated` has it as
+    /// a read after the delete would: a dependency on a task this call
+    /// deleted no longer counts. Likewise a surviving task that depended on
+    /// a deleted one may stop being out of sync without being in either
+    /// list.
     ///
     /// # Errors
     ///
@@ -498,8 +654,17 @@ impl<S: Store> Core<S> {
                     // a stale pre-delete snapshot the returned `Task` can no
                     // longer back up.
                     deleted.progress = compute_progress(tx, id, deleted.status)?;
+                    // `out_of_sync` stays `false` as read: a tombstoned
+                    // task is never out of sync.
                     tx.put_task(&deleted)?;
                     outcome.deleted.push(deleted);
+
+                    // Filled only now that `id` is tombstoned: a promoted
+                    // child may depend on it, and a soft-deleted
+                    // predecessor constrains nothing.
+                    for child_task in &mut outcome.updated {
+                        child_task.out_of_sync = is_out_of_sync(tx, child_task)?;
+                    }
                 }
             }
 
@@ -536,6 +701,7 @@ impl<S: Store> Core<S> {
 
             task.status = TaskStatus::Incomplete;
             task.progress = compute_progress(tx, id, task.status)?;
+            task.out_of_sync = is_out_of_sync(tx, &task)?;
             task.completed_at = None;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
@@ -580,6 +746,7 @@ impl<S: Store> Core<S> {
             // re-derived rather than trusted from the fetched row — see
             // `update_task`'s matching comment.
             task.progress = compute_progress(tx, id, task.status)?;
+            task.out_of_sync = is_out_of_sync(tx, &task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -591,6 +758,8 @@ impl<S: Store> Core<S> {
 
     /// Completes a task per LLD §Algorithm 5: marks `id`
     /// `status = Complete`, `completed_at = Some(now)`, `updated_at = now`.
+    /// No date is touched, on `id` or on any task that depends on it: a
+    /// completed predecessor constrains its successors exactly as before.
     ///
     /// If `id` has any descendant, at any depth, whose `status` is still
     /// [`TaskStatus::Incomplete`], the call is rejected with
@@ -646,6 +815,7 @@ impl<S: Store> Core<S> {
                 // children are already at their final status — no ordering
                 // hazard like `mark_complete_subtree`'s below.
                 task.progress = compute_progress(tx, id, task.status)?;
+                task.out_of_sync = is_out_of_sync(tx, &task)?;
                 task.completed_at = Some(now);
                 task.updated_at = now;
                 tx.put_task(&task)?;
@@ -691,6 +861,7 @@ impl<S: Store> Core<S> {
 
             if task.parent_id == parent {
                 task.progress = compute_progress(tx, id, task.status)?;
+                task.out_of_sync = is_out_of_sync(tx, &task)?;
                 return Ok(Ok(task));
             }
 
@@ -705,6 +876,7 @@ impl<S: Store> Core<S> {
             // sibling under the old and new parent untouched — this call
             // never writes any row but `id`'s own.
             task.progress = compute_progress(tx, id, task.status)?;
+            task.out_of_sync = is_out_of_sync(tx, &task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -837,6 +1009,10 @@ impl<S: Store> Core<S> {
     /// otherwise the edge is added (or its type replaced) and `id`'s
     /// `updated_at` is bumped. `predecessor`'s row is never written.
     ///
+    /// No date is moved on either task. If `id`'s dates already break the
+    /// new dependency, it is added all the same and the returned task has
+    /// [`Task::out_of_sync`] set.
+    ///
     /// # Errors
     ///
     /// - [`CoreError::SelfDependency`] if `id == predecessor`.
@@ -877,6 +1053,7 @@ impl<S: Store> Core<S> {
             };
             if task.depends_on.contains(&unchanged) {
                 task.progress = compute_progress(tx, id, task.status)?;
+                task.out_of_sync = is_out_of_sync(tx, &task)?;
                 return Ok(Ok(task));
             }
 
@@ -888,6 +1065,7 @@ impl<S: Store> Core<S> {
                 return Ok(Err(CoreError::NotFound(id)));
             };
             task.progress = compute_progress(tx, id, task.status)?;
+            task.out_of_sync = is_out_of_sync(tx, &task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -931,6 +1109,7 @@ impl<S: Store> Core<S> {
                 .any(|dep| dep.predecessor_id == predecessor)
             {
                 task.progress = compute_progress(tx, id, task.status)?;
+                task.out_of_sync = is_out_of_sync(tx, &task)?;
                 return Ok(Ok(task));
             }
 
@@ -942,6 +1121,7 @@ impl<S: Store> Core<S> {
                 return Ok(Err(CoreError::NotFound(id)));
             };
             task.progress = compute_progress(tx, id, task.status)?;
+            task.out_of_sync = is_out_of_sync(tx, &task)?;
             task.updated_at = Utc::now();
             tx.put_task(&task)?;
 
@@ -988,18 +1168,24 @@ fn write_parent(
     Ok(())
 }
 
-/// Computes `id`'s current progress from its direct children (LLD
-/// §Algorithm 4), the single shared entry point every `Task`-returning
-/// facade method uses instead of re-deriving a leaf-only placeholder from
-/// `status` alone.
-///
-/// Builds the [`SiblingOrder`] of live tasks from one store call.
+/// Builds the [`SiblingOrder`] of every live task: lists the live tasks,
+/// then hands their ids to [`sibling_order_of`].
 fn live_sibling_order(tx: &mut dyn StoreTx) -> Result<SiblingOrder, StoreError> {
     let live: HashSet<TaskId> = tx
         .list_tasks(&TreeFilter::default())?
         .into_iter()
         .map(|t| t.id)
         .collect();
+    sibling_order_of(tx, &live)
+}
+
+/// Builds the [`SiblingOrder`] of the tasks in `live` from one
+/// [`StoreTx::list_all_child_edges`] call; an edge to any other child is
+/// left out.
+fn sibling_order_of(
+    tx: &mut dyn StoreTx,
+    live: &HashSet<TaskId>,
+) -> Result<SiblingOrder, StoreError> {
     let mut map: HashMap<Option<TaskId>, Vec<TaskId>> = HashMap::new();
     for (parent, child) in tx.list_all_child_edges()? {
         if live.contains(&child) {
@@ -1009,11 +1195,32 @@ fn live_sibling_order(tx: &mut dyn StoreTx) -> Result<SiblingOrder, StoreError> 
     Ok(map.into())
 }
 
-/// Stable-sorts `tasks` into depth-first sibling order (roots first, each
-/// task followed by its children). Tasks not reached (e.g. under a deleted
-/// parent) keep their relative order at the end.
-fn sort_by_hierarchy_order(tx: &mut dyn StoreTx, tasks: &mut [Task]) -> Result<(), StoreError> {
-    let order = live_sibling_order(tx)?;
+/// The schedule `scheduling::plan` computes over every live task, read in
+/// `get_tree` order, with `progress` filled on each task it returns. Both
+/// [`Core::preview_schedule`] and [`Core::reschedule`] take their schedule
+/// from here, so what is previewed is what is committed.
+///
+/// The tasks are listed once: that list is every live task, so it also
+/// supplies the live set the ordering is built from.
+fn planned_schedule(tx: &mut dyn StoreTx) -> Result<Schedule, StoreError> {
+    let mut tasks = tx.list_tasks(&TreeFilter::default())?;
+    let live: HashSet<TaskId> = tasks.iter().map(|task| task.id).collect();
+    sort_in_sibling_order(&sibling_order_of(tx, &live)?, &mut tasks);
+    let mut schedule = scheduling::plan(tasks);
+    for moved in &mut schedule.moved {
+        moved.before.progress = compute_progress(tx, moved.before.id, moved.before.status)?;
+        moved.after.progress = moved.before.progress;
+    }
+    for task in &mut schedule.out_of_sync {
+        task.progress = compute_progress(tx, task.id, task.status)?;
+    }
+    Ok(schedule)
+}
+
+/// Stable-sorts `tasks` into the depth-first order `order` describes
+/// (roots first, each task followed by its children). Tasks not reached
+/// (e.g. under a deleted parent) keep their relative order at the end.
+fn sort_in_sibling_order(order: &SiblingOrder, tasks: &mut [Task]) {
     let mut rank: HashMap<TaskId, usize> = HashMap::new();
     let mut stack: Vec<TaskId> = order.children_of(None).iter().rev().copied().collect();
     while let Some(id) = stack.pop() {
@@ -1024,9 +1231,13 @@ fn sort_by_hierarchy_order(tx: &mut dyn StoreTx, tasks: &mut [Task]) -> Result<(
         stack.extend(order.children_of(Some(id)).iter().rev().copied());
     }
     tasks.sort_by_key(|t| rank.get(&t.id).copied().unwrap_or(usize::MAX));
-    Ok(())
 }
 
+/// Computes `id`'s current progress from its direct children (LLD
+/// §Algorithm 4), the single shared entry point every `Task`-returning
+/// facade method uses instead of re-deriving a leaf-only placeholder from
+/// `status` alone.
+///
 /// Fetches `id`'s direct children the same way `get_tree`/`list_children`
 /// already do (`StoreTx::list_child_edges` + `StoreTx::get_task`, skipping
 /// any child id that no longer resolves) and hands them to
@@ -1129,6 +1340,7 @@ fn mark_complete_subtree(
             continue;
         };
         task.progress = compute_progress(tx, touched_id, task.status)?;
+        task.out_of_sync = is_out_of_sync(tx, &task)?;
         tx.put_task(&task)?;
         touched.push(task);
     }
@@ -1186,6 +1398,8 @@ fn tombstone_subtree(
         // would recompute, rather than a stale pre-delete snapshot the
         // returned `Task` can no longer back up.
         task.progress = compute_progress(tx, current, task.status)?;
+        // `out_of_sync` stays `false` as read: a tombstoned task is never
+        // out of sync.
         tx.put_task(&task)?;
         deleted.push(task);
     }
@@ -1197,7 +1411,7 @@ fn tombstone_subtree(
 mod tests {
     use super::*;
     use crate::in_memory_store::InMemoryStore;
-    use crate::model::TaskStatus;
+    use crate::model::{Rescheduled, TaskStatus};
     use crate::test_support::CountingStore;
     use chrono::NaiveDate;
 
@@ -1213,6 +1427,7 @@ mod tests {
             type_key: None,
             start_date: None,
             due_date: None,
+            duration_days: None,
             assignee_id: None,
         }
     }
@@ -1333,6 +1548,69 @@ mod tests {
         assert_eq!(task.description.as_deref(), Some("Details"));
         assert_eq!(task.start_date, Some(start));
         assert_eq!(task.due_date, Some(due));
+    }
+
+    #[test]
+    fn create_task_should_fix_dates_when_a_date_is_given() {
+        let mut core = new_core();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+        let start_only = core
+            .create_task(NewTask {
+                start_date: Some(date),
+                ..minimal_new_task("Start only")
+            })
+            .unwrap();
+        let due_only = core
+            .create_task(NewTask {
+                due_date: Some(date),
+                ..minimal_new_task("Due only")
+            })
+            .unwrap();
+
+        assert!(start_only.dates_fixed);
+        assert!(due_only.dates_fixed);
+        let stored = core.get_task(start_only.id).unwrap().unwrap();
+        assert!(stored.dates_fixed);
+    }
+
+    #[test]
+    fn create_task_should_leave_dates_floating_when_none_given() {
+        let mut core = new_core();
+
+        let task = core
+            .create_task(NewTask {
+                duration_days: Some(3),
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+
+        assert!(!task.dates_fixed);
+    }
+
+    #[test]
+    fn create_task_should_store_duration() {
+        let mut core = new_core();
+
+        let task = core
+            .create_task(NewTask {
+                duration_days: Some(5),
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+        let milestone = core
+            .create_task(NewTask {
+                duration_days: Some(0),
+                ..minimal_new_task("Milestone")
+            })
+            .unwrap();
+        let unsized_task = core.create_task(minimal_new_task("Unsized")).unwrap();
+
+        assert_eq!(task.duration_days, Some(5));
+        assert_eq!(milestone.duration_days, Some(0));
+        assert_eq!(unsized_task.duration_days, None);
+        let stored = core.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.duration_days, Some(5));
     }
 
     #[test]
@@ -2158,6 +2436,217 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].title, "Renamed");
+    }
+
+    /// A task created with a start date, then floated, so its dates are
+    /// present but not fixed.
+    fn floating_task_with_start(core: &mut Core<InMemoryStore>, start: NaiveDate) -> Task {
+        let task = core
+            .create_task(NewTask {
+                start_date: Some(start),
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+        core.update_task(
+            task.id,
+            TaskPatch {
+                dates_fixed: Field::Set(false),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    #[test]
+    fn update_task_should_fix_dates_when_a_date_is_set() {
+        let mut core = new_core();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let by_start = core.create_task(minimal_new_task("By start")).unwrap();
+        let by_due = core.create_task(minimal_new_task("By due")).unwrap();
+
+        let by_start = core
+            .update_task(
+                by_start.id,
+                TaskPatch {
+                    start_date: Field::Set(date),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let by_due = core
+            .update_task(
+                by_due.id,
+                TaskPatch {
+                    due_date: Field::Set(date),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(by_start[0].dates_fixed);
+        assert!(by_due[0].dates_fixed);
+        let stored = core.get_task(by_start[0].id).unwrap().unwrap();
+        assert!(stored.dates_fixed);
+    }
+
+    #[test]
+    fn update_task_should_float_dates_when_asked() {
+        let mut core = new_core();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let task = core
+            .create_task(NewTask {
+                start_date: Some(start),
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    dates_fixed: Field::Set(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(!updated[0].dates_fixed);
+        assert_eq!(updated[0].start_date, Some(start));
+    }
+
+    #[test]
+    fn update_task_should_fix_dates_again_when_asked() {
+        let mut core = new_core();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let task = floating_task_with_start(&mut core, start);
+        assert!(!task.dates_fixed);
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    dates_fixed: Field::Set(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(updated[0].dates_fixed);
+        assert_eq!(updated[0].start_date, Some(start));
+    }
+
+    #[test]
+    fn update_task_should_keep_a_date_floating_when_set_and_floated_together() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    start_date: Field::Set(start),
+                    dates_fixed: Field::Set(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(!updated[0].dates_fixed);
+        assert_eq!(updated[0].start_date, Some(start));
+    }
+
+    #[test]
+    fn update_task_should_unfix_when_both_dates_are_cleared() {
+        let mut core = new_core();
+        let task = core
+            .create_task(NewTask {
+                start_date: NaiveDate::from_ymd_opt(2026, 1, 1),
+                due_date: NaiveDate::from_ymd_opt(2026, 1, 31),
+                ..minimal_new_task("Task")
+            })
+            .unwrap();
+
+        let one_cleared = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    start_date: Field::Clear,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(one_cleared[0].dates_fixed);
+
+        let both_cleared = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    due_date: Field::Clear,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!both_cleared[0].dates_fixed);
+    }
+
+    #[test]
+    fn update_task_should_not_fix_a_task_with_no_dates_when_asked() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let updated = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    dates_fixed: Field::Set(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(!updated[0].dates_fixed);
+    }
+
+    #[test]
+    fn update_task_should_set_and_clear_duration() {
+        let mut core = new_core();
+        let task = core.create_task(minimal_new_task("Task")).unwrap();
+
+        let set = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    duration_days: Field::Set(4),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(set[0].duration_days, Some(4));
+        assert!(!set[0].dates_fixed);
+
+        let kept = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    title: Field::Set("Renamed".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(kept[0].duration_days, Some(4));
+
+        let cleared = core
+            .update_task(
+                task.id,
+                TaskPatch {
+                    duration_days: Field::Clear,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared[0].duration_days, None);
     }
 
     #[test]
@@ -4174,6 +4663,756 @@ mod tests {
                 predecessor_id: b.id,
                 dep_type: DependencyType::FinishToStart,
             }]
+        );
+    }
+
+    fn day(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 3, day).unwrap()
+    }
+
+    /// A task running from `start` to `due`, both days of March 2026.
+    fn dated_task(core: &mut Core<InMemoryStore>, title: &str, start: u32, due: u32) -> Task {
+        core.create_task(NewTask {
+            start_date: Some(day(start)),
+            due_date: Some(day(due)),
+            ..minimal_new_task(title)
+        })
+        .unwrap()
+    }
+
+    /// A predecessor running 1..10 and a successor running 5..12 that
+    /// depends on it finish-to-start, so the successor starts five days
+    /// before its predecessor is due.
+    fn violating_pair(core: &mut Core<InMemoryStore>) -> (Task, Task) {
+        let predecessor = dated_task(core, "Predecessor", 1, 10);
+        let successor = dated_task(core, "Successor", 5, 12);
+        core.add_dependency(successor.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        (predecessor, successor)
+    }
+
+    fn set_due(core: &mut Core<InMemoryStore>, id: TaskId, due: u32) -> Vec<Task> {
+        core.update_task(
+            id,
+            TaskPatch {
+                due_date: Field::Set(day(due)),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn is_flagged(core: &Core<InMemoryStore>, id: TaskId) -> bool {
+        core.get_task(id).unwrap().unwrap().out_of_sync
+    }
+
+    #[test]
+    fn get_tree_should_flag_task_that_starts_before_its_predecessor_is_due() {
+        let mut core = new_core();
+        let (predecessor, successor) = violating_pair(&mut core);
+        let on_time = dated_task(&mut core, "On time", 10, 12);
+        core.add_dependency(on_time.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+
+        let flagged: Vec<TaskId> = tree
+            .iter()
+            .filter(|t| t.out_of_sync)
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(tree.len(), 3);
+        assert_eq!(flagged, [successor.id]);
+
+        // A filter that leaves the predecessor out of the result does not
+        // stop it constraining the tasks that are in it.
+        core.complete_task(predecessor.id, false).unwrap();
+        let incomplete = core
+            .get_tree(TreeFilter {
+                status: Some(TaskStatus::Incomplete),
+                ..TreeFilter::default()
+            })
+            .unwrap();
+        let flagged: Vec<TaskId> = incomplete
+            .iter()
+            .filter(|t| t.out_of_sync)
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(incomplete.len(), 2);
+        assert_eq!(flagged, [successor.id]);
+    }
+
+    #[test]
+    fn get_task_should_flag_task_when_any_one_of_several_dependencies_is_broken() {
+        let mut core = new_core();
+        let early = dated_task(&mut core, "Early", 1, 3);
+        let late = dated_task(&mut core, "Late", 1, 20);
+        let also_early = dated_task(&mut core, "Also early", 2, 4);
+        let broken = dated_task(&mut core, "Broken", 10, 15);
+        let in_sync = dated_task(&mut core, "In sync", 10, 15);
+        for predecessor in [&early, &late, &also_early] {
+            core.add_dependency(broken.id, predecessor.id, DependencyType::FinishToStart)
+                .unwrap();
+        }
+        for predecessor in [&early, &also_early] {
+            core.add_dependency(in_sync.id, predecessor.id, DependencyType::FinishToStart)
+                .unwrap();
+        }
+
+        let broken = core.get_task(broken.id).unwrap().unwrap();
+        let in_sync = core.get_task(in_sync.id).unwrap().unwrap();
+
+        assert!(broken.out_of_sync);
+        assert!(!in_sync.out_of_sync);
+    }
+
+    #[test]
+    fn update_task_should_allow_and_flag_a_date_that_breaks_a_dependency() {
+        let mut core = new_core();
+        let predecessor = dated_task(&mut core, "Predecessor", 1, 10);
+        let successor = dated_task(&mut core, "Successor", 10, 12);
+        let added = core
+            .add_dependency(successor.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        assert!(!added.out_of_sync);
+
+        let updated = core
+            .update_task(
+                successor.id,
+                TaskPatch {
+                    start_date: Field::Set(day(9)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].start_date, Some(day(9)));
+        assert!(updated[0].out_of_sync);
+        let stored = core.get_task(successor.id).unwrap().unwrap();
+        assert_eq!(stored.start_date, Some(day(9)));
+        assert!(stored.out_of_sync);
+    }
+
+    #[test]
+    fn update_task_on_predecessor_should_flag_successor_without_moving_it() {
+        let mut core = new_core();
+        let predecessor = dated_task(&mut core, "Predecessor", 1, 10);
+        let successor = dated_task(&mut core, "Successor", 10, 12);
+        core.add_dependency(successor.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        let before = core.get_task(successor.id).unwrap().unwrap();
+        assert!(!before.out_of_sync);
+
+        let updated = set_due(&mut core, predecessor.id, 11);
+
+        // Only the edited task comes back, and it is not the one flagged:
+        // the flag sits on the task whose dependency is broken.
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].id, predecessor.id);
+        assert!(!updated[0].out_of_sync);
+        let after = core.get_task(successor.id).unwrap().unwrap();
+        assert!(after.out_of_sync);
+        assert_eq!(
+            Task {
+                out_of_sync: false,
+                ..after
+            },
+            before
+        );
+    }
+
+    #[test]
+    fn update_task_should_clear_the_flag_when_dates_are_moved_back_into_line() {
+        let mut core = new_core();
+        let (predecessor, successor) = violating_pair(&mut core);
+        assert!(is_flagged(&core, successor.id));
+
+        // Moving the successor out past its predecessor clears it.
+        let updated = core
+            .update_task(
+                successor.id,
+                TaskPatch {
+                    start_date: Field::Set(day(10)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!updated[0].out_of_sync);
+        assert!(!is_flagged(&core, successor.id));
+
+        // So does pulling the predecessor back in, after breaking it again.
+        set_due(&mut core, predecessor.id, 11);
+        assert!(is_flagged(&core, successor.id));
+        set_due(&mut core, predecessor.id, 10);
+        assert!(!is_flagged(&core, successor.id));
+    }
+
+    #[test]
+    fn add_dependency_should_flag_an_already_violating_pair_and_move_nothing() {
+        let mut core = new_core();
+        let predecessor = dated_task(&mut core, "Predecessor", 1, 10);
+        let successor = dated_task(&mut core, "Successor", 5, 12);
+        assert!(!is_flagged(&core, successor.id));
+
+        let added = core
+            .add_dependency(successor.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        assert!(added.out_of_sync);
+        assert_eq!(
+            (added.start_date, added.due_date),
+            (Some(day(5)), Some(day(12)))
+        );
+        let stored = core.get_task(successor.id).unwrap().unwrap();
+        assert!(stored.out_of_sync);
+        assert_eq!(
+            (stored.start_date, stored.due_date),
+            (Some(day(5)), Some(day(12)))
+        );
+        let stored_predecessor = core.get_task(predecessor.id).unwrap().unwrap();
+        assert_eq!(stored_predecessor, predecessor);
+
+        // Re-adding the same dependency writes nothing and still reports it.
+        let again = core
+            .add_dependency(successor.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        assert!(again.out_of_sync);
+        // A type the pair's dates satisfy replaces the edge and clears it.
+        let retyped = core
+            .add_dependency(successor.id, predecessor.id, DependencyType::StartToStart)
+            .unwrap();
+        assert!(!retyped.out_of_sync);
+    }
+
+    #[test]
+    fn remove_dependency_should_clear_the_flag() {
+        let mut core = new_core();
+        let (predecessor, successor) = violating_pair(&mut core);
+        assert!(is_flagged(&core, successor.id));
+
+        let removed = core
+            .remove_dependency(successor.id, predecessor.id)
+            .unwrap();
+
+        assert!(!removed.out_of_sync);
+        assert!(!is_flagged(&core, successor.id));
+    }
+
+    #[test]
+    fn remove_dependency_should_keep_the_flag_while_another_dependency_is_broken() {
+        let mut core = new_core();
+        let (predecessor, successor) = violating_pair(&mut core);
+        let other = dated_task(&mut core, "Other", 1, 11);
+        core.add_dependency(successor.id, other.id, DependencyType::FinishToStart)
+            .unwrap();
+
+        let removed = core
+            .remove_dependency(successor.id, predecessor.id)
+            .unwrap();
+        // No such edge any more: nothing is written, and it is still flagged.
+        let unchanged = core
+            .remove_dependency(successor.id, predecessor.id)
+            .unwrap();
+
+        assert!(removed.out_of_sync);
+        assert!(unchanged.out_of_sync);
+    }
+
+    #[test]
+    fn out_of_sync_should_ignore_a_soft_deleted_predecessor() {
+        let mut core = new_core();
+        let (predecessor, successor) = violating_pair(&mut core);
+        assert!(is_flagged(&core, successor.id));
+
+        core.delete_task(predecessor.id, DeleteMode::Subtree)
+            .unwrap();
+
+        assert!(!is_flagged(&core, successor.id));
+        let live = core.get_tree(TreeFilter::default()).unwrap();
+        assert_eq!(live.len(), 1);
+        assert!(!live[0].out_of_sync);
+        // Listing the deleted predecessor alongside does not make it
+        // constrain anything.
+        let all = core
+            .get_tree(TreeFilter {
+                include_deleted: true,
+                ..TreeFilter::default()
+            })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|t| !t.out_of_sync));
+
+        // The dependency is kept, so it constrains again once restored.
+        core.restore_task(predecessor.id).unwrap();
+        assert!(is_flagged(&core, successor.id));
+    }
+
+    #[test]
+    fn out_of_sync_should_be_false_for_a_soft_deleted_task() {
+        let mut core = new_core();
+        let (_, successor) = violating_pair(&mut core);
+
+        let outcome = core.delete_task(successor.id, DeleteMode::Subtree).unwrap();
+
+        assert_eq!(outcome.deleted.len(), 1);
+        assert!(!outcome.deleted[0].out_of_sync);
+        let all = core
+            .get_tree(TreeFilter {
+                include_deleted: true,
+                ..TreeFilter::default()
+            })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|t| !t.out_of_sync));
+
+        // Restoring brings the task back with the dates that break its
+        // dependency, so it is flagged again.
+        let restored = core.restore_task(successor.id).unwrap();
+        assert!(restored.out_of_sync);
+    }
+
+    #[test]
+    fn complete_task_should_not_change_successor_dates() {
+        let mut core = new_core();
+        let (predecessor, successor) = violating_pair(&mut core);
+        let in_sync = dated_task(&mut core, "In sync", 10, 12);
+        core.add_dependency(in_sync.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        let successor_before = core.get_task(successor.id).unwrap().unwrap();
+        let in_sync_before = core.get_task(in_sync.id).unwrap().unwrap();
+
+        let completed = core.complete_task(predecessor.id, false).unwrap();
+
+        // Neither successor's row is written, and each keeps its flag: a
+        // completed predecessor still constrains by its dates.
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, predecessor.id);
+        let successor_after = core.get_task(successor.id).unwrap().unwrap();
+        let in_sync_after = core.get_task(in_sync.id).unwrap().unwrap();
+        assert_eq!(successor_after, successor_before);
+        assert_eq!(in_sync_after, in_sync_before);
+        assert!(successor_after.out_of_sync);
+        assert!(!in_sync_after.out_of_sync);
+    }
+
+    #[test]
+    fn delete_task_promote_children_should_not_flag_a_child_that_depended_on_it() {
+        let mut core = new_core();
+        let (predecessor, successor) = violating_pair(&mut core);
+        core.set_parent(successor.id, Some(predecessor.id)).unwrap();
+        assert!(is_flagged(&core, successor.id));
+
+        let outcome = core
+            .delete_task(predecessor.id, DeleteMode::PromoteChildren)
+            .unwrap();
+
+        // The promoted child's only predecessor is the task just deleted,
+        // so what the call returns matches a later read.
+        assert_eq!(outcome.updated.len(), 1);
+        assert!(!outcome.updated[0].out_of_sync);
+        assert!(!is_flagged(&core, successor.id));
+    }
+
+    #[test]
+    fn task_returning_methods_should_report_out_of_sync() {
+        let mut core = new_core();
+        let (_, successor) = violating_pair(&mut core);
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let other_parent = core.create_task(minimal_new_task("Other parent")).unwrap();
+
+        let moved = core.set_parent(successor.id, Some(parent.id)).unwrap();
+        assert!(moved.out_of_sync);
+        let unmoved = core.set_parent(successor.id, Some(parent.id)).unwrap();
+        assert!(unmoved.out_of_sync);
+        let children = core.list_children(parent.id).unwrap();
+        assert!(children[0].out_of_sync);
+
+        let completed = core.complete_task(successor.id, false).unwrap();
+        assert!(completed[0].out_of_sync);
+        let reopened = core.reopen_task(successor.id).unwrap();
+        assert!(reopened.out_of_sync);
+        let cascaded = core.complete_task(parent.id, true).unwrap();
+        let flagged: Vec<TaskId> = cascaded
+            .iter()
+            .filter(|t| t.out_of_sync)
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(cascaded.len(), 2);
+        assert_eq!(flagged, [successor.id]);
+
+        core.set_parent(parent.id, Some(other_parent.id)).unwrap();
+        let outcome = core
+            .delete_task(parent.id, DeleteMode::PromoteChildren)
+            .unwrap();
+        assert_eq!(outcome.updated.len(), 1);
+        assert!(outcome.updated[0].out_of_sync);
+        assert!(!outcome.deleted[0].out_of_sync);
+    }
+
+    fn floating_task(core: &mut Core<InMemoryStore>, title: &str, start: u32, due: u32) -> Task {
+        let task = dated_task(core, title, start, due);
+        core.update_task(
+            task.id,
+            TaskPatch {
+                dates_fixed: Field::Set(false),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    /// A predecessor running 1..10 with three finish-to-start successors
+    /// that all start too early: a floating parent of one completed child,
+    /// that child, and a task with fixed dates.
+    fn schedule_fixture(core: &mut Core<InMemoryStore>) -> (Task, Task, Task) {
+        let predecessor = dated_task(core, "Predecessor", 1, 10);
+        let floating = floating_task(core, "Floating", 5, 12);
+        let child = core
+            .create_task(NewTask {
+                parent_id: Some(floating.id),
+                start_date: Some(day(6)),
+                due_date: Some(day(8)),
+                ..minimal_new_task("Child")
+            })
+            .unwrap();
+        let fixed = dated_task(core, "Fixed", 3, 9);
+        for id in [floating.id, child.id, fixed.id] {
+            core.add_dependency(id, predecessor.id, DependencyType::FinishToStart)
+                .unwrap();
+        }
+        core.complete_task(child.id, false).unwrap();
+        (floating, child, fixed)
+    }
+
+    #[test]
+    fn preview_schedule_should_report_moves_with_before_and_after() {
+        let mut core = new_core();
+        let (floating, child, fixed) = schedule_fixture(&mut core);
+        let before = core.get_task(floating.id).unwrap().unwrap();
+        let after = Task {
+            start_date: Some(day(10)),
+            due_date: Some(day(17)),
+            out_of_sync: false,
+            ..before.clone()
+        };
+
+        let schedule = core.preview_schedule().unwrap();
+
+        assert!(before.out_of_sync);
+        assert!((before.progress - 1.0).abs() < f32::EPSILON);
+        assert_eq!(schedule.moved, [Rescheduled { before, after }]);
+        assert_eq!(
+            schedule.out_of_sync,
+            [
+                core.get_task(child.id).unwrap().unwrap(),
+                core.get_task(fixed.id).unwrap().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_schedule_should_write_nothing() {
+        let mut core = new_core();
+        schedule_fixture(&mut core);
+        let before = store_snapshot(&core);
+
+        let schedule = core.preview_schedule().unwrap();
+
+        assert_eq!(schedule.moved.len(), 1);
+        assert_eq!(store_snapshot(&core), before);
+    }
+
+    /// What `committed` would be had it not bumped `updated_at` on the
+    /// tasks it moved: the form a preview reports them in.
+    fn without_updated_at_bump(mut committed: Schedule) -> Schedule {
+        for moved in &mut committed.moved {
+            moved.after.updated_at = moved.before.updated_at;
+        }
+        committed
+    }
+
+    /// `schedule_fixture` plus a floating task that depends on the floating
+    /// one, so a schedule moves two tasks, one after the other.
+    fn chained_schedule_fixture(core: &mut Core<InMemoryStore>) -> (Task, Task) {
+        let (floating, _, _) = schedule_fixture(core);
+        let downstream = floating_task(core, "Downstream", 6, 7);
+        core.add_dependency(downstream.id, floating.id, DependencyType::FinishToStart)
+            .unwrap();
+        (floating, downstream)
+    }
+
+    #[test]
+    fn reschedule_should_write_exactly_what_preview_schedule_reported() {
+        let mut core = new_core();
+        let (floating, downstream) = chained_schedule_fixture(&mut core);
+        let preview = core.preview_schedule().unwrap();
+
+        let committed = core.reschedule().unwrap();
+
+        let moved_ids: Vec<TaskId> = committed.moved.iter().map(|m| m.after.id).collect();
+        assert_eq!(moved_ids, [floating.id, downstream.id]);
+        for moved in &committed.moved {
+            let stored = core.get_task(moved.after.id).unwrap().unwrap();
+            assert_eq!(stored, moved.after);
+        }
+        assert_eq!(without_updated_at_bump(committed), preview);
+        let stored = core.get_task(floating.id).unwrap().unwrap();
+        assert_eq!(stored.start_date, Some(day(10)));
+        assert_eq!(stored.due_date, Some(day(17)));
+    }
+
+    #[test]
+    fn reschedule_should_leave_moved_tasks_floating() {
+        let mut core = new_core();
+        let (floating, downstream) = chained_schedule_fixture(&mut core);
+
+        let committed = core.reschedule().unwrap();
+
+        assert_eq!(committed.moved.len(), 2);
+        assert!(committed.moved.iter().all(|m| !m.after.dates_fixed));
+        for (id, start) in [(floating.id, day(10)), (downstream.id, day(17))] {
+            let stored = core.get_task(id).unwrap().unwrap();
+            assert_eq!(stored.start_date, Some(start));
+            assert!(!stored.dates_fixed);
+        }
+    }
+
+    #[test]
+    fn reschedule_should_bump_updated_at_only_on_moved_tasks() {
+        let mut core = new_core();
+        let (floating, downstream) = chained_schedule_fixture(&mut core);
+        let before = store_snapshot(&core).0;
+        // Long enough that a bumped timestamp is strictly later.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let committed = core.reschedule().unwrap();
+
+        let moved_ids = [floating.id, downstream.id];
+        for was in &before {
+            let now = core.get_task(was.id).unwrap().unwrap();
+            if moved_ids.contains(&was.id) {
+                assert!(now.updated_at > was.updated_at);
+            } else {
+                assert_eq!(now.updated_at, was.updated_at);
+            }
+        }
+        // Every moved task carries the same instant, the one the result
+        // reports.
+        let stamp = committed.moved[0].after.updated_at;
+        assert!(committed.moved.iter().all(|m| m.after.updated_at == stamp));
+    }
+
+    #[test]
+    fn reschedule_should_write_nothing_when_nothing_moves() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        let mut dated = |title: &str, start: u32, due: u32| {
+            core.create_task(NewTask {
+                start_date: Some(day(start)),
+                due_date: Some(day(due)),
+                ..minimal_new_task(title)
+            })
+            .unwrap()
+        };
+        let predecessor = dated("Predecessor", 1, 10);
+        let fixed = dated("Fixed", 3, 9);
+        core.add_dependency(fixed.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        let fixed = core.get_task(fixed.id).unwrap().unwrap();
+        let start = log.borrow().len();
+
+        let committed = core.reschedule().unwrap();
+
+        // A fixed task is never moved, so it stays out of sync and the
+        // call is read-only, inside a single transaction.
+        assert_eq!(committed.moved, []);
+        assert_eq!(committed.out_of_sync, std::slice::from_ref(&fixed));
+        let transactions: HashSet<usize> =
+            log.borrow()[start..].iter().map(|(tx, _)| *tx).collect();
+        assert_eq!(transactions.len(), 1);
+        assert!(
+            log.borrow()[start..]
+                .iter()
+                .all(|(_, method)| *method != "put_task")
+        );
+        assert_eq!(core.get_task(fixed.id).unwrap().unwrap(), fixed);
+    }
+
+    /// Reading, planning and every write share one transaction.
+    #[test]
+    fn reschedule_should_run_in_a_single_transaction() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        let predecessor = core
+            .create_task(NewTask {
+                start_date: Some(day(1)),
+                due_date: Some(day(10)),
+                ..minimal_new_task("Predecessor")
+            })
+            .unwrap();
+        let floating = core
+            .create_task(NewTask {
+                duration_days: Some(3),
+                ..minimal_new_task("Floating")
+            })
+            .unwrap();
+        core.add_dependency(floating.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        let start = log.borrow().len();
+
+        let committed = core.reschedule().unwrap();
+
+        assert_eq!(committed.moved.len(), 1);
+        let log = log.borrow();
+        let transactions: HashSet<usize> = log[start..].iter().map(|(tx, _)| *tx).collect();
+        assert_eq!(transactions.len(), 1);
+        let writes = log[start..].iter().filter(|(_, m)| *m == "put_task");
+        assert_eq!(writes.count(), 1);
+    }
+
+    #[test]
+    fn get_tree_should_list_tasks_once_when_unfiltered() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        core.create_task(NewTask {
+            parent_id: Some(parent.id),
+            ..minimal_new_task("Child")
+        })
+        .unwrap();
+        let start = log.borrow().len();
+
+        let tree = core.get_tree(TreeFilter::default()).unwrap();
+
+        assert_eq!(tree.len(), 2);
+        let log = log.borrow();
+        let lists = log[start..].iter().filter(|(_, m)| *m == "list_tasks");
+        assert_eq!(lists.count(), 1);
+    }
+
+    #[test]
+    fn get_tree_should_fetch_a_filtered_out_predecessor_once() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        let mut dated = |title: &str, start: u32, due: u32| {
+            core.create_task(NewTask {
+                start_date: Some(day(start)),
+                due_date: Some(day(due)),
+                ..minimal_new_task(title)
+            })
+            .unwrap()
+        };
+        let predecessor = dated("Predecessor", 1, 10);
+        let successors = [
+            dated("One", 5, 12),
+            dated("Two", 6, 12),
+            dated("Three", 7, 12),
+        ];
+        for successor in &successors {
+            core.add_dependency(successor.id, predecessor.id, DependencyType::FinishToStart)
+                .unwrap();
+        }
+        core.complete_task(predecessor.id, false).unwrap();
+        let start = log.borrow().len();
+
+        let tree = core
+            .get_tree(TreeFilter {
+                status: Some(TaskStatus::Incomplete),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // The completed predecessor is filtered out of the result but still
+        // constrains all three, and is read for them once.
+        assert_eq!(tree.len(), 3);
+        assert!(tree.iter().all(|task| task.out_of_sync));
+        let log = log.borrow();
+        let fetches = log[start..].iter().filter(|(_, m)| *m == "get_task");
+        assert_eq!(fetches.count(), 1);
+    }
+
+    /// The one list a schedule is planned from also supplies the set of
+    /// live tasks its ordering needs, so the tasks are not listed again.
+    #[test]
+    fn preview_schedule_should_list_tasks_once() {
+        let store = CountingStore::new();
+        let log = store.log();
+        let mut core = Core::new(store).unwrap();
+        let predecessor = core
+            .create_task(NewTask {
+                start_date: Some(day(1)),
+                due_date: Some(day(10)),
+                ..minimal_new_task("Predecessor")
+            })
+            .unwrap();
+        let floating = core
+            .create_task(NewTask {
+                duration_days: Some(3),
+                ..minimal_new_task("Floating")
+            })
+            .unwrap();
+        core.add_dependency(floating.id, predecessor.id, DependencyType::FinishToStart)
+            .unwrap();
+        let start = log.borrow().len();
+
+        let schedule = core.preview_schedule().unwrap();
+
+        assert_eq!(schedule.moved.len(), 1);
+        let log = log.borrow();
+        let lists = log[start..].iter().filter(|(_, m)| *m == "list_tasks");
+        assert_eq!(lists.count(), 1);
+    }
+
+    #[test]
+    fn reschedule_twice_should_move_nothing_the_second_time() {
+        let mut core = new_core();
+        chained_schedule_fixture(&mut core);
+        let first = core.reschedule().unwrap();
+        let after_first = store_snapshot(&core);
+
+        let second = core.reschedule().unwrap();
+
+        assert_eq!(first.moved.len(), 2);
+        assert_eq!(second.moved, []);
+        assert_eq!(second.out_of_sync, first.out_of_sync);
+        assert_eq!(store_snapshot(&core), after_first);
+    }
+
+    #[test]
+    fn update_task_should_still_return_only_the_edited_task() {
+        let mut core = new_core();
+        let (floating, downstream) = chained_schedule_fixture(&mut core);
+        core.reschedule().unwrap();
+        let downstream_before = core.get_task(downstream.id).unwrap().unwrap();
+
+        // Pushing a task later leaves its floating dependent where it is,
+        // now out of sync, until the next schedule is committed.
+        let updated = core
+            .update_task(
+                floating.id,
+                TaskPatch {
+                    due_date: Field::Set(day(25)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].id, floating.id);
+        let downstream_after = core.get_task(downstream.id).unwrap().unwrap();
+        assert!(downstream_after.out_of_sync);
+        assert_eq!(
+            Task {
+                out_of_sync: false,
+                ..downstream_after
+            },
+            downstream_before
         );
     }
 }

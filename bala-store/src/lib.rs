@@ -4,12 +4,11 @@
 //! `docs/design/data-store.md`) against a single SQLite database, opened
 //! via [`SqliteStore::open`]/[`SqliteStore::open_in_memory`].
 //!
-//! ## Unused schema
+//! ## Schema
 //!
-//! The schema baseline (`migrations/V1__init.sql`) creates the full shape
-//! from `docs/design/data-store.md` §Schema, ahead of the features that
-//! use it. The `tasks.out_of_sync` column sits unused: `bala-core`'s `Task`
-//! has no `out_of_sync` field (see the `task` module docs). The
+//! The schema baseline (`migrations/V1__init.sql`) creates the shape from
+//! `docs/design/data-store.md` §Schema, and all of it is in use. Every
+//! `tasks` column backs a `Task` field (see the `task` module docs). The
 //! `dependency_edges` table is written only through the dependency-edge
 //! `StoreTx` methods (see the `edges` module); `get_task`/`list_tasks` read
 //! it to fill `Task::depends_on`.

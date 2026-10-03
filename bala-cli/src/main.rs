@@ -31,6 +31,9 @@ fn main() -> ExitCode {
         Some(Commands::User(user_args)) => cli::run_user_command(&db_path, user_args.command),
         Some(Commands::Type(type_args)) => cli::run_type_command(&db_path, type_args.command),
         Some(Commands::Dep(dep_args)) => cli::run_dep_command(&db_path, dep_args.command),
+        Some(Commands::Schedule(schedule_args)) => {
+            cli::run_schedule_command(&db_path, &schedule_args)
+        }
     };
 
     match result {

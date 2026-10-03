@@ -1,9 +1,7 @@
 -- Bala schema baseline (docs/design/data-store.md §Schema).
 --
--- Some columns and tables are not read by `bala-core` yet
--- (`dependency_edges`; `tasks.assignee_id`, `out_of_sync`, `completed_at`,
--- `deleted_at`). They are part of the designed schema so the features that
--- use them need no table rebuild.
+-- Every table and column here is read and written through `bala-core`'s
+-- `Store`/`StoreTx` traits.
 
 CREATE TABLE task_types (
     key         TEXT PRIMARY KEY,
@@ -25,14 +23,16 @@ CREATE TABLE tasks (
     status        TEXT NOT NULL CHECK (status IN ('incomplete', 'complete')),
     start_date    TEXT,                      -- ISO-8601 date
     due_date      TEXT,
+    duration_days INTEGER,                   -- whole calendar days; 0 = milestone
+    dates_fixed   INTEGER NOT NULL DEFAULT 0, -- 0/1; 0 = the dates float
     assignee_id   BLOB REFERENCES users(id),
-    out_of_sync   INTEGER NOT NULL DEFAULT 0, -- 0/1
     created_at    TEXT NOT NULL,              -- RFC 3339 UTC
     updated_at    TEXT NOT NULL,
     completed_at  TEXT,
     deleted_at    TEXT                        -- soft-delete tombstone; NULL = live
 );
 -- progress is library-computed on read (Core LLD §Algorithm 4) — no column.
+-- out_of_sync likewise (Core LLD §Algorithm 3) — no column.
 
 CREATE INDEX idx_tasks_type_live     ON tasks(type_key)     WHERE deleted_at IS NULL;
 CREATE INDEX idx_tasks_status_live   ON tasks(status)       WHERE deleted_at IS NULL;
@@ -70,7 +70,7 @@ CREATE TABLE dependency_edges (
                                                  -- add_dependency_edge upserts, doesn't duplicate
 );
 -- PK's leading column (predecessor_id) indexes "what depends on X"
--- (cascade forward-propagation, Core LLD §Algorithm 3; list_successor_edges).
+-- (list_successor_edges).
 -- Reverse needs its own index:
 CREATE INDEX idx_dependency_edges_successor ON dependency_edges(successor_id); -- "what does X depend on"
                                                                                 -- (dependency validity walk, Core LLD §Algorithm 2;

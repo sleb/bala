@@ -1,13 +1,12 @@
 //! `tasks` row <-> [`Task`] mapping and queries.
 //!
-//! `out_of_sync` is unused by `bala-core`'s current `Task` shape (see crate
-//! docs) and is written with a fixed default (`0`) on every `put_task`,
-//! never read back into a `Task`, since `Task` has nowhere to put it yet.
-//! `assignee_id`, `deleted_at`, and `completed_at` *are* read/written.
+//! Every `tasks` column is read into and written from a `Task` field.
 //!
 //! `parent_id` and `depends_on` are not columns: reads fill them from the
 //! `parent_edges` and `dependency_edges` tables, and `put_task` writes
-//! neither, so the edge tables are their only source.
+//! neither, so the edge tables are their only source. `progress` and
+//! `out_of_sync` are not columns either: `Core` computes both on read, so a
+//! row always reads back `0.0` and `false` and `put_task` writes neither.
 
 use bala_core::{StoreError, Task, TaskId, TreeFilter};
 use rusqlite::{OptionalExtension, Row, ToSql, Transaction, params};
@@ -19,7 +18,7 @@ use crate::convert::{
 use crate::edges;
 
 const SELECT_COLUMNS: &str = "id, title, description, type_key, status, start_date, due_date, \
-    assignee_id, created_at, updated_at, completed_at, deleted_at";
+    duration_days, dates_fixed, assignee_id, created_at, updated_at, completed_at, deleted_at";
 
 /// Builds a [`Task`] from a row of [`SELECT_COLUMNS`], leaving `parent_id`
 /// and `depends_on` empty — callers fill them in with [`fill_edges`] (edges
@@ -32,11 +31,13 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
     let status_text: String = row.get(4)?;
     let start_date: Option<String> = row.get(5)?;
     let due_date: Option<String> = row.get(6)?;
-    let assignee_id: Option<Vec<u8>> = row.get(7)?;
-    let created_at: String = row.get(8)?;
-    let updated_at: String = row.get(9)?;
-    let completed_at: Option<String> = row.get(10)?;
-    let deleted_at: Option<String> = row.get(11)?;
+    let duration_days: Option<u32> = row.get(7)?;
+    let dates_fixed: bool = row.get(8)?;
+    let assignee_id: Option<Vec<u8>> = row.get(9)?;
+    let created_at: String = row.get(10)?;
+    let updated_at: String = row.get(11)?;
+    let completed_at: Option<String> = row.get(12)?;
+    let deleted_at: Option<String> = row.get(13)?;
 
     Ok((|| {
         Ok(Task {
@@ -51,8 +52,13 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Result<Task, StoreError>> {
             progress: 0.0,
             start_date: start_date.map(|s| date_from_text(&s)).transpose()?,
             due_date: due_date.map(|s| date_from_text(&s)).transpose()?,
+            duration_days,
+            dates_fixed,
             assignee_id: assignee_id.map(|b| blob_to_user_id(&b)).transpose()?,
             depends_on: Vec::new(),
+            // Not a stored column either: `Core` computes it from the
+            // task's dependencies on every read.
+            out_of_sync: false,
             created_at: timestamp_from_text(&created_at)?,
             updated_at: timestamp_from_text(&updated_at)?,
             completed_at: completed_at.map(|s| timestamp_from_text(&s)).transpose()?,
@@ -106,8 +112,9 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
     tx.execute(
         "INSERT INTO tasks (
             id, title, description, type_key, status, start_date, due_date,
-            assignee_id, out_of_sync, created_at, updated_at, completed_at, deleted_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12)
+            duration_days, dates_fixed, assignee_id, created_at, updated_at,
+            completed_at, deleted_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         ON CONFLICT(id) DO UPDATE SET
             title = excluded.title,
             description = excluded.description,
@@ -115,6 +122,8 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
             status = excluded.status,
             start_date = excluded.start_date,
             due_date = excluded.due_date,
+            duration_days = excluded.duration_days,
+            dates_fixed = excluded.dates_fixed,
             assignee_id = excluded.assignee_id,
             updated_at = excluded.updated_at,
             completed_at = excluded.completed_at,
@@ -127,6 +136,8 @@ pub(crate) fn put_task(tx: &Transaction, task: &Task) -> Result<(), StoreError> 
             status_to_text(task.status),
             task.start_date.map(date_to_text),
             task.due_date.map(date_to_text),
+            task.duration_days,
+            task.dates_fixed,
             assignee_id_blob.as_ref().map(<[u8; 16]>::as_slice),
             timestamp_to_text(task.created_at),
             timestamp_to_text(task.updated_at),

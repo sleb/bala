@@ -340,8 +340,11 @@ mod tests {
             progress: 0.0,
             start_date: None,
             due_date: None,
+            duration_days: None,
+            dates_fixed: false,
             assignee_id: None,
             depends_on: Vec::new(),
+            out_of_sync: false,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -815,6 +818,7 @@ mod tests {
                 type_key: None,
                 start_date: None,
                 due_date: None,
+                duration_days: None,
                 assignee_id: None,
             }
         }

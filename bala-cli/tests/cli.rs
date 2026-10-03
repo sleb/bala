@@ -464,6 +464,217 @@ fn lines_naming<'a>(ls_text: &'a str, title: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The single `task ls` line for the task with this id.
+fn ls_line(db_path: &std::path::Path, task_id: &str) -> String {
+    let ls_text = task_ls(db_path);
+    let lines = lines_naming(&ls_text, task_id);
+    assert_eq!(lines.len(), 1, "{task_id} should be on one line: {ls_text}");
+    lines[0].to_owned()
+}
+
+#[test]
+fn task_add_with_duration_should_store_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Build", "--duration", "3"]);
+
+    assert_eq!(
+        ls_line(&db_path, &task_id),
+        format!("[ ] {task_id} Build (type: task) (3d)")
+    );
+}
+
+#[test]
+fn task_edit_duration_should_replace_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let task_id = add_task(&db_path, &["--title", "Build", "--duration", "3"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--duration", "5"])
+        .assert()
+        .success()
+        .stdout(contains("(5d)"));
+
+    assert_eq!(
+        ls_line(&db_path, &task_id),
+        format!("[ ] {task_id} Build (type: task) (5d)")
+    );
+}
+
+#[test]
+fn task_edit_clear_duration_should_remove_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let task_id = add_task(&db_path, &["--title", "Build", "--duration", "3"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--clear-duration"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        ls_line(&db_path, &task_id),
+        format!("[ ] {task_id} Build (type: task)")
+    );
+}
+
+#[test]
+fn task_edit_with_negative_duration_should_fail_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let task_id = add_task(&db_path, &["--title", "Build", "--duration", "3"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--duration", "-1"])
+        .assert()
+        .code(2)
+        .stderr(contains("invalid value '-1' for '--duration"));
+
+    assert_eq!(
+        ls_line(&db_path, &task_id),
+        format!("[ ] {task_id} Build (type: task) (3d)")
+    );
+}
+
+#[test]
+fn task_edit_float_should_release_a_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let task_id = add_task(&db_path, &["--title", "Build", "--start", "2026-10-05"]);
+    assert!(ls_line(&db_path, &task_id).ends_with(" 2026-10-05..? (fixed)"));
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--float"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        ls_line(&db_path, &task_id),
+        format!("[ ] {task_id} Build (type: task) 2026-10-05..?")
+    );
+}
+
+#[test]
+fn task_edit_fix_should_fix_a_floating_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let task_id = add_task(&db_path, &["--title", "Build", "--start", "2026-10-05"]);
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--float"])
+        .assert()
+        .success();
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--fix"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        ls_line(&db_path, &task_id),
+        format!("[ ] {task_id} Build (type: task) 2026-10-05..? (fixed)")
+    );
+}
+
+#[test]
+fn task_edit_start_with_float_should_set_a_floating_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let task_id = add_task(&db_path, &["--title", "Build"]);
+
+    bala_cmd(&db_path)
+        .args([
+            "task",
+            "edit",
+            &task_id,
+            "--start",
+            "2026-10-05",
+            "--duration",
+            "3",
+            "--float",
+        ])
+        .assert()
+        .success()
+        .stdout(format!(
+            "[ ] {task_id} Build (type: task) 2026-10-05..? (3d)\n"
+        ));
+}
+
+#[test]
+fn task_edit_fix_and_float_together_should_fail_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let task_id = add_task(&db_path, &["--title", "Build", "--start", "2026-10-05"]);
+
+    bala_cmd(&db_path)
+        .args(["task", "edit", &task_id, "--fix", "--float"])
+        .assert()
+        .code(2)
+        .stderr(contains("cannot be used with"));
+
+    assert!(ls_line(&db_path, &task_id).ends_with(" (fixed)"));
+}
+
+#[test]
+fn task_ls_should_show_dates_duration_and_fixed_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let user_id = String::from_utf8(
+        bala_cmd(&db_path)
+            .args(["user", "add", "--name", "Ada"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    let both_id = add_task(
+        &db_path,
+        &[
+            "--title",
+            "Both dates",
+            "--assignee",
+            &user_id,
+            "--start",
+            "2026-10-05",
+            "--due",
+            "2026-10-08",
+            "--duration",
+            "3",
+        ],
+    );
+    let due_only_id = add_task(&db_path, &["--title", "Due only", "--due", "2026-10-08"]);
+
+    assert_eq!(
+        ls_line(&db_path, &both_id),
+        format!(
+            "[ ] {both_id} Both dates (type: task) (assigned: Ada) 2026-10-05..2026-10-08 (3d) (fixed)"
+        )
+    );
+    assert_eq!(
+        ls_line(&db_path, &due_only_id),
+        format!("[ ] {due_only_id} Due only (type: task) ?..2026-10-08 (fixed)")
+    );
+}
+
+#[test]
+fn task_ls_should_show_no_date_suffix_for_a_task_without_dates_or_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+
+    let task_id = add_task(&db_path, &["--title", "Plain"]);
+
+    assert_eq!(
+        ls_line(&db_path, &task_id),
+        format!("[ ] {task_id} Plain (type: task)")
+    );
+}
+
 #[test]
 fn task_delete_promote_children_should_move_children_to_top_level_without_a_grandparent() {
     let dir = tempfile::tempdir().unwrap();
@@ -993,18 +1204,14 @@ fn task_add_with_inherit_should_copy_assignee_and_dates_from_first_parent() {
         &["--title", "Child task", "--parent", &parent_id, "--inherit"],
     );
 
-    // `task ls` doesn't print start/due dates at all (see `format_task_line`
-    // in `bala-cli/src/cli.rs`), so the date-inheritance half of this
-    // behavior isn't observable through CLI stdout. The assignee-name
-    // suffix is, so that's what's asserted here as the observable proxy for
-    // "inherit actually ran".
+    // The child's line carries the parent's assignee (by name, never by
+    // id) and both of its dates.
     bala_cmd(&db_path)
         .args(["task", "ls"])
         .assert()
         .success()
         .stdout(
-            contains("Child task")
-                .and(contains("Ada"))
+            contains("Child task (type: task) (assigned: Ada) 2026-01-01..2026-01-31")
                 .and(contains(&user_id).not()),
         );
 }
@@ -1513,4 +1720,321 @@ fn dep_rm_with_unknown_task_id_should_fail() {
         .assert()
         .failure()
         .stderr(contains("not found"));
+}
+
+#[test]
+fn task_ls_should_mark_out_of_sync_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let a = add_task(
+        &db_path,
+        &[
+            "--title",
+            "A",
+            "--start",
+            "2026-10-01",
+            "--due",
+            "2026-10-05",
+        ],
+    );
+    let b = add_task(
+        &db_path,
+        &[
+            "--title",
+            "B",
+            "--start",
+            "2026-10-05",
+            "--due",
+            "2026-10-08",
+        ],
+    );
+    add_dependency(&db_path, &b, &a);
+    let in_sync = format!("[ ] {b} B (type: task) 2026-10-05..2026-10-08 (fixed)");
+    assert_eq!(ls_line(&db_path, &b), in_sync);
+
+    // Moving A's due date past B's start breaks B's dependency on it.
+    bala_cmd(&db_path)
+        .args(["task", "edit", &a, "--due", "2026-10-06"])
+        .assert()
+        .success()
+        .stdout(contains("(out of sync)").not());
+
+    // B keeps its dates and gains the marker; A, which breaks nothing of
+    // its own, does not.
+    assert_eq!(ls_line(&db_path, &b), format!("{in_sync} (out of sync)"));
+    assert_eq!(
+        ls_line(&db_path, &a),
+        format!("[ ] {a} A (type: task) 2026-10-01..2026-10-06 (fixed)")
+    );
+}
+
+#[test]
+fn dep_add_on_a_violating_pair_should_print_the_task_as_out_of_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let a = add_task(
+        &db_path,
+        &[
+            "--title",
+            "A",
+            "--start",
+            "2026-10-01",
+            "--due",
+            "2026-10-05",
+        ],
+    );
+    let b = add_task(
+        &db_path,
+        &[
+            "--title",
+            "B",
+            "--start",
+            "2026-10-03",
+            "--due",
+            "2026-10-08",
+        ],
+    );
+
+    let output = bala_cmd(&db_path)
+        .args(["dep", "add", &b, "--on", &a])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    // The dependency is recorded and neither task has moved.
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        format!(
+            "[ ] {b} B (type: task) 2026-10-03..2026-10-08 (fixed) (out of sync)\n  \
+             depends on: {a} (fs)\n"
+        )
+    );
+    assert_eq!(
+        ls_line(&db_path, &a),
+        format!("[ ] {a} A (type: task) 2026-10-01..2026-10-05 (fixed)")
+    );
+}
+
+/// Adds a task with both dates set, returning its id.
+fn add_dated_task(db_path: &std::path::Path, title: &str, start: &str, due: &str) -> String {
+    add_task(db_path, &["--title", title, "--start", start, "--due", due])
+}
+
+/// Builds A (`2026-10-01..2026-10-05`) and B (`2026-10-05..2026-10-08`),
+/// B depending on A, then pushes A's due date to `2026-10-09` so B breaks
+/// its dependency. B floats when `float_b` is set and stays fixed otherwise.
+/// Returns `(a, b)`.
+fn late_predecessor_fixture(db_path: &std::path::Path, float_b: bool) -> (String, String) {
+    let a = add_dated_task(db_path, "A", "2026-10-01", "2026-10-05");
+    let b = add_dated_task(db_path, "B", "2026-10-05", "2026-10-08");
+    if float_b {
+        bala_cmd(db_path)
+            .args(["task", "edit", &b, "--float"])
+            .assert()
+            .success();
+    }
+    add_dependency(db_path, &b, &a);
+    bala_cmd(db_path)
+        .args(["task", "edit", &a, "--due", "2026-10-09"])
+        .assert()
+        .success();
+    (a, b)
+}
+
+/// Runs `bala schedule` with `args`, feeding `stdin`, and returns its
+/// stdout.
+fn schedule_stdout(db_path: &std::path::Path, args: &[&str], stdin: &str) -> String {
+    let output = bala_cmd(db_path)
+        .arg("schedule")
+        .args(args)
+        .write_stdin(stdin)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).unwrap()
+}
+
+#[test]
+fn schedule_should_list_moves_with_old_and_new_dates_before_confirming() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let (_a, b) = late_predecessor_fixture(&db_path, true);
+
+    let stdout = schedule_stdout(&db_path, &[], "n\n");
+
+    let preview = format!(
+        "1 task(s) would move:\n  \
+         {b} B: 2026-10-05..2026-10-08 -> 2026-10-09..2026-10-12\n\
+         Apply? [y/N] "
+    );
+    assert!(
+        stdout.starts_with(&preview),
+        "expected the preview and then the prompt, got: {stdout}"
+    );
+}
+
+#[test]
+fn schedule_answered_no_should_change_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let (_a, b) = late_predecessor_fixture(&db_path, true);
+    let before = task_ls(&db_path);
+
+    let stdout = schedule_stdout(&db_path, &[], "n\n");
+
+    assert!(
+        stdout.ends_with("Aborted: nothing was moved.\n"),
+        "expected the abort message, got: {stdout}"
+    );
+    assert_eq!(task_ls(&db_path), before);
+    assert_eq!(
+        ls_line(&db_path, &b),
+        format!("[ ] {b} B (type: task) 2026-10-05..2026-10-08 (out of sync)")
+    );
+}
+
+#[test]
+fn schedule_answered_yes_should_move_the_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let (a, b) = late_predecessor_fixture(&db_path, true);
+
+    let stdout = schedule_stdout(&db_path, &[], "y\n");
+
+    // B moves, stays floating, and is back in sync; A is untouched.
+    let moved = format!("[ ] {b} B (type: task) 2026-10-09..2026-10-12");
+    assert!(
+        stdout.ends_with(&format!("Apply? [y/N] {moved}\n")),
+        "expected the moved task after the prompt, got: {stdout}"
+    );
+    assert_eq!(ls_line(&db_path, &b), moved);
+    assert_eq!(
+        ls_line(&db_path, &a),
+        format!("[ ] {a} A (type: task) 2026-10-01..2026-10-09 (fixed)")
+    );
+}
+
+#[test]
+fn schedule_with_yes_should_apply_without_prompting() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let (_a, b) = late_predecessor_fixture(&db_path, true);
+
+    // No stdin is fed: a prompt would read end-of-input and decline.
+    let stdout = schedule_stdout(&db_path, &["--yes"], "");
+
+    let moved = format!("[ ] {b} B (type: task) 2026-10-09..2026-10-12");
+    assert_eq!(
+        stdout,
+        format!(
+            "1 task(s) would move:\n  \
+             {b} B: 2026-10-05..2026-10-08 -> 2026-10-09..2026-10-12\n\
+             {moved}\n"
+        )
+    );
+    assert_eq!(ls_line(&db_path, &b), moved);
+}
+
+#[test]
+fn schedule_should_list_tasks_left_out_of_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let (a, b) = late_predecessor_fixture(&db_path, true);
+    // C is fixed and starts before A finishes, so no reschedule can fix it.
+    let c = add_dated_task(&db_path, "C", "2026-10-06", "2026-10-07");
+    add_dependency(&db_path, &c, &a);
+
+    let stdout = schedule_stdout(&db_path, &[], "n\n");
+
+    let preview = format!(
+        "1 task(s) would move:\n  \
+         {b} B: 2026-10-05..2026-10-08 -> 2026-10-09..2026-10-12\n\
+         1 task(s) would stay out of sync:\n  \
+         {c} C\n\
+         Apply? [y/N] "
+    );
+    assert!(
+        stdout.starts_with(&preview),
+        "expected the out-of-sync list before the prompt, got: {stdout}"
+    );
+}
+
+#[test]
+fn schedule_should_not_move_a_fixed_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let (_a, b) = late_predecessor_fixture(&db_path, false);
+    let before = task_ls(&db_path);
+
+    let stdout = schedule_stdout(&db_path, &["--yes"], "");
+
+    // The fixed task is reported, not moved.
+    assert_eq!(
+        stdout,
+        format!("Nothing to move.\n1 task(s) would stay out of sync:\n  {b} B\n")
+    );
+    assert_eq!(task_ls(&db_path), before);
+    assert_eq!(
+        ls_line(&db_path, &b),
+        format!("[ ] {b} B (type: task) 2026-10-05..2026-10-08 (fixed) (out of sync)")
+    );
+}
+
+#[test]
+fn schedule_with_nothing_to_move_should_say_so_and_not_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let a = add_dated_task(&db_path, "A", "2026-10-01", "2026-10-05");
+    let b = add_dated_task(&db_path, "B", "2026-10-05", "2026-10-08");
+    add_dependency(&db_path, &b, &a);
+
+    // Answering "y" to a prompt that is never shown changes nothing.
+    let stdout = schedule_stdout(&db_path, &[], "y\n");
+
+    assert_eq!(stdout, "Nothing to move.\n");
+}
+
+#[test]
+fn schedule_should_fill_a_due_date_from_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bala.db");
+    let a = add_task(
+        &db_path,
+        &["--title", "A", "--start", "2026-10-05", "--duration", "3"],
+    );
+    bala_cmd(&db_path)
+        .args(["task", "edit", &a, "--float"])
+        .assert()
+        .success();
+    // Fixed, so its missing due date is left alone.
+    let fixed = add_task(
+        &db_path,
+        &[
+            "--title",
+            "Fixed",
+            "--start",
+            "2026-10-05",
+            "--duration",
+            "3",
+        ],
+    );
+
+    let stdout = schedule_stdout(&db_path, &["--yes"], "");
+
+    assert_eq!(
+        stdout,
+        format!(
+            "1 task(s) would move:\n  \
+             {a} A: 2026-10-05..? -> 2026-10-05..2026-10-08\n\
+             [ ] {a} A (type: task) 2026-10-05..2026-10-08 (3d)\n"
+        )
+    );
+    assert_eq!(
+        ls_line(&db_path, &fixed),
+        format!("[ ] {fixed} Fixed (type: task) 2026-10-05..? (3d) (fixed)")
+    );
 }
