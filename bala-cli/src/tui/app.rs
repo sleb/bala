@@ -486,16 +486,20 @@ pub fn handle_key<S: Store>(app: &mut App, core: &mut Core<S>, key: KeyEvent) ->
 /// `mode` (see `confirm_delete`); in any other mode it does nothing. `Noop`
 /// does nothing.
 ///
-/// After every action the selected row's blockers are reloaded (see
-/// `reload_blockers`), so every selection change and tree refresh is covered
-/// without each call site repeating it.
+/// After every action except `InsertChar`/`Backspace` the selected row's
+/// blockers are reloaded (see `reload_blockers`), so every selection change
+/// and tree refresh is covered without each call site repeating it. The two
+/// keystroke actions only edit the buffer, so they skip the store reads.
 pub fn apply_action<S: Store>(
     app: &mut App,
     core: &mut Core<S>,
     action: Action,
 ) -> ControlFlow<()> {
+    let edits_buffer_only = matches!(action, Action::InsertChar(_) | Action::Backspace);
     let flow = dispatch_action(app, core, action);
-    reload_blockers(app, core);
+    if !edits_buffer_only {
+        reload_blockers(app, core);
+    }
     flow
 }
 
@@ -2351,6 +2355,41 @@ mod tests {
         super::reload_blockers(&mut app, &core);
 
         assert_eq!(app.error(), Some("original"));
+    }
+
+    #[test]
+    fn apply_action_insert_char_should_not_reload_blockers() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        let pred = core.create_task(minimal_new_task("Pred")).expect("create");
+        let blocked = core
+            .create_task(minimal_new_task("Blocked"))
+            .expect("create");
+        core.add_dependency(blocked.id, pred.id, bala_core::DependencyType::default())
+            .expect("add dependency");
+        let tasks = core
+            .get_tree(bala_core::TreeFilter::default())
+            .expect("get_tree should succeed");
+        let order = core.sibling_order().expect("sibling_order should succeed");
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        app.select_by_id(Some(blocked.id));
+        let _ = apply_action(&mut app, &mut core, Action::StartInsertNewTitle);
+        remaining.set(Some(0));
+
+        let _ = apply_action(&mut app, &mut core, Action::InsertChar('x'));
+
+        assert_eq!(app.error(), None);
     }
 
     #[test]
