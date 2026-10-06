@@ -48,6 +48,12 @@ pub enum Action {
     /// `Normal` mode, `List`/`Detail` pane, `x`/`Space`: toggle the selected
     /// task's complete/incomplete state.
     ToggleComplete,
+    /// `Normal` mode, `List`/`Detail` pane, `p`: start adding a dependency
+    /// to the selected task.
+    StartAddDependency,
+    /// `Normal` mode, `List`/`Detail` pane, `P`: start removing a dependency
+    /// from the selected task.
+    StartRemoveDependency,
     /// `Insert` mode: append a character to the edit buffer.
     InsertChar(char),
     /// `Insert` mode: remove the last character from the edit buffer.
@@ -181,6 +187,18 @@ pub static NORMAL_LIST_BINDINGS: &[Binding] = &[
         description: "Toggle complete/incomplete",
     },
     Binding {
+        keys: &[KeyCode::Char('p')],
+        action: Action::StartAddDependency,
+        label: "p",
+        description: "Add a dependency to the selected task",
+    },
+    Binding {
+        keys: &[KeyCode::Char('P')],
+        action: Action::StartRemoveDependency,
+        label: "P",
+        description: "Remove a dependency from the selected task",
+    },
+    Binding {
         keys: &[KeyCode::Char('?')],
         action: Action::OpenHelp,
         label: "?",
@@ -289,6 +307,18 @@ pub static NORMAL_DETAIL_BINDINGS: &[Binding] = &[
         action: Action::ToggleComplete,
         label: "x/Space",
         description: "Toggle complete/incomplete",
+    },
+    Binding {
+        keys: &[KeyCode::Char('p')],
+        action: Action::StartAddDependency,
+        label: "p",
+        description: "Add a dependency to the selected task",
+    },
+    Binding {
+        keys: &[KeyCode::Char('P')],
+        action: Action::StartRemoveDependency,
+        label: "P",
+        description: "Remove a dependency from the selected task",
     },
     Binding {
         keys: &[KeyCode::Char('?')],
@@ -648,6 +678,82 @@ mod tests {
                 .iter()
                 .any(|e| e.key == "b" && e.description.contains("blocked"))
         );
+    }
+
+    #[test]
+    fn key_to_action_should_map_p_in_normal_list_to_start_add_dependency() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::StartAddDependency);
+    }
+
+    #[test]
+    fn key_to_action_should_map_p_in_normal_detail_to_start_add_dependency() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::Detail,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(action, Action::StartAddDependency);
+    }
+
+    #[test]
+    fn help_entries_should_list_the_add_dependency_key() {
+        for pane in [Pane::List, Pane::Detail] {
+            let entries = help_entries(&Mode::Normal, pane, DetailField::Title);
+
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.key == "p" && e.description.contains("dependency")),
+                "no add-dependency entry in {pane:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_to_action_should_map_uppercase_p_in_normal_list_to_start_remove_dependency() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::List,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(action, Action::StartRemoveDependency);
+    }
+
+    #[test]
+    fn key_to_action_should_map_uppercase_p_in_normal_detail_to_start_remove_dependency() {
+        let action = key_to_action(
+            &Mode::Normal,
+            Pane::Detail,
+            DetailField::Title,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(action, Action::StartRemoveDependency);
+    }
+
+    #[test]
+    fn help_entries_should_list_the_remove_dependency_key() {
+        for pane in [Pane::List, Pane::Detail] {
+            let entries = help_entries(&Mode::Normal, pane, DetailField::Title);
+
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.key == "P" && e.description.contains("dependency")),
+                "no remove-dependency entry in {pane:?}"
+            );
+        }
     }
 
     #[test]

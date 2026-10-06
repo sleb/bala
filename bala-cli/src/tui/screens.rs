@@ -9,9 +9,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::tui::app::{App, BlockedView};
+use crate::tui::app::{App, BlockedView, RelatedTask};
 use crate::tui::keymap;
 use crate::tui::mode::{DetailField, EditableField, Mode, Pane};
 
@@ -24,7 +24,8 @@ use crate::tui::mode::{DetailField, EditableField, Mode, Pane};
 /// dispatches on `app.pane()`: `Pane::List` renders a centered "No tasks
 /// yet." message when there are no rows, otherwise a `List` of one line per
 /// row with the selected row highlighted; `Pane::Detail` renders the
-/// selected task's title and description via [`draw_detail`]. When `app` is
+/// selected task's title, description and dependency lists via
+/// [`draw_detail`]. When `app` is
 /// in `Mode::Insert`, an input line showing the in-progress buffer (and,
 /// below it, any inline error) is drawn along the bottom of the frame,
 /// regardless of pane.
@@ -178,6 +179,8 @@ fn draw_insert_input(frame: &mut Frame, app: &App, area: Rect) {
         EditableField::NewSubtaskTitle(_) => "New subtask",
         EditableField::Parent(_) => "Parent id",
         EditableField::TypeKey(_) => "Type",
+        EditableField::AddPredecessor(_) => "Depends on (task id)",
+        EditableField::RemovePredecessor(_) => "Remove dependency on (task id)",
     };
     let [buffer_area, error_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -191,21 +194,32 @@ fn draw_insert_input(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Renders the `Mode::Confirm` prompt as a single line along the bottom of
-/// `area`, overlaid on whatever pane is showing beneath it — the same
-/// "last line of the frame" convention `draw_insert_input` uses for the
-/// new-task/edit entry line, but a single, self-contained line (no separate
-/// error line) since a confirm prompt carries its own key hint rather than
-/// a validation error.
+/// Renders the `Mode::Confirm` prompt along the bottom of `area`, overlaid
+/// on whatever pane is showing beneath it — the same "bottom of the frame"
+/// convention `draw_insert_input` uses for the new-task/edit entry line,
+/// but self-contained (no separate error line) since a confirm prompt
+/// carries its own key hint rather than a validation error.
+///
+/// The prompt takes one row per line of its text, so its last line — the
+/// question and key hint — sits on the bottom row with any lines naming
+/// affected tasks stacked above it. Those rows are cleared first, so the
+/// pane beneath doesn't show through to the right of a short line. When
+/// `area` is shorter than the prompt, the leading lines are the ones cut
+/// off, keeping the question visible. Lines are not wrapped.
 fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let Mode::Confirm { prompt, .. } = app.mode() else {
         return;
     };
+    let line_count = u16::try_from(prompt.lines().count()).unwrap_or(u16::MAX);
+    let height = line_count.min(area.height);
     let [_, prompt_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(area);
 
-    let line = Paragraph::new(prompt.as_str()).style(Style::new().fg(Color::Yellow));
-    frame.render_widget(line, prompt_area);
+    let paragraph = Paragraph::new(prompt.as_str())
+        .style(Style::new().fg(Color::Yellow))
+        .scroll((line_count - height, 0));
+    frame.render_widget(Clear, prompt_area);
+    frame.render_widget(paragraph, prompt_area);
 }
 
 /// Renders the keybinding help overlay: one line per [`keymap::HelpEntry`]
@@ -242,6 +256,11 @@ fn draw_empty(frame: &mut Frame, area: Rect) {
 /// on its own line, with the line matching `app.detail_field()` highlighted
 /// the same way the list highlights its selected row (`Modifier::REVERSED`).
 ///
+/// Below them, when the task has any live predecessor, a "Blocked by:"
+/// section lists each one's title and status, complete or not; under that,
+/// when any live task depends on this one, a "Blocks:" section lists those
+/// the same way. Neither section shows the dependency's type.
+///
 /// Renders nothing (an empty area) when there's no selected row — shouldn't
 /// normally happen, since the Detail pane can only be entered from a
 /// non-empty list, but avoids a panic if it ever does.
@@ -251,16 +270,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     };
     let description = app.description_of(selected.id).unwrap_or("");
 
-    let blockers = app.blockers();
-    let blocked_by_height = if blockers.is_empty() {
-        0
-    } else {
-        u16::try_from(blockers.len() + 1).unwrap_or(u16::MAX)
-    };
-    let [title_area, description_area, blocked_by_area] = Layout::vertical([
+    let blocked_by = related_task_lines("Blocked by:", app.predecessors());
+    let blocks = related_task_lines("Blocks:", app.dependents());
+    let [title_area, description_area, blocked_by_area, blocks_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(blocked_by_height),
+        Constraint::Length(line_count(&blocked_by)),
+        Constraint::Length(line_count(&blocks)),
     ])
     .areas(area);
 
@@ -283,17 +299,30 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(format!("Description: {description}")).style(description_style);
     frame.render_widget(description_line, description_area);
 
-    if !blockers.is_empty() {
-        let mut lines = vec![Line::from("Blocked by:")];
-        lines.extend(blockers.iter().map(|blocker| {
-            Line::from(format!(
-                "  {} ({})",
-                blocker.title,
-                status_label(blocker.status)
-            ))
-        }));
-        frame.render_widget(Paragraph::new(lines), blocked_by_area);
+    // A section with nothing to list has no lines and a zero-height area.
+    frame.render_widget(Paragraph::new(blocked_by), blocked_by_area);
+    frame.render_widget(Paragraph::new(blocks), blocks_area);
+}
+
+/// The lines of one Detail-pane dependency section: `heading`, then each of
+/// `tasks` indented with its title and status. Empty when `tasks` is, so
+/// the section is omitted entirely.
+fn related_task_lines(heading: &'static str, tasks: &[RelatedTask]) -> Vec<Line<'static>> {
+    if tasks.is_empty() {
+        return Vec::new();
     }
+    std::iter::once(Line::from(heading))
+        .chain(
+            tasks.iter().map(|task| {
+                Line::from(format!("  {} ({})", task.title, status_label(task.status)))
+            }),
+        )
+        .collect()
+}
+
+/// The number of rows `lines` occupies, saturating at `u16::MAX`.
+fn line_count(lines: &[Line]) -> u16 {
+    u16::try_from(lines.len()).unwrap_or(u16::MAX)
 }
 
 /// Lowercase display name of a task status.
@@ -575,6 +604,113 @@ mod tests {
     }
 
     #[test]
+    fn draw_confirm_should_render_every_prompt_line_with_the_key_hint_last() {
+        let mut core = core();
+        let new_task = |title: &str| bala_core::NewTask {
+            title: title.to_string(),
+            description: None,
+            parent_id: None,
+            type_key: None,
+            start_date: None,
+            due_date: None,
+            duration_days: None,
+            assignee_id: None,
+        };
+        let a = core.create_task(new_task("A")).unwrap();
+        // Enough long rows to fill the frame, so the prompt overlays list
+        // rows rather than blank space.
+        for n in 0..12 {
+            let dependent = core
+                .create_task(new_task(&format!("Dependent {n} with a long title")))
+                .unwrap();
+            if n < 2 {
+                core.add_dependency(dependent.id, a.id, bala_core::DependencyType::default())
+                    .unwrap();
+            }
+        }
+        let tasks = core.get_tree(bala_core::TreeFilter::default()).unwrap();
+        let order = core.sibling_order().unwrap();
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        app.select_by_id(Some(a.id));
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let bottom_lines: Vec<String> = (6..10)
+            .map(|y| {
+                let line: String = (0..60).map(|x| buffer[(x, y)].symbol()).collect();
+                line.trim_end().to_string()
+            })
+            .collect();
+        assert_eq!(
+            bottom_lines,
+            [
+                "2 task(s) depend on this task:",
+                "  Dependent 0 with a long title",
+                "  Dependent 1 with a long title",
+                "Delete \"A\"? (y/n)",
+            ]
+        );
+    }
+
+    #[test]
+    fn draw_confirm_should_keep_the_question_visible_when_the_prompt_is_taller_than_the_frame() {
+        let mut core = core();
+        let new_task = |title: &str| bala_core::NewTask {
+            title: title.to_string(),
+            description: None,
+            parent_id: None,
+            type_key: None,
+            start_date: None,
+            due_date: None,
+            duration_days: None,
+            assignee_id: None,
+        };
+        let a = core.create_task(new_task("A")).unwrap();
+        for title in ["B", "C"] {
+            let dependent = core.create_task(new_task(title)).unwrap();
+            core.add_dependency(dependent.id, a.id, bala_core::DependencyType::default())
+                .unwrap();
+        }
+        let tasks = core.get_tree(bala_core::TreeFilter::default()).unwrap();
+        let order = core.sibling_order().unwrap();
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        app.select_by_id(Some(a.id));
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+
+        // Two rows for a four-line prompt.
+        let mut terminal = Terminal::new(TestBackend::new(60, 2)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..2)
+            .map(|y| {
+                let line: String = (0..60).map(|x| buffer[(x, y)].symbol()).collect();
+                line.trim_end().to_string()
+            })
+            .collect();
+        assert_eq!(lines, ["  C", "Delete \"A\"? (y/n)"]);
+    }
+
+    #[test]
     fn draw_should_render_help_overlay_listing_normal_list_bindings_when_help_opened_from_normal_list()
      {
         let task_row = row("Write docs", TaskStatus::Incomplete);
@@ -616,7 +752,7 @@ mod tests {
         let mut core = core();
         let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
 
-        let backend = TestBackend::new(60, 24);
+        let backend = TestBackend::new(60, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
 
@@ -783,7 +919,7 @@ mod tests {
         let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
         let _ = apply_action(&mut app, &mut core, Action::OpenHelp);
 
-        let backend = TestBackend::new(60, 10);
+        let backend = TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
 
@@ -792,9 +928,12 @@ mod tests {
         assert!(text.contains("i — Edit title"));
     }
 
-    /// An app over a seeded core where "Ship it" depends on a task per
-    /// `blocker_titles`, with "Ship it" selected and its Detail pane open.
-    fn blocked_detail_app(blocker_titles: &[&str]) -> (App, Core<InMemoryStore>) {
+    /// An app over a seeded core where "Ship it" depends on one task per
+    /// `predecessors` entry (title and status), with "Ship it" selected and
+    /// its Detail pane open.
+    fn detail_app_with_predecessors(
+        predecessors: &[(&str, TaskStatus)],
+    ) -> (App, Core<InMemoryStore>) {
         let mut core = core();
         let new_task = |title: &str| bala_core::NewTask {
             title: title.to_string(),
@@ -807,12 +946,16 @@ mod tests {
             assignee_id: None,
         };
         let mut preds = Vec::new();
-        for title in blocker_titles {
-            preds.push(core.create_task(new_task(title)).unwrap());
+        for (title, status) in predecessors {
+            let pred = core.create_task(new_task(title)).unwrap();
+            if *status == TaskStatus::Complete {
+                core.complete_task(pred.id, false).unwrap();
+            }
+            preds.push(pred);
         }
-        let blocked = core.create_task(new_task("Ship it")).unwrap();
+        let successor = core.create_task(new_task("Ship it")).unwrap();
         for pred in &preds {
-            core.add_dependency(blocked.id, pred.id, bala_core::DependencyType::default())
+            core.add_dependency(successor.id, pred.id, bala_core::DependencyType::default())
                 .unwrap();
         }
         let tasks = core.get_tree(bala_core::TreeFilter::default()).unwrap();
@@ -825,40 +968,32 @@ mod tests {
             &std::collections::HashSet::new(),
         );
         let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
-        app.select_by_id(Some(blocked.id));
-        // Reaching the row by navigation is what loads its blockers.
-        let _ = apply_action(&mut app, &mut core, Action::MoveUp);
-        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        app.select_by_id(Some(successor.id));
+        // Entering the Detail pane through `apply_action` is what loads the
+        // selected row's predecessors.
         let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
         (app, core)
     }
 
     #[test]
-    fn draw_detail_should_list_each_blocker_with_title_and_status() {
-        let (app, _core) = blocked_detail_app(&["Design", "Review"]);
+    fn draw_detail_should_list_each_predecessor_with_title_and_status() {
+        let (app, _core) = detail_app_with_predecessors(&[
+            ("Design", TaskStatus::Complete),
+            ("Review", TaskStatus::Incomplete),
+        ]);
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
 
         terminal.draw(|frame| draw(frame, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("Blocked by"));
-        assert!(text.contains("Design (incomplete)"));
-        assert!(text.contains("Review (incomplete)"));
+        assert!(text.contains("Blocked by:"));
+        assert!(text.contains("  Design (complete)"));
+        assert!(text.contains("  Review (incomplete)"));
     }
 
     #[test]
-    fn draw_detail_should_omit_the_blocked_by_section_when_unblocked() {
-        let (mut app, mut core) = blocked_detail_app(&["Design"]);
-        // Completing the only blocker unblocks the selected task.
-        let _ = apply_action(&mut app, &mut core, Action::LeaveDetail);
-        let _ = apply_action(&mut app, &mut core, Action::MoveUp);
-        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
-        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
-        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
-        assert_eq!(
-            app.selected_row().map(|r| r.title.as_str()),
-            Some("Ship it")
-        );
+    fn draw_detail_should_omit_blocked_by_when_the_task_has_no_predecessors() {
+        let (app, _core) = detail_app_with_predecessors(&[]);
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
 
         terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -866,6 +1001,81 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("Ship it"));
         assert!(!text.contains("Blocked by"));
+    }
+
+    /// An app over a seeded core where one task per `dependents` entry
+    /// (title and status) depends on "Design", with "Design" selected and
+    /// its Detail pane open.
+    fn detail_app_with_dependents(dependents: &[(&str, TaskStatus)]) -> (App, Core<InMemoryStore>) {
+        let mut core = core();
+        let new_task = |title: &str| bala_core::NewTask {
+            title: title.to_string(),
+            description: None,
+            parent_id: None,
+            type_key: None,
+            start_date: None,
+            due_date: None,
+            duration_days: None,
+            assignee_id: None,
+        };
+        let predecessor = core.create_task(new_task("Design")).unwrap();
+        for (title, status) in dependents {
+            let dependent = core.create_task(new_task(title)).unwrap();
+            // Completed before the edge exists, while nothing blocks it.
+            if *status == TaskStatus::Complete {
+                core.complete_task(dependent.id, false).unwrap();
+            }
+            core.add_dependency(
+                dependent.id,
+                predecessor.id,
+                bala_core::DependencyType::default(),
+            )
+            .unwrap();
+        }
+        let tasks = core.get_tree(bala_core::TreeFilter::default()).unwrap();
+        let order = core.sibling_order().unwrap();
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
+        app.select_by_id(Some(predecessor.id));
+        // Entering the Detail pane through `apply_action` is what loads the
+        // selected row's dependents.
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        (app, core)
+    }
+
+    #[test]
+    fn draw_detail_should_list_each_dependent_with_title_and_status() {
+        let (app, _core) = detail_app_with_dependents(&[
+            ("Build", TaskStatus::Incomplete),
+            ("Announce", TaskStatus::Complete),
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Blocks:"));
+        assert!(text.contains("  Build (incomplete)"));
+        assert!(text.contains("  Announce (complete)"));
+        assert!(!text.contains("Blocked by"));
+    }
+
+    #[test]
+    fn draw_detail_should_omit_blocks_when_nothing_depends_on_the_task() {
+        let (app, _core) = detail_app_with_dependents(&[]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Design"));
+        assert!(!text.contains("Blocks"));
     }
 
     #[test]
@@ -899,5 +1109,39 @@ mod tests {
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("b — Cycle the view: all, blocked, ready"));
+    }
+
+    #[test]
+    fn draw_insert_should_label_the_add_dependency_line() {
+        let mut app = App::new(vec![row("Write docs", TaskStatus::Incomplete)]);
+        let mut core = core();
+        let _ = apply_action(&mut app, &mut core, Action::StartAddDependency);
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Depends on (task id): _"), "got: {text}");
+    }
+
+    #[test]
+    fn draw_insert_should_label_the_remove_dependency_line() {
+        // Two predecessors, so the line opens empty rather than prefilled.
+        let (mut app, mut core) = detail_app_with_predecessors(&[
+            ("Design", TaskStatus::Incomplete),
+            ("Review", TaskStatus::Incomplete),
+        ]);
+        let _ = apply_action(&mut app, &mut core, Action::StartRemoveDependency);
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("Remove dependency on (task id): _"),
+            "got: {text}"
+        );
     }
 }

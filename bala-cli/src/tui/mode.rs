@@ -22,6 +22,9 @@ pub enum Mode {
     /// [`PendingAction::DeleteWithChildren`] prompt instead accepts `s`
     /// (delete the subtree), `p` (delete, promoting the children), or
     /// `n`/`Esc`; `y` does nothing there.
+    ///
+    /// `prompt` may span several lines; the question and its key hint are
+    /// the last one.
     Confirm {
         prompt: String,
         action: PendingAction,
@@ -85,6 +88,11 @@ pub enum DetailField {
 ///   single parent id, or is empty for a top-level task.
 /// - `TypeKey(TaskId)`: the given task's `type_key`, edited from the list;
 ///   the buffer holds the raw type key being typed.
+/// - `AddPredecessor(TaskId)`: adding a dependency to the given task; the
+///   buffer holds the one full id of the predecessor it will depend on.
+/// - `RemovePredecessor(TaskId)`: removing a dependency from the given task;
+///   the buffer holds the one full id of the predecessor it will stop
+///   depending on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditableField {
     NewTitle,
@@ -93,4 +101,6 @@ pub enum EditableField {
     NewSubtaskTitle(TaskId),
     Parent(TaskId),
     TypeKey(TaskId),
+    AddPredecessor(TaskId),
+    RemovePredecessor(TaskId),
 }

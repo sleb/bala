@@ -7,8 +7,9 @@
 //! keeps this projection unit-testable without a terminal or a database.
 //!
 //! `subtree_ids` and `dependents_of` are pure scans over the same
-//! `Core::get_tree()` result, used by `bala task delete` to name the tasks
-//! that depend on what it deletes.
+//! `Core::get_tree()` result, used by `bala task delete` and the TUI's `dd`
+//! prompt to name the tasks that depend on what they delete, and by the
+//! TUI's Detail pane to list the tasks that depend on the selected one.
 
 use std::collections::{HashMap, HashSet};
 
