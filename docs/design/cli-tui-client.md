@@ -194,10 +194,10 @@ Gantt):
 | `o` / `O`            | new subtask under focused task / new top-level task → `Insert{title}` ([#6](https://github.com/sleb/bala/issues/6), [#37](https://github.com/sleb/bala/issues/37))                                                          |
 | `Enter`              | open Detail pane on focused task                                                                                                                  |
 | `i` (in Detail pane) | edit a field → `Insert` ([#11](https://github.com/sleb/bala/issues/11))                                                                                                               |
-| `dd`                 | delete focused task → `Confirm` ([#12](https://github.com/sleb/bala/issues/12)): `PendingAction::Delete` (`y`/`n`) if `Core::list_children` is empty, else `PendingAction::DeleteWithChildren` naming the child count (`s` = `DeleteMode::Subtree`, `p` = `DeleteMode::PromoteChildren`, `n`/`Esc` cancels); a `list_children` error shows inline and stays in `Normal` |
+| `dd`                 | delete focused task → `Confirm` ([#12](https://github.com/sleb/bala/issues/12)): `PendingAction::Delete` (`y`/`n`) if `Core::list_children` is empty, else `PendingAction::DeleteWithChildren` naming the child count (`s` = `DeleteMode::Subtree`, `p` = `DeleteMode::PromoteChildren`, `n`/`Esc` cancels). The prompt is multi-line when other tasks depend on what the delete covers: above the question it names the tasks that depend on the task and, for a task with children, the further tasks that depend on its descendants (see **Confirm mode** below). A `list_children` or dependents-lookup error stays in `Normal` and is recorded in `app.error`, which is not yet displayed outside an entry line (a known gap) |
 | `x` / `Space`        | toggle complete → `Confirm` only if blocked by incomplete children ([#13](https://github.com/sleb/bala/issues/13))                                                                    |
 | `m`                  | reparent (`set_parent`, an optional parent id) → `Insert{parent}`, a `Parent id: ` line prefilled with the current parent id (empty when top level); one id reparents, an empty line promotes to top level, more than one id is an inline error that stays in the entry line ([#37](https://github.com/sleb/bala/issues/37) AC4) |
-| `p` / `P`            | add / remove dependency → `Insert{predecessor}` ([#60](https://github.com/sleb/bala/issues/60))                                                                                       |
+| `p` / `P`            | add / remove dependency ([#60](https://github.com/sleb/bala/issues/60)). `p` (List or Detail pane) → `Insert` with `EditableField::AddPredecessor`, an empty `Depends on (task id): ` line taking one full task id and calling `Core::add_dependency` with `DependencyType::FinishToStart`; an empty line, more than one id, an invalid id or a `CoreError` is an inline error that stays in the entry line, and so is an id the task already depends on (the task is re-read first: `add_dependency` upserts, so it would silently rewrite the existing edge's type). `P` (List or Detail pane) → `Insert` with `EditableField::RemovePredecessor`, a `Remove dependency on (task id): ` line prefilled with the predecessor's id when the task has exactly one (empty otherwise; read from `depends_on` itself, so a deleted predecessor's id is prefilled too, and a failed read is recorded in `app.error`, which is not yet displayed outside an entry line), taking one full task id and calling `Core::remove_dependency`; the same entry errors apply, and an id the task does not depend on is also an inline error (`Core` treats it as a no-op, which would make a mistyped id look like success) |
 | `t`                  | set task type → `Insert{type}` ([#40](https://github.com/sleb/bala/issues/40))                                                                                                        |
 | `g` (Gantt toggle)   | switch right pane Detail ↔ Gantt ([#63](https://github.com/sleb/bala/issues/63))                                                                                                      |
 | `r`                  | enter `Reschedule` for focused task; switches right pane to Gantt if it isn't already showing, so the bar being nudged is visible ([#65](https://github.com/sleb/bala/issues/65) AC1) |
@@ -236,6 +236,32 @@ to the deleted task's parent, or to top level if it had none), or
 parent without `--cascade` or `--promote-children`. After either delete the
 list is re-rendered from a fresh `get_tree`.
 
+The prompt is a `String` of one or more lines, drawn along the bottom of the
+content area on as many (cleared) rows as it has lines; the question, with
+its key hint, is always the last line, and is the line kept if the area is
+too short for all of them. A `dd` prompt puts up to two groups above the
+question, each a header with the group's size and then one indented title
+per line, capped at five titles followed by `… and N more`:
+
+1. `N task(s) depend on this task:` — `render::dependents_of(&[id], tasks)`,
+   the tasks left depending on a deleted task by either delete mode. A
+   descendant that depends on the task is in this group: a promote delete
+   leaves it live.
+2. `N more depend on its subtasks (subtree delete only):` — only for a task
+   with children: `render::dependents_of(&render::subtree_ids(id, tasks),
+   tasks)` minus group one, i.e. tasks outside the subtree that depend on a
+   descendant.
+
+An empty group is omitted, so with no dependents the prompt is the question
+alone. `tasks` is the unfiltered tree, so a dependent the type filter hides
+is still named: the cached tree when it was fetched without a type filter,
+otherwise one `get_tree` with the default filter (§Task Detail View). If
+that fetch fails the TUI stays in `Normal`, as for a failed `list_children`,
+and the error is recorded in `app.error`, which is not yet displayed outside
+an entry line (a known gap). The
+groups are advisory, like `bala task delete`'s stderr warning: the
+delete leaves the dependency edges in place.
+
 ## Screens
 
 ### Tree/List View (left pane, always visible in Normal/Reschedule)
@@ -255,13 +281,36 @@ one line.
 ### Task Detail View (right pane)
 
 All fields from HLD's shared `Task` shape, plus the two lists [#60](https://github.com/sleb/bala/issues/60)
-AC5 requires: "blocked by" (this task's `depends_on`, each with its
-predecessor's title/status) and "blocks" (successor lookup — the CLI has
-no direct `list_successors` call on `Core`; it derives this by scanning
-the already-fetched tree's `depends_on` lists for entries naming this
-task, which is O(tasks) but runs once per render against data already in
-memory, not a new query). `i` on a field enters `Insert` scoped to that
-field.
+AC5 requires: "blocked by" (every live predecessor in this task's
+`depends_on`, in that order and complete or not, each with its title and
+status — loaded with one `Core::get_task` per id, only while the Detail
+pane is showing, so a predecessor the type filter hides is still listed and
+a soft-deleted one is skipped; the
+dependency type is not shown, and the list-pane `⊘` still comes from
+`blocked_by`, §Algorithm 2) and "blocks" (every live task that depends on
+this one, in tree order, each with its title and status — the CLI has no
+direct `list_successors` call on `Core`; it derives this with
+`render::dependents_of`, an O(tasks) scan of `depends_on` lists over an
+unfiltered tree: the cached tree when it was fetched without a type filter,
+otherwise one `Core::get_tree(TreeFilter::default())`, so a dependent the
+type filter hides is still listed. The scan runs in the reload that follows
+each action, not per render, and only while the Detail pane is showing).
+`i` on a field enters `Insert` scoped to that field.
+
+Both lists are loaded only while the Detail pane is showing and are empty
+in the List pane, where neither is drawn. A failed load is recorded in
+`app.error`, which is not yet displayed outside an entry line (a known gap).
+
+Whether the cached tree is unfiltered is decided by the filter it was
+actually fetched with (`App::tasks_filter`, set whenever the cache is
+replaced), not by the active `type_filter`: when a filter change's refetch
+fails the cache keeps the previous filter's tree, and the two differ.
+
+The Detail pane closes back to the List pane when an action takes its task
+out of the rows — `p` blocking it under the `ready` view, `P` or `x`
+unblocking or completing it under `blocked` / `ready`. The check runs once
+after every action (`apply_action`), so the pane never shows a different
+task or nothing; a task still in the rows keeps its Detail pane.
 
 ### Gantt View (right pane, toggled with `g`)
 
@@ -438,9 +487,9 @@ rendering rule, shared by the TUI status bar and CLI subcommand stderr:
 | ----------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------- |
 | `EmptyTitle`, `InvalidDateRange`          | inline message under the `Insert` field, blocks submit                                | stderr, nonzero exit, no partial write      |
 | `CircularHierarchy`                       | inline in `Insert{parent}` (reparent)                                                 | stderr, nonzero exit                        |
-| `SelfDependency`, `DependsOnRelative`, `CircularDependency` | inline in `Insert{predecessor}`                                     | stderr, nonzero exit                        |
+| `SelfDependency`, `DependsOnRelative`, `CircularDependency` | inline under the `p` entry line, reworded to name tasks by title, staying in `Insert`. Titles come from the unfiltered tree (fetched only on this error path, and only when the cached tree is filtered), so a task the type filter hides is still named; a soft-deleted task, or any task missing when that fetch fails, is named by its id | stderr, nonzero exit                        |
 | `IncompleteChildren`                      | routes to `Confirm` offering cascade (§Modes)                                         | stderr suggesting `--cascade`, nonzero exit |
-| `NotFound`, `UnknownTaskType`             | status-bar message (defensive — shouldn't normally be reachable from a rendered list) | stderr, nonzero exit                        |
+| `NotFound`, `UnknownTaskType`             | status-bar message (defensive — shouldn't normally be reachable from a rendered list), except a `NotFound` from the `p` / `P` entry lines, which is inline there: `no task with that id` for the typed id, `this task no longer exists` for the task the line was opened on | stderr, nonzero exit                        |
 | `Store(_)`                                | status-bar "storage error", task list unchanged                                       | stderr, nonzero exit                        |
 
 No `CoreError` variant is ever displayed as a raw `Debug`/`{:?}` dump —

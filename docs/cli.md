@@ -56,6 +56,8 @@ instead of a blank screen.
 | `o` (in the list) | Create a new subtask under the selected task: opens a text-entry line for its title, nested under the focused task. `Enter` submits, `Esc` cancels. If the parent has an assignee or dates, you're then asked whether to inherit them onto the new subtask (`y`/`n`). |
 | `m` (in the list) | Reparent the selected task: opens a text-entry line prefilled with its current parent id (empty when it is top-level). `Enter` submits, `Esc` cancels. |
 | `t` (in the list) | Set the selected task's type: opens a text-entry line prefilled with its current type key. `Enter` submits, `Esc` cancels. |
+| `p` (in the list or Detail pane) | Add a dependency to the selected task: opens an empty text-entry line for the id of the task it depends on. `Enter` submits, `Esc` cancels. |
+| `P` (in the list or Detail pane) | Remove a dependency from the selected task: opens a text-entry line for the id of the task it should no longer depend on, prefilled when the task has exactly one dependency. `Enter` submits, `Esc` cancels. |
 | `f` (in the list) | Cycle the active type filter: no filter → the first configured type → the next → ... → back to no filter. Persists across sessions in `view.toml` (see [config.md](config.md)). |
 | `b` (in the list) | Cycle the blocked/ready view: all → blocked (tasks waiting on an incomplete predecessor) → ready (incomplete tasks that are not blocked) → all. Combines with the type filter. The active view shows in a `view: …` status line below the list; a row whose parent the view hides is shown at the top level. |
 | `Enter` (in the list) | Open the Detail pane for the selected task. |
@@ -63,7 +65,7 @@ instead of a blank screen.
 | `k` / `↑` (in the Detail pane) | Move the field cursor up (Description → Title). |
 | `i` (in the Detail pane) | Edit the field under the cursor: opens a text-entry line prefilled with its current value. `Enter` submits, `Esc` cancels. |
 | `Esc` (in the Detail pane) | Leave the Detail pane, back to the list. |
-| `dd` (in the list) | Delete the selected task: press `d` twice in a row to prompt for confirmation. For a task with no subtasks, `y` confirms and `n`/`Esc` cancels. For a task with subtasks, the prompt names how many it has: `s` deletes the task and its whole subtree, `p` deletes only the task and promotes its subtasks to its parent (or to top level if it had none), and `n`/`Esc` cancels. |
+| `dd` (in the list) | Delete the selected task: press `d` twice in a row to prompt for confirmation. For a task with no subtasks, `y` confirms and `n`/`Esc` cancels. For a task with subtasks, the prompt names how many it has: `s` deletes the task and its whole subtree, `p` deletes only the task and promotes its subtasks to its parent (or to top level if it had none), and `n`/`Esc` cancels. If other tasks depend on the task, or on its subtasks, the prompt lists them above the question. |
 | `x` / `Space` (in the list or Detail pane) | Toggle the selected task's complete/incomplete state. Completing a task with incomplete subtasks prompts for confirmation: `y` completes the whole cascade, `n`/`Esc` cancels. |
 | `?` | Open the help overlay, listing every key bound in the current mode. Not available in Insert mode, where `?` types a literal question mark — use `F1` there instead. |
 | `F1` (in a text-entry line) | Open the help overlay. |
@@ -109,6 +111,50 @@ doesn't name a configured task type (see `bala type set`/`bala type ls`)
 shows an inline error under the input line and keeps you in the entry line
 to fix it — fix the key and press `Enter` again, or `Esc` to give up.
 
+Pressing `p` on a selected task, in the list or the Detail pane, opens an
+empty `Depends on (task id): ` input line at the bottom of the screen. Enter
+the one full id of the task it should depend on and press `Enter` to add the
+dependency, or `Esc` to cancel without changing anything. The dependency is
+always finish-to-start; use `bala dep add --type` for the other types. Press
+`p` again to add another predecessor. If the predecessor is incomplete, the
+task's row gains the `⊘` blocked marker.
+
+A dependency that can't be added shows a message under the input line and
+keeps you in the entry line with what you typed — fix the id and press
+`Enter` again, or `Esc` to give up. Nothing is changed until an entry is
+accepted. The entry is rejected if it:
+
+- is empty, is not a valid task id, or holds more than one id;
+- names no task (`no task with that id`);
+- names the task itself (`a task cannot depend on itself`);
+- names a task this one already depends on
+  (`this task already depends on that task`), so an existing dependency is
+  never silently rewritten as finish-to-start;
+- names an ancestor or a descendant of the task, such as its parent or one of
+  its subtasks (`"Parent" is an ancestor or descendant of this task`);
+- would close a cycle, because that task already depends on this one,
+  directly or through other tasks. The message names the tasks in the cycle
+  by title: with B depending on A, making A depend on B shows
+  `would create a cycle: A → B → A`. Tasks hidden by the type filter are
+  named by title too.
+
+Pressing `P` on a selected task, in the list or the Detail pane, opens a
+`Remove dependency on (task id): ` input line at the bottom of the screen.
+When the task depends on exactly one task, the line is prefilled with that
+task's id, so `Enter` alone removes the dependency; with several (or none)
+it opens empty, and you enter the one full id of the task it should stop
+depending on. `Esc` cancels without changing anything. Once the last
+incomplete predecessor is removed, the task's row loses the `⊘` blocked
+marker. The line is prefilled with the only dependency's id even when that
+predecessor has been deleted: "Blocked by" does not list a deleted
+predecessor, and this is how a dependency on one is cleared.
+
+As with `p`, an entry that is empty, is not a valid task id, or holds more
+than one id shows a message under the input line and keeps you in the entry
+line with what you typed. So does the id of a task the selected task does
+not depend on (`this task does not depend on that task`), so a mistyped id
+is never mistaken for a successful removal.
+
 Pressing `Enter` on a task in the list opens its Detail pane, showing the
 task's title and description with the field cursor (highlighted) starting on
 the title. `j`/`k` move the cursor between the two fields (the same physical
@@ -118,14 +164,24 @@ current value — `Enter` saves the change and returns to the Detail pane
 showing the new value, `Esc` discards it. An empty title is rejected the
 same way as in `O`'s new-task entry (inline error, stays in the entry line);
 an empty description is accepted. `Esc` in the Detail pane itself (not
-mid-edit) leaves it and returns to the list.
+mid-edit) leaves it and returns to the list. The pane also closes back to
+the list when an edit made in it (`x`, `p` or `P`) moves the task out of the
+active blocked/ready view, since the task is then no longer listed.
 
-When the selected task is blocked, the Detail pane also shows a "Blocked by"
-section below the description: one line per task still blocking it, giving
-the blocker's title and status (e.g. `Design (incomplete)`), in dependency
-order. Blockers are looked up directly, so one hidden by the type filter is
-still listed. The section updates as blockers are completed and is omitted
-entirely when the task is not blocked.
+When the selected task depends on at least one task that has not been
+deleted, the Detail pane also shows a "Blocked by" section below the
+description: one line per predecessor, complete or not, giving its title and
+status (e.g. `Design (incomplete)`), in dependency order. A finished
+predecessor stays listed and reads `Design (complete)`; a deleted one is not
+listed. Predecessors are looked up directly, so one hidden by the type
+filter is still listed. The section is omitted entirely when the task has no
+predecessors to list.
+
+Under it, a "Blocks" section lists every task that depends on the selected
+one and has not been deleted: one line per dependent, complete or not, giving
+its title and status (e.g. `Build (incomplete)`), in list order. Dependents
+are found across all tasks, so one hidden by the type filter is still listed.
+The section is omitted entirely when nothing depends on the task.
 
 Pressing `d` twice in a row on a selected task shows a confirmation prompt
 naming the task, at the bottom of the screen. For a task with no subtasks,
@@ -139,6 +195,28 @@ its direct subtasks up to the task's own parent (or to top level if it had
 none), or `n`/`Esc` to cancel. `y` does nothing at this prompt. Pressing `d` once and then any other key
 (rather than a second `d`) does not count toward the sequence — the next `d`
 starts fresh.
+
+When other tasks depend on the task, the prompt lists them above the
+question:
+
+```text
+2 task(s) depend on this task:
+  Write docs
+  Ship release
+1 more depend on its subtasks (subtree delete only):
+  Announce
+"Build" has 2 subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?
+```
+
+The first group is the tasks that depend on the task itself. The second
+appears only for a task with subtasks: the other tasks, outside its subtree,
+that depend on a subtask at any depth. Those are affected only if you delete
+the subtree with `s`; `p` keeps the subtasks. Each group shows at most five
+titles, then `… and N more` for the rest; the count in its first line is the
+whole group. Tasks hidden by the type filter are included. A group with no
+tasks is left out, so a task nothing depends on gets the question alone. The
+list is a warning only: the delete itself is unaffected, and the dependency
+edges stay, as [`bala task delete`](#bala-task-delete) explains.
 
 The TUI requires a real terminal (a TTY) on stdin: running it in a
 non-interactive context (e.g. piped/redirected input, as CI or scripting

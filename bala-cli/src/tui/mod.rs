@@ -166,7 +166,7 @@ fn build_app<S: Store>(core: &Core<S>, view_state: ViewState) -> Result<App, Cli
         .with_type_filter_state(view_state.filter_type_key, available_type_keys)
         .with_blocked_view(blocked_view);
     app.select_by_id(view_state.selected);
-    app::reload_blockers(&mut app, core);
+    app::reload_detail_lists(&mut app, core);
 
     Ok(app)
 }
@@ -301,7 +301,10 @@ mod tests {
 
         let titles: Vec<&str> = app.rows().iter().map(|row| row.title.as_str()).collect();
         assert_eq!(titles, ["Ship it"]);
-        assert_eq!(app.blockers().len(), 1);
+        assert_eq!(
+            app.selected_row().map(|row| row.title.as_str()),
+            Some("Ship it")
+        );
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).expect("terminal");
         terminal
             .draw(|frame| screens::draw(frame, &app))

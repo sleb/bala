@@ -7,12 +7,13 @@
 //! thin wrapper around `keymap::key_to_action` + `apply_action` for the
 //! real crossterm-backed event loop in `tui::mod::run`.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use bala_core::{
-    Core, CoreError, DeleteMode, Field, NewTask, SiblingOrder, Store, Task, TaskId, TaskPatch,
-    TaskStatus, UserId,
+    Core, CoreError, DeleteMode, DependencyType, Field, NewTask, SiblingOrder, Store, Task, TaskId,
+    TaskPatch, TaskStatus, UserId,
 };
 use crossterm::event::KeyEvent;
 
@@ -20,12 +21,14 @@ use crate::render::{self, TaskRow};
 use crate::tui::keymap::{Action, key_to_action};
 use crate::tui::mode::{DetailField, EditableField, Mode, Pane, PendingAction};
 
-/// One task blocking the selected row, as shown in the Detail pane.
+/// One task related to the selected row by a dependency, as shown in the
+/// Detail pane's "Blocked by" list (a task it depends on) and "Blocks" list
+/// (a task that depends on it).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Blocker {
-    /// The blocking task's title.
+pub struct RelatedTask {
+    /// The related task's title.
     pub title: String,
-    /// The blocking task's current status.
+    /// The related task's current status.
     pub status: TaskStatus,
 }
 
@@ -105,6 +108,11 @@ pub struct App {
     /// re-derives `rows` from this plus `collapsed` whenever collapse state
     /// changes, without needing to re-fetch from `Core`.
     tasks: Vec<Task>,
+    /// The type filter `tasks` was actually fetched with (`None` = the
+    /// unfiltered tree). Normally equal to `type_filter`, but the two part
+    /// when `type_filter` changes and the refetch that should follow fails,
+    /// leaving `tasks` as it was; `unfiltered_tree` goes by this one.
+    tasks_filter: Option<String>,
     /// Sibling order fetched alongside `tasks` (`Core::sibling_order`);
     /// kept so a later reorder/reparent can re-render without a reload.
     sibling_order: SiblingOrder,
@@ -123,10 +131,16 @@ pub struct App {
     /// them. Populated once at startup by `tui::mod::run` (via
     /// [`App::with_type_filter_state`]) from `Core::list_task_types()`.
     available_type_keys: Vec<String>,
-    /// The tasks blocking the selected row, in dependency order. Loaded
-    /// with `Core::get_task` per id by `reload_blockers`, so blockers the
-    /// type filter hides from `rows` are still listed.
-    blockers: Vec<Blocker>,
+    /// The selected row's live predecessors, complete or not, in
+    /// `depends_on` order. Loaded with `Core::get_task` per id by
+    /// `reload_predecessors`, so predecessors the type filter hides from
+    /// `rows` are still listed. Empty whenever the List pane is showing.
+    predecessors: Vec<RelatedTask>,
+    /// The live tasks that depend on the selected row, in tree order.
+    /// Loaded by `reload_dependents` from an unfiltered tree, so dependents
+    /// the type filter hides from `rows` are still listed. Empty whenever
+    /// the List pane is showing.
+    dependents: Vec<RelatedTask>,
     /// The active blocked/ready view, cycled by `Action::CycleBlockedView`
     /// (`b`). Applied together with the type filter whenever `rows` are
     /// derived from `tasks`.
@@ -154,12 +168,14 @@ impl App {
             user_names: HashMap::new(),
             descriptions: HashMap::new(),
             tasks: Vec::new(),
+            tasks_filter: None,
             sibling_order: SiblingOrder::default(),
             collapsed: HashSet::new(),
             pending_d: false,
             type_filter: None,
             available_type_keys: Vec::new(),
-            blockers: Vec::new(),
+            predecessors: Vec::new(),
+            dependents: Vec::new(),
             blocked_view: BlockedView::default(),
         }
     }
@@ -167,7 +183,9 @@ impl App {
     /// Attaches the cached full task fetch used by [`App::rebuild_rows`] to
     /// re-derive `rows` after a collapse/expand action, without needing to
     /// re-fetch from `Core`. Builder-style for the same reason as
-    /// [`App::with_lookup_maps`].
+    /// [`App::with_lookup_maps`]. The tasks are taken to be the unfiltered
+    /// tree unless [`App::with_type_filter_state`] says which type filter
+    /// they were fetched with.
     #[must_use]
     pub fn with_tasks(mut self, tasks: Vec<Task>) -> Self {
         self.tasks = tasks;
@@ -230,13 +248,15 @@ impl App {
     /// [`App::new`] are expected to already reflect `type_filter` (via a
     /// filtered initial `Core::get_tree` fetch in `tui::mod::run`) — a
     /// restored filter only changes what `refresh_rows_from_tree` fetches
-    /// going forward.
+    /// going forward. For the same reason `type_filter` is recorded as the
+    /// filter the cached tasks were fetched with.
     #[must_use]
     pub fn with_type_filter_state(
         mut self,
         type_filter: Option<String>,
         available_type_keys: Vec<String>,
     ) -> Self {
+        self.tasks_filter.clone_from(&type_filter);
         self.type_filter = type_filter;
         self.available_type_keys = available_type_keys;
         self
@@ -334,11 +354,20 @@ impl App {
         self.detail_field
     }
 
-    /// Returns the tasks blocking the selected row (empty when it is not
-    /// blocked or nothing is selected).
+    /// Returns the selected row's live predecessors, complete or not
+    /// (empty when it depends on nothing, nothing is selected, or the List
+    /// pane is showing).
     #[must_use]
-    pub fn blockers(&self) -> &[Blocker] {
-        &self.blockers
+    pub fn predecessors(&self) -> &[RelatedTask] {
+        &self.predecessors
+    }
+
+    /// Returns the live tasks that depend on the selected row (empty when
+    /// nothing depends on it, nothing is selected, or the List pane is
+    /// showing).
+    #[must_use]
+    pub fn dependents(&self) -> &[RelatedTask] {
+        &self.dependents
     }
 
     /// Returns the description of the task with `id`, or `None` when it has
@@ -475,7 +504,18 @@ pub fn handle_key<S: Store>(app: &mut App, core: &mut Core<S>, key: KeyEvent) ->
 /// `SubmitInsert` for that field calls `Core::update_task` with a
 /// `TaskPatch { type_key: Field::Set(...), .. }`, surfacing
 /// `CoreError::UnknownTaskType` inline like other validation errors when the
-/// typed key names no configured type. `OpenHelp` enters `Mode::Help`,
+/// typed key names no configured type. `StartAddDependency` enters
+/// `Mode::Insert` scoped to `EditableField::AddPredecessor` with an empty
+/// buffer, and `SubmitInsert` for that field calls `Core::add_dependency`
+/// with the one task id typed and `DependencyType::FinishToStart`, after
+/// checking the task does not already depend on it.
+/// `StartRemoveDependency` enters `Mode::Insert` scoped to
+/// `EditableField::RemovePredecessor`, prefilled with the selected task's
+/// predecessor id when it has exactly one (fetched fresh via
+/// `Core::get_task`), and `SubmitInsert` for that field calls
+/// `Core::remove_dependency` with the one task id typed, after checking the
+/// task really depends on it.
+/// `OpenHelp` enters `Mode::Help`,
 /// remembering the current mode as `previous`; `CloseHelp` restores
 /// `previous` if `app` is currently in `Mode::Help`, otherwise it does
 /// nothing. `CycleTypeFilter` advances `app.type_filter` through `None ->
@@ -486,53 +526,145 @@ pub fn handle_key<S: Store>(app: &mut App, core: &mut Core<S>, key: KeyEvent) ->
 /// `mode` (see `confirm_delete`); in any other mode it does nothing. `Noop`
 /// does nothing.
 ///
+/// If the Detail pane was showing a task and the action took that task out
+/// of `rows` (an edit that moves it out of the active blocked/ready view or
+/// type filter), `app.pane` falls back to `Pane::List` with whatever
+/// selection the refresh chose, so the pane never silently shows a
+/// different task or nothing. A task still in `rows` keeps its Detail pane.
+///
 /// After every action except `InsertChar`/`Backspace` the selected row's
-/// blockers are reloaded (see `reload_blockers`), so every selection change
-/// and tree refresh is covered without each call site repeating it. The two
-/// keystroke actions only edit the buffer, so they skip the store reads.
+/// predecessors and dependents are reloaded (see `reload_detail_lists`), so
+/// every selection change, pane change and tree refresh is covered without
+/// each call site repeating it. They are read from the store only while the
+/// Detail pane is showing and cleared otherwise. The two keystroke actions
+/// only edit the buffer, so they skip the reload.
 pub fn apply_action<S: Store>(
     app: &mut App,
     core: &mut Core<S>,
     action: Action,
 ) -> ControlFlow<()> {
     let edits_buffer_only = matches!(action, Action::InsertChar(_) | Action::Backspace);
+    let shown_in_detail = if app.pane == Pane::Detail {
+        app.selected_row().map(|row| row.id)
+    } else {
+        None
+    };
     let flow = dispatch_action(app, core, action);
+    if let Some(id) = shown_in_detail
+        && !app.rows.iter().any(|row| row.id == id)
+    {
+        app.pane = Pane::List;
+    }
     if !edits_buffer_only {
-        reload_blockers(app, core);
+        reload_detail_lists(app, core);
     }
     flow
 }
 
-/// Reloads `app.blockers` for the selected row: one `Core::get_task` per id
-/// in the row's `blocked_by`, so blockers hidden from `rows` by the type
-/// filter are still listed. A blocker that no longer exists is skipped; a
-/// backend failure sets `app.error` (unless an error is already shown) and
-/// leaves the list empty.
-pub fn reload_blockers<S: Store>(app: &mut App, core: &Core<S>) {
-    app.blockers.clear();
+/// Reloads the two lists the Detail pane shows for the selected row: its
+/// predecessors (see `reload_predecessors`) and its dependents (see
+/// `reload_dependents`). Both are only loaded while the Detail pane is
+/// showing; in the List pane, where neither is drawn, they are just cleared.
+pub fn reload_detail_lists<S: Store>(app: &mut App, core: &Core<S>) {
+    reload_predecessors(app, core);
+    reload_dependents(app, core);
+}
+
+/// Reloads `app.predecessors` for the selected row: one `Core::get_task`
+/// per entry in the task's `depends_on`, in that order, so a predecessor
+/// stays listed once it is complete and one hidden from `rows` by the type
+/// filter is still listed. A soft-deleted predecessor reads as `None` and
+/// is skipped. The list is left empty, without reading anything, while the
+/// List pane is showing. A backend failure sets `app.error` (unless an error
+/// is already shown) and leaves the list empty.
+fn reload_predecessors<S: Store>(app: &mut App, core: &Core<S>) {
+    app.predecessors.clear();
+    if app.pane != Pane::Detail {
+        return;
+    }
     let Some(id) = app.selected_row().map(|row| row.id) else {
         return;
     };
     let Some(task) = app.tasks.iter().find(|task| task.id == id) else {
         return;
     };
-    let blocked_by = task.blocked_by.clone();
-    for blocker_id in blocked_by {
-        match core.get_task(blocker_id) {
-            Ok(Some(blocker)) => app.blockers.push(Blocker {
-                title: blocker.title,
-                status: blocker.status,
+    let predecessor_ids: Vec<TaskId> = task
+        .depends_on
+        .iter()
+        .map(|dependency| dependency.predecessor_id)
+        .collect();
+    for predecessor_id in predecessor_ids {
+        match core.get_task(predecessor_id) {
+            Ok(Some(predecessor)) => app.predecessors.push(RelatedTask {
+                title: predecessor.title,
+                status: predecessor.status,
             }),
             Ok(None) => {}
             Err(err) => {
                 if app.error.is_none() {
                     app.error = Some(err.to_string());
                 }
-                app.blockers.clear();
+                app.predecessors.clear();
                 return;
             }
         }
     }
+}
+
+/// Reloads `app.dependents` for the selected row: the tasks whose
+/// `depends_on` names it, found with `render::dependents_of` over the
+/// unfiltered tree (see `unfiltered_tree`), so a dependent hidden from
+/// `rows` by the type filter is still listed; a soft-deleted dependent is
+/// not in the tree and so is not listed. The list is left empty, without
+/// scanning or fetching anything, while the List pane is showing. A backend
+/// failure sets `app.error` (unless an error is already shown) and leaves
+/// the list empty.
+fn reload_dependents<S: Store>(app: &mut App, core: &Core<S>) {
+    app.dependents.clear();
+    if app.pane != Pane::Detail {
+        return;
+    }
+    let Some(id) = app.selected_row().map(|row| row.id) else {
+        return;
+    };
+    let dependents = match unfiltered_tree(app, core) {
+        Ok(tasks) => render::dependents_of(&[id], &tasks)
+            .into_iter()
+            .map(|dependent| RelatedTask {
+                title: dependent.title.clone(),
+                status: dependent.status,
+            })
+            .collect(),
+        Err(err) => {
+            if app.error.is_none() {
+                app.error = Some(err.to_string());
+            }
+            return;
+        }
+    };
+    app.dependents = dependents;
+}
+
+/// Returns every live task regardless of `app.type_filter`: the cached
+/// `app.tasks` when it was fetched without a type filter (it already is the
+/// unfiltered tree), otherwise one `Core::get_tree` with the default filter.
+/// Which of the two applies is read from `app.tasks_filter`, not
+/// `app.type_filter`: after a failed refetch the cache can still hold the
+/// tree of the previous filter.
+///
+/// # Errors
+///
+/// Returns the `CoreError` from `Core::get_tree` when the cache is filtered
+/// and the fetch fails.
+fn unfiltered_tree<'a, S: Store>(
+    app: &'a App,
+    core: &Core<S>,
+) -> Result<Cow<'a, [Task]>, CoreError> {
+    if app.tasks_filter.is_none() {
+        return Ok(Cow::Borrowed(&app.tasks));
+    }
+    core.get_tree(bala_core::TreeFilter::default())
+        .map(Cow::Owned)
 }
 
 #[allow(clippy::too_many_lines)] // one big dispatch table by design; see `apply_action`
@@ -568,6 +700,14 @@ fn dispatch_action<S: Store>(app: &mut App, core: &mut Core<S>, action: Action) 
         }
         Action::StartSetType => {
             start_set_type(app, core);
+            ControlFlow::Continue(())
+        }
+        Action::StartAddDependency => {
+            start_add_dependency(app);
+            ControlFlow::Continue(())
+        }
+        Action::StartRemoveDependency => {
+            start_remove_dependency(app, core);
             ControlFlow::Continue(())
         }
         Action::InsertChar(c) => {
@@ -1041,6 +1181,54 @@ fn start_set_type<S: Store>(app: &mut App, core: &Core<S>) {
     app.error = None;
 }
 
+/// Handles `Action::StartAddDependency`: enters `Mode::Insert` scoped to the
+/// selected task with an empty buffer, ready for the id of the task it will
+/// depend on. No-op when there's no selection.
+fn start_add_dependency(app: &mut App) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    app.mode = Mode::Insert {
+        field: EditableField::AddPredecessor(row.id),
+        buffer: String::new(),
+    };
+    app.error = None;
+}
+
+/// Handles `Action::StartRemoveDependency`: enters `Mode::Insert` scoped to
+/// the selected task, ready for the id of the predecessor to drop. The
+/// buffer is prefilled with that id when the task (fetched fresh via
+/// `Core::get_task`) depends on exactly one task, and empty otherwise, since
+/// with several there is no single obvious choice. No-op when there's no
+/// selection, or when the fetch comes back `Ok(None)` (the task vanished out
+/// from under the list), as in `start_reparent`. A backend failure (`Err`)
+/// is surfaced via `app.error`.
+fn start_remove_dependency<S: Store>(app: &mut App, core: &Core<S>) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let id = row.id;
+    let task = match core.get_task(id) {
+        Ok(Some(task)) => task,
+        Ok(None) => return,
+        Err(err) => {
+            app.error = Some(dependency_error(app, core, &err));
+            return;
+        }
+    };
+
+    let buffer = match task.depends_on.as_slice() {
+        [only] => uuid::Uuid::from(only.predecessor_id).to_string(),
+        _ => String::new(),
+    };
+
+    app.mode = Mode::Insert {
+        field: EditableField::RemovePredecessor(id),
+        buffer,
+    };
+    app.error = None;
+}
+
 /// Handles `Action::StartEditTitle`: enters `Mode::Insert` prefilled with
 /// the selected task's current title. No-op when there's no selection.
 fn start_edit_title(app: &mut App) {
@@ -1080,11 +1268,16 @@ fn start_edit_description(app: &mut App) {
 /// Which prompt depends on the task's live direct children, fetched via
 /// `Core::list_children` rather than read from `app.rows`, so a parent whose
 /// children are all hidden by the type filter (or collapsed) still gets the
-/// choice. With no children the prompt is a plain `y`/`n` and the pending
+/// choice. With no children the question is a plain `y`/`n` and the pending
 /// action is `PendingAction::Delete`; with children it names the child
 /// count and offers `s` (delete the subtree), `p` (promote the children) or
 /// `n` (cancel), and the pending action is
-/// `PendingAction::DeleteWithChildren`. If listing the children fails,
+/// `PendingAction::DeleteWithChildren`.
+///
+/// The question is the prompt's last line. Above it [`delete_prompt`] names
+/// the tasks that depend on what the delete covers, found in the unfiltered
+/// tree (see `unfiltered_tree`) so a dependent the type filter hides is
+/// still named. If listing the children or fetching that tree fails,
 /// `app.error` is set and `app` stays in `Mode::Normal`.
 fn handle_d_key_pressed<S: Store>(app: &mut App, core: &Core<S>, was_pending_d: bool) {
     if !was_pending_d {
@@ -1095,24 +1288,89 @@ fn handle_d_key_pressed<S: Store>(app: &mut App, core: &Core<S>, was_pending_d: 
         return;
     };
     let id = row.id;
-    let title = row.title.clone();
-    match core.list_children(id) {
-        Ok(children) if children.is_empty() => {
-            app.mode = Mode::Confirm {
-                prompt: format!("Delete \"{title}\"? (y/n)"),
-                action: PendingAction::Delete(id),
+    let prompt = core.list_children(id).and_then(|children| {
+        let tasks = unfiltered_tree(app, core)?;
+        Ok((
+            delete_prompt(id, &row.title, children.len(), &tasks),
+            children.is_empty(),
+        ))
+    });
+    match prompt {
+        Ok((prompt, is_leaf)) => {
+            let action = if is_leaf {
+                PendingAction::Delete(id)
+            } else {
+                PendingAction::DeleteWithChildren(id)
             };
-        }
-        Ok(children) => {
-            let count = children.len();
-            app.mode = Mode::Confirm {
-                prompt: format!(
-                    "\"{title}\" has {count} subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?"
-                ),
-                action: PendingAction::DeleteWithChildren(id),
-            };
+            app.mode = Mode::Confirm { prompt, action };
         }
         Err(err) => app.error = Some(err.to_string()),
+    }
+}
+
+/// How many titles each group of [`delete_prompt`] lists before it
+/// summarizes the rest as a count.
+const MAX_PROMPT_DEPENDENTS: usize = 5;
+
+/// Builds the `dd` confirmation prompt for the task `id` titled `title`,
+/// which has `child_count` live direct children, from `tasks`, the
+/// unfiltered tree.
+///
+/// The last line is the question: a plain `y`/`n` for a childless task,
+/// otherwise the child count and the subtree/promote/cancel choice. Above
+/// it come up to two groups of dependents, each a header line with the
+/// group's size followed by one indented title per line, capped at
+/// [`MAX_PROMPT_DEPENDENTS`] titles and then an `… and N more` line:
+///
+/// 1. the tasks that depend on `id` itself (`render::dependents_of`), which
+///    either kind of delete leaves depending on a deleted task;
+/// 2. for a task with children, the other tasks outside its subtree that
+///    depend on one of its descendants (`render::subtree_ids`), which only a
+///    subtree delete affects.
+///
+/// An empty group is omitted, header included, so a task nothing depends on
+/// gets the question alone.
+fn delete_prompt(id: TaskId, title: &str, child_count: usize, tasks: &[Task]) -> String {
+    let mut lines = Vec::new();
+    let on_task = render::dependents_of(&[id], tasks);
+    push_dependent_lines(&mut lines, "task(s) depend on this task:", &on_task);
+    if child_count == 0 {
+        lines.push(format!("Delete \"{title}\"? (y/n)"));
+    } else {
+        let on_subtasks: Vec<&Task> = render::dependents_of(&render::subtree_ids(id, tasks), tasks)
+            .into_iter()
+            .filter(|task| !on_task.iter().any(|named| named.id == task.id))
+            .collect();
+        push_dependent_lines(
+            &mut lines,
+            "more depend on its subtasks (subtree delete only):",
+            &on_subtasks,
+        );
+        lines.push(format!(
+            "\"{title}\" has {child_count} subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?"
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Appends one group of [`delete_prompt`] to `lines`: a `"{count} {label}"`
+/// header, then the first [`MAX_PROMPT_DEPENDENTS`] titles of `dependents`
+/// indented two spaces, then a count of any left over. Appends nothing for
+/// an empty group.
+fn push_dependent_lines(lines: &mut Vec<String>, label: &str, dependents: &[&Task]) {
+    if dependents.is_empty() {
+        return;
+    }
+    lines.push(format!("{} {label}", dependents.len()));
+    lines.extend(
+        dependents
+            .iter()
+            .take(MAX_PROMPT_DEPENDENTS)
+            .map(|task| format!("  {}", task.title)),
+    );
+    let rest = dependents.len().saturating_sub(MAX_PROMPT_DEPENDENTS);
+    if rest > 0 {
+        lines.push(format!("  … and {rest} more"));
     }
 }
 
@@ -1281,6 +1539,10 @@ fn submit_insert<S: Store>(app: &mut App, core: &mut Core<S>) {
         }
         EditableField::Parent(id) => submit_reparent(app, core, id, &buffer.clone()),
         EditableField::TypeKey(id) => submit_set_type(app, core, id, &buffer.clone()),
+        EditableField::AddPredecessor(id) => submit_add_dependency(app, core, id, &buffer.clone()),
+        EditableField::RemovePredecessor(id) => {
+            submit_remove_dependency(app, core, id, &buffer.clone());
+        }
     }
 }
 
@@ -1330,6 +1592,212 @@ fn submit_reparent<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buff
     }
 }
 
+/// `EditableField::AddPredecessor(id)`: parses `buffer` as exactly one
+/// predecessor UUID and calls `Core::add_dependency` with it and
+/// `DependencyType::FinishToStart`, making `id` depend on that task. On
+/// success, refreshes `app.rows` from the full tree via
+/// `refresh_rows_from_tree` so `id`'s row picks up its blocked flag, and
+/// returns to `Mode::Normal`.
+///
+/// `id` is re-read first and the typed id checked against its `depends_on`:
+/// `Core::add_dependency` upserts, so adding an edge that already exists
+/// would silently rewrite its type to finish-to-start, and a repeated id
+/// would look like a new dependency. The check is against `depends_on`
+/// itself, so an edge to a since-deleted task counts too.
+///
+/// On an empty buffer, more than one id (entries separated by commas or
+/// whitespace — each submit adds one dependency), a parse failure (an entry
+/// that isn't a valid UUID), an id `id` already depends on, `id` itself
+/// having vanished, or a `CoreError` (e.g. `CircularDependency`, worded by
+/// `dependency_error`), sets `app.error` and leaves `app.mode`
+/// untouched so the buffer survives for correction, as `submit_reparent`
+/// does. Any error `refresh_rows_from_tree` itself sets on the success path
+/// is preserved, not immediately cleared — the dependency already committed,
+/// so the user still needs to see that the displayed rows may now be stale.
+fn submit_add_dependency<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buffer: &str) {
+    let predecessor = match parse_one_task_id(buffer) {
+        Ok(predecessor) => predecessor,
+        Err(message) => {
+            app.error = Some(message.to_string());
+            return;
+        }
+    };
+
+    let task = match core.get_task(id) {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            app.error = Some(TASK_GONE_MESSAGE.to_string());
+            return;
+        }
+        Err(err) => {
+            app.error = Some(dependency_error(app, core, &err));
+            return;
+        }
+    };
+    if task
+        .depends_on
+        .iter()
+        .any(|dep| dep.predecessor_id == predecessor)
+    {
+        app.error = Some("this task already depends on that task".to_string());
+        return;
+    }
+
+    match core.add_dependency(id, predecessor, DependencyType::FinishToStart) {
+        Ok(_) => {
+            app.error = None;
+            refresh_rows_from_tree(app, core, Some(id));
+            app.mode = Mode::Normal;
+        }
+        // `NotFound` carries whichever task is missing, so one naming `id`
+        // means the task was deleted between the read above and this call,
+        // not that the typed id is wrong.
+        Err(CoreError::NotFound(missing)) if missing == id => {
+            app.error = Some(TASK_GONE_MESSAGE.to_string());
+        }
+        Err(err) => {
+            app.error = Some(dependency_error(app, core, &err));
+        }
+    }
+}
+
+/// Shown under a dependency entry line when the task it was opened for has
+/// been deleted since.
+const TASK_GONE_MESSAGE: &str = "this task no longer exists";
+
+/// `EditableField::RemovePredecessor(id)`: parses `buffer` as exactly one
+/// predecessor UUID and calls `Core::remove_dependency` with it, so `id` no
+/// longer depends on that task. On success, refreshes `app.rows` from the
+/// full tree via `refresh_rows_from_tree` so `id`'s row drops its blocked
+/// flag once nothing incomplete is left in front of it, and returns to
+/// `Mode::Normal`.
+///
+/// `id` is re-read first and the typed id checked against its `depends_on`:
+/// `Core::remove_dependency` treats an edge that doesn't exist as a silent
+/// no-op, so without the check a mistyped id would look like a successful
+/// removal. The check is against `depends_on` itself, not the live tasks, so
+/// a dependency on a since-deleted task can still be removed.
+///
+/// On an empty buffer, more than one id, a parse failure, an id `id` does
+/// not depend on, `id` itself having vanished, or a `CoreError` (worded by
+/// `dependency_error`), sets `app.error` and leaves `app.mode`
+/// untouched so the buffer survives for correction, as
+/// `submit_add_dependency` does. Any error `refresh_rows_from_tree` itself
+/// sets on the success path is preserved, as there.
+fn submit_remove_dependency<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buffer: &str) {
+    let predecessor = match parse_one_task_id(buffer) {
+        Ok(predecessor) => predecessor,
+        Err(message) => {
+            app.error = Some(message.to_string());
+            return;
+        }
+    };
+
+    let task = match core.get_task(id) {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            app.error = Some(TASK_GONE_MESSAGE.to_string());
+            return;
+        }
+        Err(err) => {
+            app.error = Some(dependency_error(app, core, &err));
+            return;
+        }
+    };
+    if !task
+        .depends_on
+        .iter()
+        .any(|dep| dep.predecessor_id == predecessor)
+    {
+        app.error = Some("this task does not depend on that task".to_string());
+        return;
+    }
+
+    match core.remove_dependency(id, predecessor) {
+        Ok(_) => {
+            app.error = None;
+            refresh_rows_from_tree(app, core, Some(id));
+            app.mode = Mode::Normal;
+        }
+        // The task was deleted between the read above and this call.
+        Err(CoreError::NotFound(missing)) if missing == id => {
+            app.error = Some(TASK_GONE_MESSAGE.to_string());
+        }
+        Err(err) => {
+            app.error = Some(dependency_error(app, core, &err));
+        }
+    }
+}
+
+/// Parses a dependency entry line's `buffer` as exactly one full task id.
+/// Entries are separated by commas or whitespace, as in `submit_reparent`.
+/// An empty buffer, more than one entry, or an entry that isn't a valid
+/// UUID is an `Err` holding the one-line message to show under the line.
+fn parse_one_task_id(buffer: &str) -> Result<TaskId, &'static str> {
+    let mut entries = buffer
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|entry| !entry.is_empty());
+    match (entries.next(), entries.next()) {
+        (None, _) => Err("enter a task id"),
+        (Some(_), Some(_)) => Err("enter one task id at a time"),
+        (Some(entry), None) => entry
+            .parse::<uuid::Uuid>()
+            .map(TaskId::from)
+            .map_err(|_| "invalid task id"),
+    }
+}
+
+/// Words `err` with [`dependency_error_message`], resolving task titles from
+/// the unfiltered tree (see `unfiltered_tree`) so a task the type filter
+/// hides from `app.tasks` is still named by title rather than by a UUID too
+/// long for the error line. The tree is only consulted for the variants
+/// that name other tasks, and only fetched when the cache is filtered; if
+/// that fetch fails, the titles come from `app.tasks` alone.
+fn dependency_error<S: Store>(app: &App, core: &Core<S>, err: &CoreError) -> String {
+    let names_tasks = matches!(
+        err,
+        CoreError::DependsOnRelative { .. } | CoreError::CircularDependency { .. }
+    );
+    if names_tasks && let Ok(tasks) = unfiltered_tree(app, core) {
+        return dependency_error_message(err, &tasks);
+    }
+    dependency_error_message(err, &app.tasks)
+}
+
+/// The one-line text shown under a dependency entry line for an `err` from
+/// `Core`, per LLD §Error Rendering. `CoreError`'s own
+/// text names tasks as `TaskId(…)` debug values, which neither reads well
+/// nor fits the error area, so the variants `add_dependency` raises are
+/// reworded here to name each task by its title in `tasks`. A task missing
+/// from `tasks` (soft-deleted, or hidden by the type filter when `tasks` is
+/// a filtered tree) is named by its plain UUID instead. A
+/// `CircularDependency`'s `cycle` already starts and
+/// ends with the task gaining the dependency, so it is printed as given.
+/// Any other variant keeps `err.to_string()`.
+fn dependency_error_message(err: &CoreError, tasks: &[Task]) -> String {
+    let name = |id: TaskId| {
+        tasks.iter().find(|task| task.id == id).map_or_else(
+            || uuid::Uuid::from(id).to_string(),
+            |task| task.title.clone(),
+        )
+    };
+    match err {
+        CoreError::SelfDependency(_) => "a task cannot depend on itself".to_string(),
+        CoreError::DependsOnRelative { other, .. } => {
+            format!(
+                "\"{}\" is an ancestor or descendant of this task",
+                name(*other)
+            )
+        }
+        CoreError::CircularDependency { cycle } => {
+            let path: Vec<String> = cycle.iter().map(|id| name(*id)).collect();
+            format!("would create a cycle: {}", path.join(" → "))
+        }
+        CoreError::NotFound(_) => "no task with that id".to_string(),
+        _ => err.to_string(),
+    }
+}
+
 /// `EditableField::TypeKey(id)`: trims `buffer` and calls `Core::update_task`
 /// with `TaskPatch { type_key: Field::Set(trimmed), .. }`. On success,
 /// refreshes `app.rows` from the full tree via `refresh_rows_from_tree` so
@@ -1363,7 +1831,9 @@ fn submit_set_type<S: Store>(app: &mut App, core: &mut Core<S>, id: TaskId, buff
 }
 
 /// Refetches the task tree via `Core::get_tree`, filtered by
-/// `app.type_filter` (`None` filters nothing), caches it as `app.tasks`,
+/// `app.type_filter` (`None` filters nothing), caches it as `app.tasks`
+/// (recording that filter in `app.tasks_filter`; a failed fetch leaves both
+/// as they were),
 /// rebuilds `app.rows` via `render::task_rows` (so a newly created/
 /// reparented task lands at its correct nested position, honoring
 /// `app.collapsed`), and merges every fetched task's description into
@@ -1393,6 +1863,7 @@ fn refresh_rows_from_tree<S: Store>(app: &mut App, core: &mut Core<S>, select_id
                 app.descriptions.insert(task.id, task.description.clone());
             }
             app.tasks = tasks;
+            app.tasks_filter.clone_from(&app.type_filter);
             app.sibling_order = sibling_order;
             app.rows = app.build_rows();
             app.selected = select_id
@@ -2323,7 +2794,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_blockers_should_not_replace_an_error_already_shown() {
+    fn reload_predecessors_should_not_replace_an_error_already_shown() {
         let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
         let mut core = Core::new(FlakyStore {
             inner: InMemoryStore::default(),
@@ -2349,16 +2820,18 @@ mod tests {
         );
         let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
         app.select_by_id(Some(blocked.id));
+        // Predecessors are only read while the Detail pane is showing.
+        app.pane = Pane::Detail;
         app.error = Some("original".to_string());
         remaining.set(Some(0));
 
-        super::reload_blockers(&mut app, &core);
+        super::reload_predecessors(&mut app, &core);
 
         assert_eq!(app.error(), Some("original"));
     }
 
     #[test]
-    fn apply_action_insert_char_should_not_reload_blockers() {
+    fn apply_action_insert_char_should_not_reload_predecessors() {
         let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
         let mut core = Core::new(FlakyStore {
             inner: InMemoryStore::default(),
@@ -2384,6 +2857,8 @@ mod tests {
         );
         let mut app = App::new(rows).with_tasks(tasks).with_sibling_order(order);
         app.select_by_id(Some(blocked.id));
+        // Predecessors are only read while the Detail pane is showing.
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
         let _ = apply_action(&mut app, &mut core, Action::StartInsertNewTitle);
         remaining.set(Some(0));
 
@@ -2678,6 +3153,295 @@ mod tests {
 
         assert_eq!(app.mode(), &Mode::Normal);
         assert!(app.error().is_some());
+        remaining.set(None);
+        assert!(
+            core.get_tree(bala_core::TreeFilter::default())
+                .expect("get_tree should succeed")
+                .iter()
+                .any(|t| t.id == p.id)
+        );
+    }
+
+    /// The text of the open `Mode::Confirm` prompt.
+    fn confirm_prompt(app: &App) -> &str {
+        match app.mode() {
+            Mode::Confirm { prompt, .. } => prompt,
+            other => panic!("expected Mode::Confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dd_on_a_leaf_with_dependents_should_name_them_in_the_prompt() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let c = core.create_task(minimal_new_task("C")).expect("create");
+        depend_on(&mut core, b.id, a.id);
+        depend_on(&mut core, c.id, a.id);
+        let mut app = app_from_core(&mut core);
+
+        press_dd_on(&mut app, &mut core, a.id);
+
+        assert_eq!(
+            app.mode(),
+            &Mode::Confirm {
+                prompt: "2 task(s) depend on this task:\n  B\n  C\nDelete \"A\"? (y/n)".to_string(),
+                action: PendingAction::Delete(a.id),
+            }
+        );
+    }
+
+    #[test]
+    fn dd_on_a_task_without_dependents_should_keep_the_one_line_prompt() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        let _k = child_of(&mut core, "K", p.id);
+        // `A` depends on `B`, but nothing depends on `A` or on `P`'s subtree.
+        depend_on(&mut core, a.id, b.id);
+        let mut app = app_from_core(&mut core);
+
+        press_dd_on(&mut app, &mut core, a.id);
+        assert_eq!(confirm_prompt(&app), "Delete \"A\"? (y/n)");
+        let _ = apply_action(&mut app, &mut core, Action::ConfirmNo);
+
+        press_dd_on(&mut app, &mut core, p.id);
+        assert_eq!(
+            confirm_prompt(&app),
+            "\"P\" has 1 subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?"
+        );
+    }
+
+    #[test]
+    fn dd_on_a_parent_should_name_dependents_of_its_descendants_as_subtree_only() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let k1 = child_of(&mut core, "K1", a.id);
+        let _k2 = child_of(&mut core, "K2", a.id);
+        let grandchild = child_of(&mut core, "G", k1.id);
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        let c = core.create_task(minimal_new_task("C")).expect("create");
+        let d = core.create_task(minimal_new_task("D")).expect("create");
+        depend_on(&mut core, b.id, a.id);
+        depend_on(&mut core, c.id, a.id);
+        // `C` depends on both `A` and a subtask: it is named once, in the
+        // first group.
+        depend_on(&mut core, c.id, k1.id);
+        depend_on(&mut core, d.id, grandchild.id);
+        let mut app = app_from_core(&mut core);
+
+        press_dd_on(&mut app, &mut core, a.id);
+
+        assert_eq!(
+            app.mode(),
+            &Mode::Confirm {
+                prompt: [
+                    "2 task(s) depend on this task:",
+                    "  B",
+                    "  C",
+                    "1 more depend on its subtasks (subtree delete only):",
+                    "  D",
+                    "\"A\" has 2 subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?",
+                ]
+                .join("\n"),
+                action: PendingAction::DeleteWithChildren(a.id),
+            }
+        );
+    }
+
+    #[test]
+    fn dd_should_not_name_a_dependent_that_is_inside_the_subtree() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let k1 = child_of(&mut core, "K1", a.id);
+        let k2 = child_of(&mut core, "K2", a.id);
+        depend_on(&mut core, k2.id, k1.id);
+        let mut app = app_from_core(&mut core);
+
+        press_dd_on(&mut app, &mut core, a.id);
+
+        assert_eq!(
+            confirm_prompt(&app),
+            "\"A\" has 2 subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?"
+        );
+    }
+
+    #[test]
+    fn dd_should_name_a_dependent_hidden_by_the_type_filter() {
+        let mut core = core();
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .unwrap();
+        let goal = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal")
+            })
+            .unwrap();
+        let plain = core.create_task(minimal_new_task("Plain")).unwrap();
+        depend_on(&mut core, plain.id, goal.id);
+        let mut app = app_from_core(&mut core)
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(goal.id));
+        assert_eq!(titles(&app), ["Goal"]);
+
+        press_dd_on(&mut app, &mut core, goal.id);
+
+        assert_eq!(
+            confirm_prompt(&app),
+            "1 task(s) depend on this task:\n  Plain\nDelete \"Goal\"? (y/n)"
+        );
+    }
+
+    #[test]
+    fn dd_should_name_a_hidden_dependent_when_clearing_the_type_filter_failed_to_refresh() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .expect("upsert type");
+        let goal = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal")
+            })
+            .expect("create");
+        let plain = core.create_task(minimal_new_task("Plain")).expect("create");
+        core.add_dependency(plain.id, goal.id, bala_core::DependencyType::default())
+            .expect("add dependency");
+        let mut app = App::new(vec![])
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(goal.id));
+        // Cycling the filter back to none fails to refetch, so the cached
+        // tree is still the one fetched for `goal`.
+        remaining.set(Some(0));
+        let _ = apply_action(&mut app, &mut core, Action::CycleTypeFilter);
+        assert_eq!(app.type_filter(), None);
+        assert!(!app.tasks.iter().any(|task| task.id == plain.id));
+        remaining.set(None);
+
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+
+        assert_eq!(
+            app.mode(),
+            &Mode::Confirm {
+                prompt: "1 task(s) depend on this task:\n  Plain\nDelete \"Goal\"? (y/n)"
+                    .to_string(),
+                action: PendingAction::Delete(goal.id),
+            }
+        );
+    }
+
+    #[test]
+    fn dd_should_use_the_cached_tree_when_setting_the_type_filter_failed_to_refresh() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let b = core.create_task(minimal_new_task("B")).expect("create");
+        core.add_dependency(b.id, a.id, bala_core::DependencyType::default())
+            .expect("add dependency");
+        let mut app = App::new(vec![]).with_type_filter_state(None, vec!["goal".to_string()]);
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(a.id));
+        // Cycling to a filter fails to refetch, so the cached tree is still
+        // the unfiltered one.
+        remaining.set(Some(0));
+        let _ = apply_action(&mut app, &mut core, Action::CycleTypeFilter);
+        assert_eq!(app.type_filter(), Some("goal"));
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        // Listing the children is the only read the prompt needs.
+        remaining.set(Some(1));
+
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+
+        assert_eq!(
+            confirm_prompt(&app),
+            "1 task(s) depend on this task:\n  B\nDelete \"A\"? (y/n)"
+        );
+    }
+
+    #[test]
+    fn dd_prompt_should_cap_each_group_and_count_the_rest() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).expect("create");
+        let k = child_of(&mut core, "K", a.id);
+        for n in 1..=7 {
+            let on_a = core
+                .create_task(minimal_new_task(&format!("OnA{n}")))
+                .expect("create");
+            depend_on(&mut core, on_a.id, a.id);
+        }
+        for n in 1..=6 {
+            let on_k = core
+                .create_task(minimal_new_task(&format!("OnK{n}")))
+                .expect("create");
+            depend_on(&mut core, on_k.id, k.id);
+        }
+        let mut app = app_from_core(&mut core);
+
+        press_dd_on(&mut app, &mut core, a.id);
+
+        assert_eq!(
+            confirm_prompt(&app),
+            [
+                "7 task(s) depend on this task:",
+                "  OnA1",
+                "  OnA2",
+                "  OnA3",
+                "  OnA4",
+                "  OnA5",
+                "  … and 2 more",
+                "6 more depend on its subtasks (subtree delete only):",
+                "  OnK1",
+                "  OnK2",
+                "  OnK3",
+                "  OnK4",
+                "  OnK5",
+                "  … and 1 more",
+                "\"A\" has 1 subtask(s). Delete [s]ubtree, [p]romote children, or [n] cancel?",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn dd_should_set_error_and_stay_normal_when_the_dependents_lookup_fails() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        let p = core.create_task(minimal_new_task("P")).expect("create");
+        // The unfiltered tree is only fetched while a type filter is active.
+        let mut app = App::new(vec![row_for(&p)])
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+        // Listing the children succeeds; the tree fetch after it fails.
+        remaining.set(Some(1));
+
+        let _ = apply_action(&mut app, &mut core, Action::DKeyPressed);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert!(app.error().is_some());
+        assert_eq!(remaining.get(), Some(0));
         remaining.set(None);
         assert!(
             core.get_tree(bala_core::TreeFilter::default())
@@ -4283,66 +5047,314 @@ mod tests {
         assert_eq!(app.selected_index(), None);
     }
 
-    #[test]
-    fn selecting_a_blocked_task_should_load_its_blockers() {
+    /// Seeds `First` and `Second`, then `Waiting` depending on both in that
+    /// order; rows come out in creation order.
+    fn two_predecessor_fixture() -> (Core<InMemoryStore>, App, [bala_core::Task; 3]) {
         let mut core = core();
-        let first = core.create_task(minimal_new_task("First blocker")).unwrap();
-        let second = core
-            .create_task(minimal_new_task("Second blocker"))
-            .unwrap();
-        let blocked = core.create_task(minimal_new_task("Blocked")).unwrap();
+        let first = core.create_task(minimal_new_task("First")).unwrap();
+        let second = core.create_task(minimal_new_task("Second")).unwrap();
+        let waiting = core.create_task(minimal_new_task("Waiting")).unwrap();
         for pred in [&first, &second] {
-            core.add_dependency(blocked.id, pred.id, bala_core::DependencyType::default())
+            core.add_dependency(waiting.id, pred.id, bala_core::DependencyType::default())
                 .unwrap();
         }
-        let mut app = app_from_core(&mut core);
-        assert_eq!(app.blockers(), []);
+        let app = app_from_core(&mut core);
+        (core, app, [first, second, waiting])
+    }
 
+    fn related_task(title: &str, status: TaskStatus) -> super::RelatedTask {
+        super::RelatedTask {
+            title: title.to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn selecting_a_task_should_load_all_its_live_predecessors() {
+        let (mut core, mut app, [_, second, _]) = two_predecessor_fixture();
+        // One predecessor is already finished before the row is reached.
+        core.complete_task(second.id, false).unwrap();
+        super::refresh_rows_from_tree(&mut app, &mut core, None);
+        assert_eq!(app.predecessors(), []);
+
+        // The list is loaded once the selected row's Detail pane opens.
         let _ = apply_action(&mut app, &mut core, Action::MoveDown);
         let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
 
         assert_eq!(
-            app.blockers(),
+            app.predecessors(),
             [
-                super::Blocker {
-                    title: "First blocker".to_string(),
-                    status: TaskStatus::Incomplete
-                },
-                super::Blocker {
-                    title: "Second blocker".to_string(),
-                    status: TaskStatus::Incomplete
-                },
+                related_task("First", TaskStatus::Incomplete),
+                related_task("Second", TaskStatus::Complete),
             ]
         );
     }
 
     #[test]
-    fn refresh_should_drop_a_blocker_once_it_is_completed() {
-        let mut core = core();
-        let first = core.create_task(minimal_new_task("First blocker")).unwrap();
-        let second = core
-            .create_task(minimal_new_task("Second blocker"))
-            .unwrap();
-        let blocked = core.create_task(minimal_new_task("Blocked")).unwrap();
-        for pred in [&first, &second] {
-            core.add_dependency(blocked.id, pred.id, bala_core::DependencyType::default())
-                .unwrap();
-        }
-        let mut app = app_from_core(&mut core);
-        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
-        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
-        assert_eq!(app.blockers().len(), 2);
+    fn predecessors_should_not_be_loaded_while_the_list_pane_is_showing() {
+        let (mut core, mut app, [_, _, waiting]) = two_predecessor_fixture();
 
-        // Complete the first blocker, then come back to the blocked row.
+        // Moving onto `Waiting` reloads the lists for it in the List pane.
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(waiting.id));
+        assert_eq!(app.predecessors(), []);
+
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        assert_eq!(app.predecessors().len(), 2);
+
+        let _ = apply_action(&mut app, &mut core, Action::LeaveDetail);
+        assert_eq!(app.pane(), Pane::List);
+        assert_eq!(app.predecessors(), []);
+    }
+
+    #[test]
+    fn completed_predecessor_should_stay_listed_as_complete() {
+        let (mut core, mut app, [_, _, waiting]) = two_predecessor_fixture();
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        assert_eq!(app.predecessors().len(), 2);
+
+        // Complete the first predecessor, then come back to its successor.
+        let _ = apply_action(&mut app, &mut core, Action::LeaveDetail);
         let _ = apply_action(&mut app, &mut core, Action::MoveUp);
         let _ = apply_action(&mut app, &mut core, Action::MoveUp);
         let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
         let _ = apply_action(&mut app, &mut core, Action::MoveDown);
         let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
 
-        assert_eq!(app.selected_row().map(|r| r.id), Some(blocked.id));
-        let titles: Vec<&str> = app.blockers().iter().map(|b| b.title.as_str()).collect();
-        assert_eq!(titles, ["Second blocker"]);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(waiting.id));
+        assert_eq!(
+            app.predecessors(),
+            [
+                related_task("First", TaskStatus::Complete),
+                related_task("Second", TaskStatus::Incomplete),
+            ]
+        );
+    }
+
+    #[test]
+    fn soft_deleted_predecessor_should_not_be_listed() {
+        let (mut core, mut app, [first, _, waiting]) = two_predecessor_fixture();
+        core.delete_task(first.id, bala_core::DeleteMode::Subtree)
+            .unwrap();
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(waiting.id));
+        // The deleted task's edge is still recorded on its successor.
+        let stored = core.get_task(waiting.id).unwrap().unwrap();
+        assert_eq!(stored.depends_on.len(), 2);
+
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+
+        assert_eq!(app.selected_row().map(|r| r.id), Some(waiting.id));
+        assert_eq!(
+            app.predecessors(),
+            [related_task("Second", TaskStatus::Incomplete)]
+        );
+    }
+
+    #[test]
+    fn predecessor_hidden_by_the_type_filter_should_still_be_listed() {
+        let mut core = core();
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .unwrap();
+        let plain = core.create_task(minimal_new_task("Plain")).unwrap();
+        let goal = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal")
+            })
+            .unwrap();
+        core.add_dependency(goal.id, plain.id, bala_core::DependencyType::default())
+            .unwrap();
+        core.complete_task(plain.id, false).unwrap();
+        let mut app = app_from_core(&mut core)
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(goal.id));
+        assert_eq!(titles(&app), ["Goal"]);
+
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+
+        assert_eq!(
+            app.predecessors(),
+            [related_task("Plain", TaskStatus::Complete)]
+        );
+    }
+
+    #[test]
+    fn detail_pane_should_load_the_tasks_that_depend_on_the_selected_task() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let c = core.create_task(minimal_new_task("C")).unwrap();
+        let _unrelated = core.create_task(minimal_new_task("Unrelated")).unwrap();
+        // `C` is finished before it comes to depend on `A`.
+        core.complete_task(c.id, false).unwrap();
+        depend_on(&mut core, b.id, a.id);
+        depend_on(&mut core, c.id, a.id);
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(a.id));
+
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+
+        assert_eq!(
+            app.dependents(),
+            [
+                related_task("B", TaskStatus::Incomplete),
+                related_task("C", TaskStatus::Complete),
+            ]
+        );
+    }
+
+    #[test]
+    fn dependent_hidden_by_the_type_filter_should_still_be_listed() {
+        let mut core = core();
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .unwrap();
+        let goal = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal")
+            })
+            .unwrap();
+        let plain = core.create_task(minimal_new_task("Plain")).unwrap();
+        depend_on(&mut core, plain.id, goal.id);
+        let mut app = app_from_core(&mut core)
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(goal.id));
+        assert_eq!(titles(&app), ["Goal"]);
+
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+
+        assert_eq!(
+            app.dependents(),
+            [related_task("Plain", TaskStatus::Incomplete)]
+        );
+    }
+
+    #[test]
+    fn dependents_should_not_be_loaded_while_the_list_pane_is_showing() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        depend_on(&mut core, b.id, a.id);
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(a.id));
+
+        // Moving away and back reloads the lists for `A` in the List pane.
+        let _ = apply_action(&mut app, &mut core, Action::MoveDown);
+        let _ = apply_action(&mut app, &mut core, Action::MoveUp);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(a.id));
+        assert_eq!(app.dependents(), []);
+
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        assert_eq!(app.dependents().len(), 1);
+
+        let _ = apply_action(&mut app, &mut core, Action::LeaveDetail);
+        assert_eq!(app.pane(), Pane::List);
+        assert_eq!(app.dependents(), []);
+    }
+
+    #[test]
+    fn dependents_should_reload_after_a_dependency_is_added_or_removed() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(a.id));
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        assert_eq!(app.dependents(), []);
+
+        // The edge is edited on the dependent's row, so leave `A`, make `B`
+        // depend on it, and come back.
+        let _ = apply_action(&mut app, &mut core, Action::LeaveDetail);
+        submit_dependency_entry(&mut app, &mut core, b.id, &id_text(a.id));
+        app.select_by_id(Some(a.id));
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        assert_eq!(
+            app.dependents(),
+            [related_task("B", TaskStatus::Incomplete)]
+        );
+
+        // The remove line is prefilled with `B`'s only predecessor.
+        let _ = apply_action(&mut app, &mut core, Action::LeaveDetail);
+        submit_entry(&mut app, &mut core, b.id, Action::StartRemoveDependency, "");
+        app.select_by_id(Some(a.id));
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        assert_eq!(app.dependents(), []);
+    }
+
+    #[test]
+    fn reload_dependents_should_set_error_when_the_unfiltered_tree_cannot_be_read() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .expect("upsert type");
+        let goal = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal")
+            })
+            .expect("create");
+        let plain = core.create_task(minimal_new_task("Plain")).expect("create");
+        core.add_dependency(plain.id, goal.id, bala_core::DependencyType::default())
+            .expect("add dependency");
+        let tasks = core
+            .get_tree(bala_core::TreeFilter {
+                type_key: Some("goal".to_string()),
+                ..Default::default()
+            })
+            .expect("get_tree should succeed");
+        let order = core.sibling_order().expect("sibling_order should succeed");
+        let rows = crate::render::task_rows(
+            &tasks,
+            &order,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let mut app = App::new(rows)
+            .with_tasks(tasks)
+            .with_sibling_order(order)
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+        app.select_by_id(Some(goal.id));
+        remaining.set(Some(0));
+
+        // In the List pane the unfiltered tree is never fetched.
+        super::reload_dependents(&mut app, &core);
+        assert_eq!(app.error(), None);
+
+        app.pane = Pane::Detail;
+        super::reload_dependents(&mut app, &core);
+
+        assert!(app.error().is_some());
+        assert_eq!(app.dependents(), []);
+
+        // An error already shown is kept.
+        app.error = Some("original".to_string());
+        super::reload_dependents(&mut app, &core);
+        assert_eq!(app.error(), Some("original"));
     }
 
     /// Seeds `Blocker` (incomplete, blocks `Blocked`), `Blocked`, `Free`
@@ -4381,7 +5393,8 @@ mod tests {
 
         assert_eq!(titles(&app), ["Blocked"]);
         assert!(app.rows()[0].blocked);
-        assert_eq!(app.blockers().len(), 1);
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+        assert_eq!(app.predecessors().len(), 1);
     }
 
     #[test]
@@ -4476,5 +5489,703 @@ mod tests {
 
         assert_eq!(app.rows(), []);
         assert_eq!(app.blocked_view(), super::BlockedView::Blocked);
+    }
+
+    /// The id of the task titled `title` in `app`'s cached tree.
+    fn id_of(app: &App, title: &str) -> TaskId {
+        app.tasks
+            .iter()
+            .find(|task| task.title == title)
+            .unwrap_or_else(|| panic!("no cached task titled {title}"))
+            .id
+    }
+
+    #[test]
+    fn adding_a_dependency_in_detail_should_return_to_the_list_when_the_ready_view_hides_the_task()
+    {
+        let (mut core, mut app) = blocked_view_fixture();
+        let (blocker, free) = (id_of(&app, "Blocker"), id_of(&app, "Free"));
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        assert_eq!(titles(&app), ["Blocker", "Free"]);
+        app.select_by_id(Some(free));
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+
+        submit_dependency_entry(&mut app, &mut core, free, &id_text(blocker));
+
+        assert_eq!(titles(&app), ["Blocker"]);
+        assert_eq!(app.pane(), Pane::List);
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(blocker));
+    }
+
+    #[test]
+    fn removing_a_dependency_in_detail_should_return_to_the_list_when_the_blocked_view_hides_the_task()
+     {
+        let (mut core, mut app) = blocked_view_fixture();
+        let blocked = id_of(&app, "Blocked");
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        assert_eq!(titles(&app), ["Blocked"]);
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+
+        // The line opens holding the only predecessor's id.
+        submit_entry(
+            &mut app,
+            &mut core,
+            blocked,
+            Action::StartRemoveDependency,
+            "",
+        );
+
+        assert_eq!(app.rows(), []);
+        assert_eq!(app.pane(), Pane::List);
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.selected_row(), None);
+    }
+
+    #[test]
+    fn completing_a_task_in_detail_should_return_to_the_list_when_the_ready_view_hides_it() {
+        let (mut core, mut app) = blocked_view_fixture();
+        let (blocker, free) = (id_of(&app, "Blocker"), id_of(&app, "Free"));
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        let _ = apply_action(&mut app, &mut core, Action::CycleBlockedView);
+        app.select_by_id(Some(free));
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+
+        let _ = apply_action(&mut app, &mut core, Action::ToggleComplete);
+
+        assert_eq!(titles(&app), ["Blocker"]);
+        assert_eq!(app.pane(), Pane::List);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(blocker));
+    }
+
+    #[test]
+    fn adding_a_dependency_in_detail_should_stay_on_the_task_while_it_is_still_listed() {
+        let (mut core, mut app) = blocked_view_fixture();
+        let (blocker, free) = (id_of(&app, "Blocker"), id_of(&app, "Free"));
+        app.select_by_id(Some(free));
+        let _ = apply_action(&mut app, &mut core, Action::EnterDetail);
+
+        submit_dependency_entry(&mut app, &mut core, free, &id_text(blocker));
+
+        assert_eq!(app.pane(), Pane::Detail);
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.selected_row().map(|r| r.id), Some(free));
+        assert_eq!(
+            app.predecessors(),
+            [related_task("Blocker", TaskStatus::Incomplete)]
+        );
+    }
+
+    /// Types `id` into the open entry line, one `InsertChar` per character.
+    fn type_task_id(app: &mut App, core: &mut Core<InMemoryStore>, id: TaskId) {
+        for c in uuid::Uuid::from(id).to_string().chars() {
+            let _ = apply_action(app, core, Action::InsertChar(c));
+        }
+    }
+
+    #[test]
+    fn start_add_dependency_should_open_an_empty_entry_line_for_the_selected_task() {
+        let mut core = core();
+        let _first = core.create_task(minimal_new_task("A")).unwrap();
+        let second = core.create_task(minimal_new_task("B")).unwrap();
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(second.id));
+
+        let _ = apply_action(&mut app, &mut core, Action::StartAddDependency);
+
+        assert_eq!(
+            app.mode(),
+            &Mode::Insert {
+                field: EditableField::AddPredecessor(second.id),
+                buffer: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn start_add_dependency_with_no_selection_should_be_noop() {
+        let mut core = core();
+        let mut app = App::new(Vec::new());
+
+        let _ = apply_action(&mut app, &mut core, Action::StartAddDependency);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn submit_add_dependency_should_call_add_dependency_and_return_to_normal() {
+        let mut core = core();
+        let pred = core.create_task(minimal_new_task("A")).unwrap();
+        let task = core.create_task(minimal_new_task("B")).unwrap();
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(task.id));
+        let _ = apply_action(&mut app, &mut core, Action::StartAddDependency);
+        type_task_id(&mut app, &mut core, pred.id);
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        let updated = core.get_task(task.id).unwrap().expect("B should exist");
+        assert_eq!(
+            updated.depends_on,
+            [bala_core::Dependency {
+                predecessor_id: pred.id,
+                dep_type: bala_core::DependencyType::FinishToStart,
+            }]
+        );
+    }
+
+    #[test]
+    fn submit_add_dependency_twice_should_give_the_task_two_predecessors() {
+        let mut core = core();
+        let first = core.create_task(minimal_new_task("A")).unwrap();
+        let second = core.create_task(minimal_new_task("B")).unwrap();
+        let task = core.create_task(minimal_new_task("C")).unwrap();
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(task.id));
+
+        for pred in [&first, &second] {
+            let _ = apply_action(&mut app, &mut core, Action::StartAddDependency);
+            type_task_id(&mut app, &mut core, pred.id);
+            let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+        }
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        let updated = core.get_task(task.id).unwrap().expect("C should exist");
+        let predecessors: HashSet<TaskId> = updated
+            .depends_on
+            .iter()
+            .map(|dep| dep.predecessor_id)
+            .collect();
+        assert_eq!(predecessors, HashSet::from([first.id, second.id]));
+    }
+
+    #[test]
+    fn submit_add_dependency_should_mark_the_row_blocked() {
+        let mut core = core();
+        let pred = core.create_task(minimal_new_task("A")).unwrap();
+        let task = core.create_task(minimal_new_task("B")).unwrap();
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(task.id));
+        assert_eq!(app.selected_row().map(|r| r.blocked), Some(false));
+        let _ = apply_action(&mut app, &mut core, Action::StartAddDependency);
+        type_task_id(&mut app, &mut core, pred.id);
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        let selected = app.selected_row().expect("a row should be selected");
+        assert_eq!(selected.id, task.id);
+        assert!(selected.blocked);
+    }
+
+    /// Selects `task`, opens its dependency entry line, types `entry` and
+    /// submits it.
+    fn submit_dependency_entry(
+        app: &mut App,
+        core: &mut Core<InMemoryStore>,
+        task: TaskId,
+        entry: &str,
+    ) {
+        submit_entry(app, core, task, Action::StartAddDependency, entry);
+    }
+
+    /// Selects `task`, opens an entry line with `start`, types `entry` after
+    /// whatever the line was prefilled with and submits it.
+    fn submit_entry(
+        app: &mut App,
+        core: &mut Core<InMemoryStore>,
+        task: TaskId,
+        start: Action,
+        entry: &str,
+    ) {
+        app.select_by_id(Some(task));
+        let _ = apply_action(app, core, start);
+        for c in entry.chars() {
+            let _ = apply_action(app, core, Action::InsertChar(c));
+        }
+        let _ = apply_action(app, core, Action::SubmitInsert);
+    }
+
+    /// The remove-dependency entry line for `task`, still open and holding
+    /// `entry`.
+    fn remove_dependency_entry_line(task: TaskId, entry: &str) -> Mode {
+        Mode::Insert {
+            field: EditableField::RemovePredecessor(task),
+            buffer: entry.to_string(),
+        }
+    }
+
+    /// Makes `task` depend on `predecessor`, finish-to-start.
+    fn depend_on(core: &mut Core<InMemoryStore>, task: TaskId, predecessor: TaskId) {
+        core.add_dependency(task, predecessor, bala_core::DependencyType::FinishToStart)
+            .expect("add_dependency should succeed");
+    }
+
+    /// The dependency entry line for `task`, still open and holding `entry`.
+    fn dependency_entry_line(task: TaskId, entry: &str) -> Mode {
+        Mode::Insert {
+            field: EditableField::AddPredecessor(task),
+            buffer: entry.to_string(),
+        }
+    }
+
+    fn id_text(id: TaskId) -> String {
+        uuid::Uuid::from(id).to_string()
+    }
+
+    #[test]
+    fn submit_add_dependency_with_empty_line_should_show_inline_error() {
+        let mut core = core();
+        let task = core.create_task(minimal_new_task("A")).unwrap();
+        let mut app = app_from_core(&mut core);
+
+        submit_dependency_entry(&mut app, &mut core, task.id, "");
+
+        assert_eq!(app.mode(), &dependency_entry_line(task.id, ""));
+        assert_eq!(app.error(), Some("enter a task id"));
+    }
+
+    #[test]
+    fn submit_add_dependency_with_invalid_uuid_should_show_inline_error() {
+        let mut core = core();
+        let task = core.create_task(minimal_new_task("A")).unwrap();
+        let mut app = app_from_core(&mut core);
+
+        submit_dependency_entry(&mut app, &mut core, task.id, "not-a-uuid");
+
+        assert_eq!(app.mode(), &dependency_entry_line(task.id, "not-a-uuid"));
+        assert_eq!(app.error(), Some("invalid task id"));
+    }
+
+    #[test]
+    fn submit_add_dependency_with_more_than_one_id_should_show_inline_error() {
+        let mut core = core();
+        let first = core.create_task(minimal_new_task("A")).unwrap();
+        let second = core.create_task(minimal_new_task("B")).unwrap();
+        let task = core.create_task(minimal_new_task("C")).unwrap();
+        let mut app = app_from_core(&mut core);
+        let entry = format!("{}, {}", id_text(first.id), id_text(second.id));
+
+        submit_dependency_entry(&mut app, &mut core, task.id, &entry);
+
+        assert_eq!(app.mode(), &dependency_entry_line(task.id, &entry));
+        assert_eq!(app.error(), Some("enter one task id at a time"));
+        let stored = core.get_task(task.id).unwrap().expect("C should exist");
+        assert_eq!(stored.depends_on, []);
+    }
+
+    #[test]
+    fn submit_add_dependency_with_unknown_id_should_show_inline_error() {
+        let mut core = core();
+        let task = core.create_task(minimal_new_task("A")).unwrap();
+        let mut app = app_from_core(&mut core);
+        let unknown = "00000000-0000-4000-8000-000000000001";
+
+        submit_dependency_entry(&mut app, &mut core, task.id, unknown);
+
+        assert_eq!(app.mode(), &dependency_entry_line(task.id, unknown));
+        assert_eq!(app.error(), Some("no task with that id"));
+    }
+
+    #[test]
+    fn submit_add_dependency_on_a_vanished_task_should_say_the_task_is_gone() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let mut app = app_from_core(&mut core);
+        // Another writer deletes `B` while its row is still on screen.
+        core.delete_task(b.id, bala_core::DeleteMode::Subtree)
+            .unwrap();
+        let entry = id_text(a.id);
+
+        submit_dependency_entry(&mut app, &mut core, b.id, &entry);
+
+        assert_eq!(app.mode(), &dependency_entry_line(b.id, &entry));
+        assert_eq!(app.error(), Some("this task no longer exists"));
+    }
+
+    #[test]
+    fn submit_remove_dependency_on_a_vanished_task_should_say_the_task_is_gone() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        depend_on(&mut core, b.id, a.id);
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(b.id));
+        let _ = apply_action(&mut app, &mut core, Action::StartRemoveDependency);
+        // Another writer deletes `B` while its entry line is open.
+        core.delete_task(b.id, bala_core::DeleteMode::Subtree)
+            .unwrap();
+        let entry = id_text(a.id);
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert_eq!(app.mode(), &remove_dependency_entry_line(b.id, &entry));
+        assert_eq!(app.error(), Some("this task no longer exists"));
+    }
+
+    #[test]
+    fn submit_add_dependency_on_itself_should_show_inline_error_and_stay_in_insert() {
+        let mut core = core();
+        let task = core.create_task(minimal_new_task("A")).unwrap();
+        let mut app = app_from_core(&mut core);
+        let entry = id_text(task.id);
+
+        submit_dependency_entry(&mut app, &mut core, task.id, &entry);
+
+        assert_eq!(app.mode(), &dependency_entry_line(task.id, &entry));
+        assert_eq!(app.error(), Some("a task cannot depend on itself"));
+    }
+
+    #[test]
+    fn submit_add_dependency_on_an_ancestor_should_name_it_by_title() {
+        let mut core = core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child = child_of(&mut core, "Child", parent.id);
+        let grandchild = child_of(&mut core, "Grandchild", child.id);
+        let mut app = app_from_core(&mut core);
+        let entry = id_text(parent.id);
+
+        submit_dependency_entry(&mut app, &mut core, grandchild.id, &entry);
+
+        assert_eq!(app.mode(), &dependency_entry_line(grandchild.id, &entry));
+        assert_eq!(
+            app.error(),
+            Some("\"Parent\" is an ancestor or descendant of this task")
+        );
+    }
+
+    #[test]
+    fn submit_add_dependency_on_a_descendant_should_name_it_by_title() {
+        let mut core = core();
+        let parent = core.create_task(minimal_new_task("Parent")).unwrap();
+        let child = child_of(&mut core, "Child", parent.id);
+        let grandchild = child_of(&mut core, "Grandchild", child.id);
+        let mut app = app_from_core(&mut core);
+        let entry = id_text(grandchild.id);
+
+        submit_dependency_entry(&mut app, &mut core, parent.id, &entry);
+
+        assert_eq!(app.mode(), &dependency_entry_line(parent.id, &entry));
+        assert_eq!(
+            app.error(),
+            Some("\"Grandchild\" is an ancestor or descendant of this task")
+        );
+    }
+
+    #[test]
+    fn submit_add_dependency_closing_a_cycle_should_show_the_cycle_by_title() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let c = core.create_task(minimal_new_task("C")).unwrap();
+        core.add_dependency(b.id, a.id, bala_core::DependencyType::default())
+            .unwrap();
+        core.add_dependency(c.id, b.id, bala_core::DependencyType::default())
+            .unwrap();
+        let mut app = app_from_core(&mut core);
+
+        submit_dependency_entry(&mut app, &mut core, a.id, &id_text(b.id));
+        assert_eq!(app.error(), Some("would create a cycle: A → B → A"));
+
+        let _ = apply_action(&mut app, &mut core, Action::CancelInsert);
+        submit_dependency_entry(&mut app, &mut core, a.id, &id_text(c.id));
+        assert_eq!(app.error(), Some("would create a cycle: A → C → B → A"));
+    }
+
+    #[test]
+    fn submit_add_dependency_closing_a_cycle_should_name_a_task_hidden_by_the_type_filter() {
+        let mut core = core();
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .unwrap();
+        let goal = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal")
+            })
+            .unwrap();
+        let plain = core.create_task(minimal_new_task("Plain")).unwrap();
+        depend_on(&mut core, plain.id, goal.id);
+        let mut app = app_from_core(&mut core)
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(goal.id));
+        assert_eq!(titles(&app), ["Goal"]);
+
+        submit_dependency_entry(&mut app, &mut core, goal.id, &id_text(plain.id));
+
+        assert_eq!(
+            app.error(),
+            Some("would create a cycle: Goal → Plain → Goal")
+        );
+    }
+
+    #[test]
+    fn rejected_add_dependency_should_fall_back_to_the_cached_tasks_when_the_tree_cannot_be_read() {
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut core = Core::new(FlakyStore {
+            inner: InMemoryStore::default(),
+            remaining: std::rc::Rc::clone(&remaining),
+        })
+        .expect("core should construct");
+        core.upsert_task_type(TaskType {
+            key: "goal".to_string(),
+            label: "Goal".to_string(),
+            color: None,
+            sort_order: 1,
+        })
+        .expect("upsert type");
+        let goal = core
+            .create_task(bala_core::NewTask {
+                type_key: Some("goal".to_string()),
+                ..minimal_new_task("Goal")
+            })
+            .expect("create");
+        let plain = core.create_task(minimal_new_task("Plain")).expect("create");
+        core.add_dependency(plain.id, goal.id, bala_core::DependencyType::default())
+            .expect("add dependency");
+        let mut app = App::new(vec![])
+            .with_type_filter_state(Some("goal".to_string()), vec!["goal".to_string()]);
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(goal.id));
+        let entry = id_text(plain.id);
+        app.mode = dependency_entry_line(goal.id, &entry);
+        // Reading the task and rejecting the edge succeed; the unfiltered
+        // tree fetch after them fails.
+        remaining.set(Some(2));
+
+        let _ = apply_action(&mut app, &mut core, Action::SubmitInsert);
+
+        assert_eq!(remaining.get(), Some(0));
+        assert_eq!(
+            app.error(),
+            Some(format!("would create a cycle: Goal → {entry} → Goal").as_str())
+        );
+    }
+
+    #[test]
+    fn rejected_add_dependency_should_keep_the_buffer_and_write_no_edge() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let edge = bala_core::Dependency {
+            predecessor_id: a.id,
+            dep_type: bala_core::DependencyType::FinishToStart,
+        };
+        core.add_dependency(b.id, a.id, edge.dep_type).unwrap();
+        let mut app = app_from_core(&mut core);
+        let entry = id_text(b.id);
+
+        submit_dependency_entry(&mut app, &mut core, a.id, &entry);
+
+        assert_eq!(app.mode(), &dependency_entry_line(a.id, &entry));
+        assert!(app.error().is_some());
+        let stored_a = core.get_task(a.id).unwrap().expect("A should exist");
+        assert_eq!(stored_a.depends_on, []);
+        let stored_b = core.get_task(b.id).unwrap().expect("B should exist");
+        assert_eq!(stored_b.depends_on, [edge]);
+    }
+
+    #[test]
+    fn submit_add_dependency_on_an_existing_predecessor_should_show_inline_error_and_write_nothing()
+    {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        depend_on(&mut core, b.id, a.id);
+        let before = core.get_task(b.id).unwrap().expect("B should exist");
+        let mut app = app_from_core(&mut core);
+        let entry = id_text(a.id);
+
+        submit_dependency_entry(&mut app, &mut core, b.id, &entry);
+
+        assert_eq!(app.mode(), &dependency_entry_line(b.id, &entry));
+        assert_eq!(app.error(), Some("this task already depends on that task"));
+        let stored = core.get_task(b.id).unwrap().expect("B should exist");
+        assert_eq!(stored, before);
+    }
+
+    #[test]
+    fn submit_add_dependency_on_an_existing_predecessor_should_keep_the_edge_type() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let edge = bala_core::Dependency {
+            predecessor_id: a.id,
+            dep_type: bala_core::DependencyType::StartToStart,
+        };
+        core.add_dependency(b.id, a.id, edge.dep_type).unwrap();
+        let mut app = app_from_core(&mut core);
+
+        submit_dependency_entry(&mut app, &mut core, b.id, &id_text(a.id));
+
+        assert_eq!(app.error(), Some("this task already depends on that task"));
+        let stored = core.get_task(b.id).unwrap().expect("B should exist");
+        assert_eq!(stored.depends_on, [edge]);
+    }
+
+    #[test]
+    fn start_remove_dependency_should_prefill_the_only_predecessor() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        depend_on(&mut core, b.id, a.id);
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(b.id));
+
+        let _ = apply_action(&mut app, &mut core, Action::StartRemoveDependency);
+
+        assert_eq!(
+            app.mode(),
+            &remove_dependency_entry_line(b.id, &id_text(a.id))
+        );
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn start_remove_dependency_should_open_empty_with_several_predecessors() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let c = core.create_task(minimal_new_task("C")).unwrap();
+        depend_on(&mut core, c.id, a.id);
+        depend_on(&mut core, c.id, b.id);
+        let mut app = app_from_core(&mut core);
+        app.select_by_id(Some(c.id));
+
+        let _ = apply_action(&mut app, &mut core, Action::StartRemoveDependency);
+
+        assert_eq!(app.mode(), &remove_dependency_entry_line(c.id, ""));
+        assert_eq!(app.error(), None);
+    }
+
+    #[test]
+    fn submit_remove_dependency_should_drop_the_predecessor_and_keep_the_others() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let c = core.create_task(minimal_new_task("C")).unwrap();
+        depend_on(&mut core, c.id, a.id);
+        depend_on(&mut core, c.id, b.id);
+        let mut app = app_from_core(&mut core);
+
+        submit_entry(
+            &mut app,
+            &mut core,
+            c.id,
+            Action::StartRemoveDependency,
+            &id_text(a.id),
+        );
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.error(), None);
+        let stored = core.get_task(c.id).unwrap().expect("C should exist");
+        assert_eq!(
+            stored.depends_on,
+            [bala_core::Dependency {
+                predecessor_id: b.id,
+                dep_type: bala_core::DependencyType::FinishToStart,
+            }]
+        );
+    }
+
+    #[test]
+    fn submit_remove_dependency_should_clear_the_blocked_flag_when_the_last_blocker_goes() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        depend_on(&mut core, b.id, a.id);
+        let mut app = app_from_core(&mut core);
+        super::refresh_rows_from_tree(&mut app, &mut core, Some(b.id));
+        assert_eq!(app.selected_row().map(|r| r.blocked), Some(true));
+
+        // The line opens holding A's id, so there is nothing to type.
+        submit_entry(&mut app, &mut core, b.id, Action::StartRemoveDependency, "");
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        let selected = app.selected_row().expect("a row should be selected");
+        assert_eq!(selected.id, b.id);
+        assert!(!selected.blocked);
+    }
+
+    #[test]
+    fn submit_remove_dependency_on_a_task_it_does_not_depend_on_should_show_inline_error() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let b = core.create_task(minimal_new_task("B")).unwrap();
+        let c = core.create_task(minimal_new_task("C")).unwrap();
+        let other = core.create_task(minimal_new_task("D")).unwrap();
+        depend_on(&mut core, c.id, a.id);
+        depend_on(&mut core, c.id, b.id);
+        let before = core.get_task(c.id).unwrap().expect("C should exist");
+        let mut app = app_from_core(&mut core);
+        let entry = id_text(other.id);
+
+        submit_entry(
+            &mut app,
+            &mut core,
+            c.id,
+            Action::StartRemoveDependency,
+            &entry,
+        );
+
+        assert_eq!(app.mode(), &remove_dependency_entry_line(c.id, &entry));
+        assert_eq!(app.error(), Some("this task does not depend on that task"));
+        let stored = core.get_task(c.id).unwrap().expect("C should exist");
+        assert_eq!(stored.depends_on, before.depends_on);
+    }
+
+    #[test]
+    fn submit_remove_dependency_with_invalid_uuid_should_show_inline_error() {
+        let mut core = core();
+        let task = core.create_task(minimal_new_task("A")).unwrap();
+        let mut app = app_from_core(&mut core);
+
+        submit_entry(
+            &mut app,
+            &mut core,
+            task.id,
+            Action::StartRemoveDependency,
+            "not-a-uuid",
+        );
+
+        assert_eq!(
+            app.mode(),
+            &remove_dependency_entry_line(task.id, "not-a-uuid")
+        );
+        assert_eq!(app.error(), Some("invalid task id"));
+    }
+
+    #[test]
+    fn dependency_error_message_should_use_the_plain_uuid_for_a_task_missing_from_tasks() {
+        let mut core = core();
+        let a = core.create_task(minimal_new_task("A")).unwrap();
+        let hidden = core.create_task(minimal_new_task("Hidden")).unwrap();
+        let err = bala_core::CoreError::CircularDependency {
+            cycle: vec![a.id, hidden.id, a.id],
+        };
+
+        let message = super::dependency_error_message(&err, std::slice::from_ref(&a));
+
+        assert_eq!(
+            message,
+            format!("would create a cycle: A → {} → A", id_text(hidden.id))
+        );
+    }
+
+    #[test]
+    fn dependency_error_message_should_keep_the_text_of_other_errors() {
+        let err = bala_core::CoreError::EmptyTitle;
+
+        let message = super::dependency_error_message(&err, &[]);
+
+        assert_eq!(message, err.to_string());
     }
 }
