@@ -20,10 +20,17 @@ GitHub. There is no stories file in the repo:
 - **A story** is an issue labeled `story`. Its body holds the
   description, acceptance criteria (ACs), and (once planned) the plan,
   followed by a `## Changelog`.
-- **An epic** is a milestone (`Epic N: <outcome>`). Its description
+- **An epic** is a milestone (`Epic: <outcome>`). Its description
   holds a goal, exit criteria, a fixed story list, and a `Scope changes:`
   log.
 - **The backlog** is every open issue with no milestone.
+- **The roadmap** is the GitHub Project "Bala roadmap"
+  (https://github.com/users/sleb/projects/8). Every open issue is an
+  item on it. Its `Release` field (`v0.1.0` / `Later`) says which
+  release the issue ships in, and its `Status` field (`Todo` /
+  `In Progress` / `Done`) says where the work stands. Milestones group
+  issues into epics; the roadmap is what orders them and shows what is
+  next. §Roadmap project below has the commands.
 - **Areas** are `area:core` / `area:store` / `area:cli` / `area:tui`
   labels.
 
@@ -46,7 +53,9 @@ If the user describes a capability that has **no story issue yet**,
 draft one (Description as "As a …, I want …, so that …", numbered ACs,
 the Changelog section from §Changelog below), confirm it with the user,
 and create it with `--label story` plus the matching `area:*` label(s)
-and no milestone. It starts in the backlog. Then continue.
+and no milestone. It starts in the backlog. Add it to the roadmap with
+`Release: Later` (§Roadmap project); the milestone check below may
+change that. Then continue.
 
 With the issue in hand (`gh issue view <number>`):
 
@@ -71,6 +80,17 @@ the story serves.
   user to confirm: one or two concrete, checkable conditions, like a
   checkpoint's Demo line. Name the epic after its outcome ("Dependencies
   block and reschedule work"), not an area ("Dependencies").
+
+**Release check.** A story ships in the same release as its epic, so
+its `Release` is the one the epic's other issues carry on the roadmap.
+
+- **An epic whose issues are `v0.1.0` blocks that release.** Adding a
+  story to it also grows the release, so say that when you ask for the
+  scope OK.
+- **A new epic has no release yet.** Ask the user, recommending
+  `Later` unless the release cannot ship without it.
+- **Issues in one epic that disagree on `Release`** are a roadmap
+  error. Raise it with the user instead of picking a side.
 
 ## Phase 1 — Read the story in context
 
@@ -127,7 +147,8 @@ deferral explicit rather than just dropping it from your plan:
 - File a **backlog issue** for the deferred part (label `story` if it's
   user-facing, plus `area:*`; no milestone). Its body opens with
   `**Origin:** follow-up to #<story> AC<n> — <why>`. #68 shows the
-  pattern.
+  pattern. It goes on the roadmap as `Release: Later`, unless the user
+  says the release needs it.
 - Edit the story's affected AC to say what moved where (`… (deferred to
   #<new>)`), and log it in the story's Changelog.
 
@@ -175,7 +196,8 @@ record, not a gap someone finds later.
 
 Present this draft to the user before publishing anything to GitHub —
 confirm the checkpoint slicing, any Phase 2 scope calls, and any
-milestone change from Phase 0 before they're written anywhere.
+milestone or `Release` change from Phase 0 before they're written
+anywhere.
 
 ## Phase 4 — Publish to GitHub
 
@@ -186,7 +208,7 @@ Once the user confirms the draft:
    description. Then `gh issue edit <number> --milestone "<title>"`. For
    a new milestone:
    ```
-   gh api repos/<owner>/<repo>/milestones -f title="Epic N: <Outcome>" -f description="Goal: <…> Done when: (1) <…>; (2) <…>. Scope is fixed at creation; new ideas go to the backlog. Scope changes: none."
+   gh api repos/<owner>/<repo>/milestones -f title="Epic: <Outcome>" -f description="Goal: <…> Done when: (1) <…>; (2) <…>. Scope is fixed at creation; new ideas go to the backlog. Scope changes: none."
    ```
 2. **Backlog issues** from Phase 2, created before the story edit so the
    story can link them.
@@ -206,23 +228,63 @@ Once the user confirms the draft:
 
    ## Changelog
    - <existing entries>
-   - YYYY-MM-DD — Planned: N checkpoints; scheduled into Epic N. <any AC edits and deferrals, linked>
+   - YYYY-MM-DD — Planned: N checkpoints; scheduled into "Epic: <Outcome>". <any AC edits and deferrals, linked>
    ```
    Use `gh issue edit <number> --body-file <path>`. Never drop or rewrite
    existing Changelog entries; only append.
-4. **Revisions** follow §Changelog: append an entry, and also post a
+4. **Roadmap.** Per §Roadmap project: make sure the story and every
+   backlog issue from step 2 is an item on the roadmap, and set each
+   one's `Release` to what Phase 0 and Phase 2 settled. Set the
+   story's `Status` to `Todo` if it is empty. Leave a status that is
+   already set alone, since a revision may land mid-implementation.
+5. **Revisions** follow §Changelog: append an entry, and also post a
    comment when the change is substantial.
-5. End every generated body or comment with the standard attribution
+6. End every generated body or comment with the standard attribution
    footer used elsewhere in this session (git commit / PR trailer
    convention) if the surrounding session has one active.
 
 ## Phase 5 — Hand back
 
-Report the issue and milestone links, and note the convention for
-closing the loop later: the PR that implements the story references
+Report the issue and milestone links and the story's `Release`, with
+the roadmap link, and note the convention for closing the loop later: the PR that implements the story references
 `Closes #<issue>` (checkpoint boxes get ticked as they land) so the
 issue's progress and eventual auto-close track real work, not just the
 plan.
+
+---
+
+## Roadmap project
+
+The roadmap is user project 8 under `sleb`. `gh` needs the `project`
+scope for it. If a command fails on scopes, ask the user to run
+`gh auth refresh -h github.com -s project`. Don't skip the step.
+
+```
+# Add an issue. Safe to repeat: an issue already on the roadmap
+# returns its existing item id.
+item=$(gh project item-add 8 --owner sleb --url <issue url> --format json --jq .id)
+
+# Look up the project id, and the ids of the Release and Status
+# fields and their options. Look them up by name each time.
+gh project view 8 --owner sleb --format json --jq .id
+gh project field-list 8 --owner sleb --format json
+
+# Set a field on an item.
+gh project item-edit --project-id <project id> --id "$item" \
+  --field-id <field id> --single-select-option-id <option id>
+
+# Read what the issues of an epic carry.
+gh project item-list 8 --owner sleb --limit 500 --format json \
+  --jq '.items[] | select(.milestone.title == "<epic title>") | "\(.content.number)\t\(.release)\t\(.status)"'
+```
+
+- **`Release`** changes only with the user's OK. It is a scope
+  decision, like a milestone's story list.
+- **`Status`** follows the work: `Todo` once planned, `In Progress`
+  when `/bala-implementation` starts the branch, `Done` when the issue
+  closes. The project's own workflow sets `Done` on close, so no skill
+  sets it by hand.
+- **Order within the roadmap** is the user's. Don't reorder items.
 
 ---
 

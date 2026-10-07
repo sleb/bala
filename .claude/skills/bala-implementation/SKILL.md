@@ -2,14 +2,13 @@
 name: bala-implementation
 description: >
   Implement a Bala story's checkpoint plan (as published by /bala-plan
-  to a GitHub issue — running /bala-plan in a sub-agent first if the
-  story has no plan yet), one checkpoint at a time, each done by a
+  to a GitHub issue), one checkpoint at a time, each done by a
   /rust-skills-following sub-agent and minimally checked before moving
   on, then closed out with a comprehensive end-to-end review, a branch,
-  and a PR. Use whenever the user wants to build/implement a story
-  (planned or not), work through a Bala issue's checkpoints, or turn a
-  /bala-plan issue into code. Invoke with /bala-implementation <issue
-  number or story title>.
+  and a PR. Use whenever the user wants to build/implement a planned
+  story, work through a Bala issue's checkpoints, or turn a /bala-plan
+  issue into code. A story with no plan yet needs /bala-plan first.
+  Invoke with /bala-implementation <issue number or story title>.
 metadata:
   internal: true
 ---
@@ -17,9 +16,8 @@ metadata:
 # Bala Implementation
 
 You are executing a checkpoint plan that `/bala-plan` published as a
-GitHub issue (or that you have it publish first, in Phase 0b, if the
-story isn't planned yet), turning it into working, tested, reviewed
-code on a branch with a PR — the other half of that skill's lifecycle. Work
+GitHub issue, turning it into working, tested, reviewed code on a
+branch with a PR — the other half of that skill's lifecycle. Work
 through the phases below in order, and don't skip Phase 4 (the
 end-to-end review) even when every checkpoint's own agent reported
 success: individual checkpoints can each be locally correct and still
@@ -38,11 +36,19 @@ that instead: `gh issue list --repo <owner>/<repo> --label story
 Fetch the issue body (`gh issue view <number>` or the `github` MCP
 tool). It holds the story (description and ACs), and once planned, the
 plan: a `## Plan` checkpoint task list (`- [ ] …`) plus an "out of
-scope" section, then a `## Changelog`. If there's no issue for the
-story yet, or its body has no `## Plan` checkpoint list, the plan
-hasn't been made — do Phase 0b before anything else. If the only match is a
-*closed* issue, ask the user whether it's being reopened or whether
-this is really a different story before planning over it.
+scope" section, then a `## Changelog`.
+
+If there's no issue for the story yet, or its body has no `## Plan`
+checkpoint list, the plan hasn't been made. Stop and ask the user to
+run `/bala-plan <issue number or story title>` first, then come back.
+Don't plan it yourself, inline or in a sub-agent: the plan's scope
+calls and its confirmation belong to the user. A plan that exists but
+looks wrong is likewise something to raise with the user, not to
+regenerate.
+
+If the only match is a *closed* issue, ask the user whether it's being
+reopened or whether this is really a different story before going
+further.
 
 If the checklist has boxes already
 checked, or a comment thread shows prior partial work, this is a
@@ -53,85 +59,6 @@ build on it instead of duplicating it.
 
 Confirm with the user which repo/working tree you're operating in if
 it isn't already obvious from context.
-
-## Phase 0b — No plan yet? Run `/bala-plan` in a sub-agent first
-
-Skip this phase entirely if Phase 0 found an issue with a checkpoint
-list — never re-plan a story that already has one; a plan that looks
-wrong is something to raise with the user, not silently regenerate.
-
-Otherwise, the plan has to exist before anything else here makes sense
-(Phase 1 reads it, Phase 3 executes it). Delegate it rather than
-planning inline: `/bala-plan` reads a lot of design docs and repo state,
-and keeping that out of your own context leaves room for the long
-implementation run that follows.
-
-### 0b-i. Dispatch the planning sub-agent
-
-`/bala-plan` has two user gates a sub-agent can't pass on its own — it
-can't talk to the user. Its Phase 2 asks about scope gaps, and its
-Phase 3 has the user confirm the draft before anything is published.
-So split the run at those gates. Spawn a `general-purpose` agent
-(the `Agent` tool) whose prompt:
-
-- States the repo path and the story (issue number and title if Phase 0
-  found one, so it plans into that issue rather than creating a
-  duplicate).
-- Instructs it to invoke `/bala-plan` (the `Skill` tool, name
-  `bala-plan`) and follow it, **up to but not including publishing**:
-  do its Phases 0–3, and wherever the skill says to ask the user, do
-  not guess — collect the question, with the skill's concrete
-  recommendation, into its report instead.
-- Says explicitly: do NOT create or edit any GitHub issue or milestone
-  yet — that happens only after the user confirms.
-- Asks it to report back: the full draft exactly as it would be
-  published (the story issue's new body — ACs, `## Plan` checkpoint
-  list, "out of scope", Changelog entry), every scope-gap question with
-  its recommendation, any backlog issues it would file, and the
-  milestone call (which epic; for an existing epic, the `Scope
-  changes:` line; for a new one, its goal and exit criteria).
-
-### 0b-ii. Minimal check, yourself, then the user's confirmation
-
-Same discipline as 3b — a quick skim with a small, fixed tool budget,
-not a full review:
-
-- The draft is in the shape Phase 1 and Phase 3 will consume: a
-  `- [ ]` task list of checkpoints, each naming its tests
-  (`should_...`-style behavior names, tagged with ACs) and ending in a
-  **Demo** line, plus an "out of scope" section.
-- Every AC of the story is either proven by some checkpoint's tests or
-  listed out of scope with a link to the backlog issue that takes it —
-  nothing silently dropped.
-- Spot-check two or three types/methods/error variants the checkpoints
-  cite against the LLDs or the actual code (`grep`), to catch an
-  invented signature.
-- It hasn't re-planned something earlier stories already built (a crate
-  or schema that already exists in the repo).
-- Nothing was published or edited: no new/changed issue or milestone,
-  and `git status` is as clean as it was before.
-
-If something's off, send the same agent a follow-up (`SendMessage`)
-rather than fixing the draft yourself. Once it passes, bring the
-agent's scope-gap questions and the draft to the user — the
-confirmation `/bala-plan` requires still belongs to them even though a
-sub-agent wrote the draft; a plan nobody signed off on is exactly the
-kind of thing that surfaces as a Phase 4 judgment call much later and
-more expensively. If the user's answers change the draft, relay them to
-the same agent and re-check the revision.
-
-### 0b-iii. Publish, and verify it landed
-
-On the user's confirmation, `SendMessage` the same agent to finish
-`/bala-plan`'s Phase 4 (milestone, backlog issues, the story issue's
-body) and report the issue number/link. If this is a closed issue the
-user chose to reopen in Phase 0, also have it run `gh issue reopen
-<number>` — `/bala-plan`'s revision path only edits the body, so
-without this the story would be implemented against a closed issue.
-Then confirm it yourself: `gh issue view <number>` shows the issue
-open, with the confirmed body, its `## Plan` task list, and a Changelog
-entry, in an `Epic N: …` milestone. That issue is now the plan — carry
-on to Phase 1 with it.
 
 ## Phase 1 — Load context once, up front
 
@@ -169,6 +96,11 @@ git checkout -b story-<issue>-<short-slug>
 ```
 
 Never implement checkpoints directly on the default branch.
+
+With the branch in place, set the story's `Status` on the roadmap to
+`In Progress`, using the commands in `/bala-plan` §Roadmap project. If
+the story is not on the roadmap or has no `Release`, that is a planning
+gap: ask the user which release it belongs to instead of guessing.
 
 ## Phase 3 — Execute checkpoints, one at a time, in order
 
@@ -257,7 +189,8 @@ rather than deciding unilaterally. If the user approves a scope
 change, record it on the issue right away, as `/bala-plan` §Changelog
 describes: update the affected AC or checkpoint, append a dated
 Changelog line, and also post a comment if it's substantial. Anything
-deferred gets its own backlog issue, linked from the story.
+deferred gets its own backlog issue, linked from the story and added
+to the roadmap as `Release: Later` unless the user says otherwise.
 
 ### 3c. Move to the next checkpoint
 
@@ -437,7 +370,8 @@ Once Phase 4 is clean:
    deliver, must link an open issue that takes it (a backlog issue, or
    another story). File any missing one as a backlog issue with an
    `**Origin:** follow-up to #<story> AC<n> — <why>` line, after
-   checking with the user, and log it in the story's Changelog. A
+   checking with the user, log it in the story's Changelog, and add it
+   to the roadmap as `Release: Later` unless the user says otherwise. A
    design decision made along the way (a scope call, a behavior choice
    an AC left open) goes into the relevant LLD in this commit, since
    the closed issue is history, not the design.
@@ -460,6 +394,8 @@ Once Phase 4 is clean:
    - Deliberate scope cuts, so a reviewer sees them as decisions on
      record rather than discovering them in the diff.
    - This session's attribution footer.
+5. Leave the story's roadmap `Status` at `In Progress`. Merging the PR
+   closes the issue, and the project's workflow moves it to `Done`.
 
 ## Phase 6 — Hand back
 
@@ -471,7 +407,8 @@ once the PR merges, moving anything still open in it to the backlog
 missing: the epic needs another story, or its exit criteria need a
 scope change (a `Scope changes:` line, with the user's OK).
 
-Report the branch and PR link. Note which checkpoints (if any) needed
+Report the branch and PR link, and how many open issues the story's
+`Release` still has on the roadmap. Note which checkpoints (if any) needed
 a correction during Phase 3b, and summarize anything flagged in Phase
 4 that the user should be aware of even though it didn't block
 merging.
