@@ -89,7 +89,9 @@ So split the run at those gates. Spawn a `general-purpose` agent
   list, "out of scope", Changelog entry), every scope-gap question with
   its recommendation, any backlog issues it would file, and the
   milestone call (which epic; for an existing epic, the `Scope
-  changes:` line; for a new one, its goal and exit criteria).
+  changes:` line; for a new one, its goal and exit criteria), and the
+  `Release` it would set on the roadmap for the story and for each
+  backlog issue.
 
 ### 0b-ii. Minimal check, yourself, then the user's confirmation
 
@@ -124,14 +126,15 @@ the same agent and re-check the revision.
 
 On the user's confirmation, `SendMessage` the same agent to finish
 `/bala-plan`'s Phase 4 (milestone, backlog issues, the story issue's
-body) and report the issue number/link. If this is a closed issue the
+body, the roadmap items) and report the issue number/link. If this is a closed issue the
 user chose to reopen in Phase 0, also have it run `gh issue reopen
 <number>` — `/bala-plan`'s revision path only edits the body, so
 without this the story would be implemented against a closed issue.
 Then confirm it yourself: `gh issue view <number>` shows the issue
 open, with the confirmed body, its `## Plan` task list, and a Changelog
-entry, in an `Epic N: …` milestone. That issue is now the plan — carry
-on to Phase 1 with it.
+entry, in an `Epic: …` milestone, and it is on the roadmap with the
+confirmed `Release` (`/bala-plan` §Roadmap project has the commands).
+That issue is now the plan — carry on to Phase 1 with it.
 
 ## Phase 1 — Load context once, up front
 
@@ -169,6 +172,11 @@ git checkout -b story-<issue>-<short-slug>
 ```
 
 Never implement checkpoints directly on the default branch.
+
+With the branch in place, set the story's `Status` on the roadmap to
+`In Progress`, using the commands in `/bala-plan` §Roadmap project. If
+the story is not on the roadmap or has no `Release`, that is a planning
+gap: ask the user which release it belongs to instead of guessing.
 
 ## Phase 3 — Execute checkpoints, one at a time, in order
 
@@ -257,7 +265,8 @@ rather than deciding unilaterally. If the user approves a scope
 change, record it on the issue right away, as `/bala-plan` §Changelog
 describes: update the affected AC or checkpoint, append a dated
 Changelog line, and also post a comment if it's substantial. Anything
-deferred gets its own backlog issue, linked from the story.
+deferred gets its own backlog issue, linked from the story and added
+to the roadmap as `Release: Later` unless the user says otherwise.
 
 ### 3c. Move to the next checkpoint
 
@@ -437,7 +446,8 @@ Once Phase 4 is clean:
    deliver, must link an open issue that takes it (a backlog issue, or
    another story). File any missing one as a backlog issue with an
    `**Origin:** follow-up to #<story> AC<n> — <why>` line, after
-   checking with the user, and log it in the story's Changelog. A
+   checking with the user, log it in the story's Changelog, and add it
+   to the roadmap as `Release: Later` unless the user says otherwise. A
    design decision made along the way (a scope call, a behavior choice
    an AC left open) goes into the relevant LLD in this commit, since
    the closed issue is history, not the design.
@@ -460,6 +470,8 @@ Once Phase 4 is clean:
    - Deliberate scope cuts, so a reviewer sees them as decisions on
      record rather than discovering them in the diff.
    - This session's attribution footer.
+5. Leave the story's roadmap `Status` at `In Progress`. Merging the PR
+   closes the issue, and the project's workflow moves it to `Done`.
 
 ## Phase 6 — Hand back
 
@@ -471,7 +483,8 @@ once the PR merges, moving anything still open in it to the backlog
 missing: the epic needs another story, or its exit criteria need a
 scope change (a `Scope changes:` line, with the user's OK).
 
-Report the branch and PR link. Note which checkpoints (if any) needed
+Report the branch and PR link, and how many open issues the story's
+`Release` still has on the roadmap. Note which checkpoints (if any) needed
 a correction during Phase 3b, and summarize anything flagged in Phase
 4 that the user should be aware of even though it didn't block
 merging.
